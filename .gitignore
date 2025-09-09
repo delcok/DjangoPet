@@ -1,0 +1,30 @@
+# 忽略环境变量文件
+.env
+.env.local
+.env.*.local
+
+# 忽略PyCharm配置文件
+.idea/
+*.iml
+*.iws
+*.ipr
+
+cert/
+
+# Django相关
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+venv/
+env/
+ENV/
+.coverage
+htmlcov/
+*.pot
+*.pyc
+migrations/*.py
+!migrations/__init__.py
+html/
