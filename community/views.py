@@ -714,8 +714,6 @@ class ReportViewSet(BaseViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if self.request.user.is_staff:
-            return Report.objects.all()
         return Report.objects.filter(reporter=self.request.user)
 
 

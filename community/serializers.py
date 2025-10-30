@@ -175,7 +175,7 @@ class CommentSerializer(serializers.ModelSerializer):
     def get_can_delete(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
-            return obj.author == request.user or request.user.is_staff
+            return obj.author == request.user or request.user.typ == 'admin'
         return False
 
 
@@ -308,7 +308,7 @@ class PostDetailSerializer(serializers.ModelSerializer):
     def get_can_delete(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
-            return obj.author == request.user or request.user.is_staff
+            return obj.author == request.user
         return False
 
 

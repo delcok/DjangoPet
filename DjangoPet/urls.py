@@ -22,4 +22,6 @@ urlpatterns = [
     path('api/v1/', include('attach.urls')),
     path('api/v1/', include('community.urls')),
     path('api/v1/', include('user.urls')),
+    path('api/v1/', include('service.urls')),
+    path('api/v1/', include('pet.urls')),
 ]

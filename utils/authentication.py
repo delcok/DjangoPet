@@ -24,27 +24,37 @@ def generate_jwt_tokens(user, user_type='user'):
     return str(refresh), str(access)
 
 class UserAuthentication(JWTAuthentication):
-    def get_user(self, validated_token: Token):
+    def get_user(self, validated_token):
         try:
             user_id = validated_token['user_id']
+            utype = validated_token['type']
         except KeyError:
             raise InvalidToken(_('Token contained no recognizable user identification'))
+
         try:
-            user = User.objects.get(id=user_id, is_active=True)
-        except User.DoesNotExist:
+            if utype == 'user':
+                user = User.objects.get(id=user_id, is_active=True)
+            else:
+                raise InvalidToken(_('Invalid user type'))
+        except (User.DoesNotExist):
             raise InvalidToken(_('User not found'))
         return user
 
 
 class AdminAuthentication(JWTAuthentication):
-    def get_user(self, validated_token: Token):
+    def get_user(self, validated_token):
         try:
             user_id = validated_token['user_id']
+            utype = validated_token['type']
         except KeyError:
             raise InvalidToken(_('Token contained no recognizable user identification'))
+
         try:
-            user = SuperAdmin.objects.get(id=user_id, is_active=True)
-        except User.DoesNotExist:
+            if utype == 'user':
+                user = User.objects.get(id=user_id, is_active=True)
+            else:
+                raise InvalidToken(_('Invalid user type'))
+        except (User.DoesNotExist):
             raise InvalidToken(_('User not found'))
         return user
 
