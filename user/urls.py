@@ -16,5 +16,9 @@ urlpatterns = [
 
     path('admin/login/', views.admin_login, name='admin-login'),
 
+    path('user/integral/add/', views.add_integral, name='add-integral'),
+    path('user/integral/deduct/', views.deduct_integral, name='deduct-integral'),
+    path('user/integral/', views.get_integral, name='get-integral'),
+
     ]
 

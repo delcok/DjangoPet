@@ -140,6 +140,7 @@ class PetDiary(models.Model):
     content = models.TextField(verbose_name="内容", blank=True, null=True)
     images = models.JSONField(default=list, blank=True, verbose_name="图片列表")
     videos = models.JSONField(default=list, blank=True, verbose_name="视频列表")
+    cover_image = models.URLField(max_length=500, blank=True, default="", verbose_name="封面图片")
 
     # 时间记录
     diary_date = models.DateField(default=timezone.now, verbose_name="日记日期")

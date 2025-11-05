@@ -10,6 +10,7 @@ from user.models import User, SuperAdmin
 from user.serializers import UserSerializer, SuperAdminSerializer
 from utils.authentication import generate_jwt_tokens, UserAuthentication
 from utils.fetch_number import fetch_phone_number
+from django.db import transaction, models
 
 
 @api_view(['POST'])
@@ -239,3 +240,64 @@ def admin_login(request):
 
 
     return Response({'error': '请提供密码'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+@api_view(['POST'])
+@authentication_classes([UserAuthentication])
+def add_integral(request):
+    """增加积分"""
+    user = request.user
+    amount = request.data.get('amount')
+
+    if not amount or int(amount) <= 0:
+        return Response({'error': '积分数量必须大于0'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        with transaction.atomic():
+            user.integral = models.F('integral') + int(amount)
+            user.save(update_fields=['integral', 'updated_at'])
+            user.refresh_from_db()
+
+        return Response({
+            'message': '积分增加成功',
+            'integral': user.integral
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@authentication_classes([UserAuthentication])
+def deduct_integral(request):
+    """扣除积分"""
+    user = request.user
+    amount = request.data.get('amount')
+
+    if not amount or int(amount) <= 0:
+        return Response({'error': '积分数量必须大于0'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if user.integral < int(amount):
+        return Response({'error': '积分不足'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        with transaction.atomic():
+            user.integral = models.F('integral') - int(amount)
+            user.save(update_fields=['integral', 'updated_at'])
+            user.refresh_from_db()
+
+        return Response({
+            'message': '积分扣除成功',
+            'integral': user.integral
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@authentication_classes([UserAuthentication])
+def get_integral(request):
+    """查询积分"""
+    return Response({
+        'integral': request.user.integral
+    }, status=status.HTTP_200_OK)

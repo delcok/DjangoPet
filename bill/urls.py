@@ -17,7 +17,7 @@ router.register(r'service-orders', ServiceOrderViewSet, basename='serviceorder')
 
 urlpatterns = [
     # API路由
-    path('api/', include(router.urls)),
+    path('', include(router.urls)),
 
     # 支付相关
     path('wechat_callback/<str:callback_type>/', wechat_callback, name='wechat_pay_notify'),

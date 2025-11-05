@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2025/8/25 16:09
+# @Time    : 2025/11/04
 # @Author  : Delock
 
 from rest_framework.pagination import PageNumberPagination
@@ -7,7 +7,29 @@ from rest_framework.response import Response
 
 
 class CustomPageNumberPagination(PageNumberPagination):
-    """自定义分页类"""
+    """
+    自定义分页类
+
+    用法示例：
+    GET /api/services/?page=1&page_size=20
+
+    返回格式：
+    {
+        "pagination": {
+            "links": {
+                "next": "http://...",
+                "previous": null
+            },
+            "count": 100,
+            "current_page": 1,
+            "total_pages": 5,
+            "page_size": 20,
+            "has_next": true,
+            "has_previous": false
+        },
+        "results": [...]
+    }
+    """
     page_size = 10  # 默认每页数量
     page_size_query_param = 'page_size'  # 允许客户端设置每页数量的参数名
     max_page_size = 100  # 最大每页数量
@@ -33,14 +55,20 @@ class CustomPageNumberPagination(PageNumberPagination):
 
 
 class SmallResultsSetPagination(PageNumberPagination):
-    """小结果集分页类"""
+    """
+    小结果集分页类
+    适用于需要较少数据的场景，如下拉选择器
+    """
     page_size = 5
     page_size_query_param = 'page_size'
     max_page_size = 20
 
 
 class LargeResultsSetPagination(PageNumberPagination):
-    """大结果集分页类"""
+    """
+    大结果集分页类
+    适用于需要较多数据的场景，如数据导出、管理后台列表
+    """
     page_size = 20
     page_size_query_param = 'page_size'
     max_page_size = 200

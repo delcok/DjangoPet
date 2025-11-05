@@ -109,26 +109,33 @@ class ServiceOrderAdmin(admin.ModelAdmin):
     """服务订单管理界面"""
 
     list_display = [
-        'id', 'user_link', 'staff_link', 'scheduled_datetime',
-        'total_price', 'status_badge', 'pets_count', 'created_at'
+        'id', 'user_link', 'base_service_display', 'staff_link',
+        'scheduled_datetime', 'total_price', 'status_badge',
+        'pets_count', 'additional_services_count', 'created_at'  # 新增
     ]
     list_filter = [
-        'status', 'scheduled_date', 'created_at', 'staff'
+        'status', 'scheduled_date', 'created_at', 'staff',
+        'base_service'  # 新增:按基础服务过滤
     ]
     search_fields = [
         'service_address', 'contact_phone', 'customer_notes',
-        'user__username', 'staff__name'
+        'user__username', 'staff__name',
+        'base_service__name'  # 新增:搜索基础服务
     ]
     readonly_fields = [
-        'total_price', 'created_at', 'updated_at'
+        'total_price', 'created_at', 'updated_at',
+        'display_additional_services'  # 新增:显示附加服务列表
     ]
     date_hierarchy = 'scheduled_date'
     ordering = ['-created_at']
-    filter_horizontal = ['pets']
+    filter_horizontal = ['pets', 'additional_services']  # 新增附加服务
 
     fieldsets = (
         ('基本信息', {
             'fields': ('bill', 'user', 'staff')
+        }),
+        ('服务信息', {  # 新增服务信息区块
+            'fields': ('base_service', 'additional_services', 'display_additional_services')
         }),
         ('宠物信息', {
             'fields': ('pets',)
@@ -160,10 +167,22 @@ class ServiceOrderAdmin(admin.ModelAdmin):
 
     user_link.short_description = '用户'
 
+    def base_service_display(self, obj):
+        """基础服务显示"""
+        if obj.base_service:
+            return format_html(
+                '<span style="color: #007bff; font-weight: bold;">{}</span><br>'
+                '<small style="color: #6c757d;">¥{}</small>',
+                obj.base_service.name,
+                obj.base_service.base_price
+            )
+        return '-'
+
+    base_service_display.short_description = '基础服务'
+
     def staff_link(self, obj):
         """员工链接"""
         if obj.staff:
-            # 假设有Staff模型的admin
             return format_html('<span style="color: green;">{}</span>', obj.staff.name)
         return format_html('<span style="color: red;">未分配</span>')
 
@@ -209,11 +228,44 @@ class ServiceOrderAdmin(admin.ModelAdmin):
 
     pets_count.short_description = '宠物'
 
+    def additional_services_count(self, obj):
+        """附加服务数量"""
+        count = obj.additional_services.count()
+        if count > 0:
+            services_names = ', '.join([s.name for s in obj.additional_services.all()[:3]])
+            if count > 3:
+                services_names += f' 等{count}项'
+            return format_html(
+                '<span title="{}" style="color: #28a745;">{} 项</span>',
+                services_names,
+                count
+            )
+        return format_html('<span style="color: #6c757d;">0 项</span>')
+
+    additional_services_count.short_description = '附加服务'
+
+    def display_additional_services(self, obj):
+        """显示附加服务详情"""
+        if obj.pk:  # 确保对象已保存
+            services = obj.additional_services.all()
+            if services:
+                html = '<ul style="margin: 0; padding-left: 20px;">'
+                for service in services:
+                    html += f'<li><strong>{service.name}</strong>: ¥{service.price}</li>'
+                html += '</ul>'
+                total = sum(s.price for s in services)
+                html += f'<p style="margin-top: 10px;"><strong>附加服务总计:</strong> ¥{total}</p>'
+                return mark_safe(html)
+            return '无附加服务'
+        return '保存后显示'
+
+    display_additional_services.short_description = '附加服务明细'
+
     def get_queryset(self, request):
         """优化查询"""
         return super().get_queryset(request).select_related(
-            'user', 'staff', 'bill'
-        ).prefetch_related('pets')
+            'user', 'staff', 'bill', 'base_service'  # 新增预加载基础服务
+        ).prefetch_related('pets', 'additional_services')  # 新增预加载附加服务
 
     actions = ['confirm_orders', 'cancel_orders']
 
@@ -232,3 +284,10 @@ class ServiceOrderAdmin(admin.ModelAdmin):
         self.message_user(request, f'成功取消 {updated} 个订单')
 
     cancel_orders.short_description = '取消选中的订单'
+
+    def save_model(self, request, obj, form, change):
+        """保存时自动更新价格"""
+        super().save_model(request, obj, form, change)
+        # 如果是更新操作,重新计算价格
+        if change and 'additional_services' in form.changed_data:
+            obj.update_prices()

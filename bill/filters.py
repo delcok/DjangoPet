@@ -144,7 +144,7 @@ class ServiceOrderFilter(django_filters.FilterSet):
     # 多状态过滤
     status_in = django_filters.BaseInFilter(
         field_name='status',
-        help_text='状态列表，用逗号分隔'
+        help_text='状态列表,用逗号分隔'
     )
 
     # 时间段快捷过滤
@@ -165,6 +165,18 @@ class ServiceOrderFilter(django_filters.FilterSet):
         help_text='宠物ID'
     )
 
+    # 新增:按基础服务过滤
+    base_service = django_filters.NumberFilter(
+        field_name='base_service',
+        help_text='基础服务ID'
+    )
+
+    # 新增:按附加服务过滤
+    additional_service = django_filters.NumberFilter(
+        field_name='additional_services',
+        help_text='附加服务ID'
+    )
+
     # 搜索
     search = django_filters.CharFilter(
         method='filter_by_search',
@@ -177,12 +189,19 @@ class ServiceOrderFilter(django_filters.FilterSet):
         help_text='是否已分配员工'
     )
 
+    # 新增:是否有附加服务
+    has_additional_services = django_filters.BooleanFilter(
+        method='filter_by_additional_services',
+        help_text='是否有附加服务'
+    )
+
     class Meta:
         model = ServiceOrder
         fields = {
             'status': ['exact'],
             'staff': ['exact'],
             'user': ['exact'],
+            'base_service': ['exact'],  # 新增
         }
 
     def filter_by_scheduled_range(self, queryset, name, value):
@@ -214,7 +233,8 @@ class ServiceOrderFilter(django_filters.FilterSet):
             Q(customer_notes__icontains=value) |
             Q(staff_notes__icontains=value) |
             Q(user__username__icontains=value) |
-            Q(staff__name__icontains=value)
+            Q(staff__name__icontains=value) |
+            Q(base_service__name__icontains=value)  # 新增:搜索基础服务名称
         )
 
     def filter_by_staff(self, queryset, name, value):
@@ -223,3 +243,10 @@ class ServiceOrderFilter(django_filters.FilterSet):
             return queryset.exclude(staff__isnull=True)
         else:
             return queryset.filter(staff__isnull=True)
+
+    def filter_by_additional_services(self, queryset, name, value):
+        """按是否有附加服务过滤"""
+        if value:
+            return queryset.filter(additional_services__isnull=False).distinct()
+        else:
+            return queryset.filter(additional_services__isnull=True)

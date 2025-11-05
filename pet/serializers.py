@@ -34,9 +34,7 @@ class PetListSerializer(serializers.ModelSerializer):
 
     def get_age_display(self, obj):
         """返回年龄显示"""
-        total = obj.age_months
-        if total is None:
-            # 返回 None（前端可自行显示“未知”），或者改成返回 '未知年龄'
+        if obj.age_months is None:
             return None
         years = obj.age_years
         months = obj.age_months % 12
@@ -62,37 +60,47 @@ class PetDetailSerializer(serializers.ModelSerializer):
             'vaccination_record', 'special_notes', 'age_years', 'age_months',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['owner', 'created_at', 'updated_at']
+        read_only_fields = ['owner', 'created_at', 'updated_at', 'age_years', 'age_months']
 
     def create(self, validated_data):
         # 自动设置当前用户为宠物主人
         validated_data['owner'] = self.context['request'].user
         return super().create(validated_data)
 
+    def validate_weight(self, value):
+        """验证体重"""
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("体重必须大于0")
+        return value
+
 
 class PetDiaryListSerializer(serializers.ModelSerializer):
     """宠物日记列表序列化器"""
     pet_name = serializers.CharField(source='pet.name', read_only=True)
-    author_name = serializers.CharField(source='author.username', read_only=True)
+    author_name = serializers.CharField(source='author.username', read_only=True, allow_null=True)
     diary_type_display = serializers.CharField(source='get_diary_type_display', read_only=True)
     image_count = serializers.SerializerMethodField()
+    video_count = serializers.SerializerMethodField()
 
     class Meta:
         model = PetDiary
         fields = [
             'id', 'pet', 'pet_name', 'author', 'author_name',
-            'diary_type', 'diary_type_display', 'title',
-            'diary_date', 'image_count', 'created_at'
+            'diary_type', 'diary_type_display', 'title', 'cover_image',
+            'diary_date', 'image_count', 'video_count', 'created_at'
         ]
 
     def get_image_count(self, obj):
         return len(obj.images) if obj.images else 0
 
+    def get_video_count(self, obj):
+        return len(obj.videos) if obj.videos else 0
+
 
 class PetDiaryDetailSerializer(serializers.ModelSerializer):
     """宠物日记详情序列化器"""
     pet_name = serializers.CharField(source='pet.name', read_only=True)
-    author_name = serializers.CharField(source='author.username', read_only=True)
+    author_name = serializers.CharField(source='author.username', read_only=True, allow_null=True)
     diary_type_display = serializers.CharField(source='get_diary_type_display', read_only=True)
 
     class Meta:
@@ -100,7 +108,8 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'pet', 'pet_name', 'author', 'author_name',
             'diary_type', 'diary_type_display', 'title', 'content',
-            'images', 'videos', 'diary_date', 'created_at', 'updated_at'
+            'images', 'videos', 'cover_image', 'diary_date',
+            'created_at', 'updated_at'
         ]
         read_only_fields = ['author', 'created_at', 'updated_at']
 
@@ -112,9 +121,18 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
     def validate_pet(self, value):
         """验证宠物是否属于当前用户"""
         user = self.context['request'].user
-        if value.owner != user and not user.type == 'admin':
+        # 检查是否是宠物主人或管理员
+        if value.owner != user and user.type != 'admin':
             raise serializers.ValidationError("您没有权限为该宠物创建日记")
         return value
+
+    def validate(self, data):
+        """验证数据完整性"""
+        # 如果设置了封面图，确保它在图片列表中
+        if data.get('cover_image') and data.get('images'):
+            if data['cover_image'] not in data['images']:
+                raise serializers.ValidationError("封面图片必须在图片列表中")
+        return data
 
 
 class PetServiceRecordListSerializer(serializers.ModelSerializer):
@@ -123,13 +141,15 @@ class PetServiceRecordListSerializer(serializers.ModelSerializer):
     service_name = serializers.SerializerMethodField()
     provider_name = serializers.SerializerMethodField()
     order_number = serializers.CharField(source='related_order.order_number', read_only=True)
+    order_status = serializers.CharField(source='related_order.status', read_only=True)
 
     class Meta:
         model = PetServiceRecord
         fields = [
-            'id', 'related_order', 'order_number', 'pet_name',
-            'service_name', 'provider_name', 'actual_start_time',
-            'actual_end_time', 'rating', 'created_at'
+            'id', 'related_order', 'order_number', 'order_status',
+            'pet_name', 'service_name', 'provider_name',
+            'actual_start_time', 'actual_end_time', 'actual_duration',
+            'rating', 'created_at'
         ]
 
     def get_pet_name(self, obj):
@@ -151,12 +171,13 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
     service_info = serializers.SerializerMethodField()
     provider_info = serializers.SerializerMethodField()
     order_info = serializers.SerializerMethodField()
+    diary_info = serializers.SerializerMethodField()
 
     class Meta:
         model = PetServiceRecord
         fields = [
             'id', 'related_order', 'related_diary', 'order_info',
-            'pet_info', 'service_info', 'provider_info',
+            'pet_info', 'service_info', 'provider_info', 'diary_info',
             'actual_start_time', 'actual_end_time', 'actual_duration',
             'pet_condition_before', 'pet_condition_after', 'pet_behavior_notes',
             'service_summary', 'professional_recommendations', 'next_service_suggestion',
@@ -173,7 +194,9 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
                 'id': pet.id,
                 'name': pet.name,
                 'breed': pet.breed,
-                'avatar': pet.avatar
+                'avatar': pet.avatar,
+                'gender': pet.gender,
+                'gender_display': pet.get_gender_display()
             }
         return None
 
@@ -182,7 +205,7 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
         if service:
             return {
                 'id': service.id,
-                'name': service.name
+                'name': service.name,
             }
         return None
 
@@ -191,7 +214,7 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
         if provider:
             return {
                 'id': provider.id,
-                'username': provider.username
+                'username': provider.username,
             }
         return None
 
@@ -200,14 +223,35 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
         return {
             'id': order.id,
             'order_number': order.order_number,
-            'status': order.status
+            'status': order.status,
+            'status_display': order.get_status_display(),
         }
+
+    def get_diary_info(self, obj):
+        """获取关联日记信息"""
+        if obj.related_diary:
+            diary = obj.related_diary
+            return {
+                'id': diary.id,
+                'title': diary.title,
+                'diary_date': diary.diary_date,
+            }
+        return None
 
     def validate(self, data):
         """验证时间逻辑"""
-        if 'actual_start_time' in data and 'actual_end_time' in data:
-            if data['actual_end_time'] <= data['actual_start_time']:
+        start_time = data.get('actual_start_time')
+        end_time = data.get('actual_end_time')
+
+        if start_time and end_time:
+            if end_time <= start_time:
                 raise serializers.ValidationError("结束时间必须晚于开始时间")
+
+        # 验证评分范围
+        rating = data.get('rating')
+        if rating is not None and (rating < 1 or rating > 5):
+            raise serializers.ValidationError("评分必须在1-5之间")
+
         return data
 
 
@@ -241,3 +285,27 @@ class PetServiceRecordCreateSerializer(serializers.ModelSerializer):
 
         return value
 
+    def validate(self, data):
+        """验证时间逻辑"""
+        start_time = data.get('actual_start_time')
+        end_time = data.get('actual_end_time')
+
+        if start_time and end_time:
+            if end_time <= start_time:
+                raise serializers.ValidationError("结束时间必须晚于开始时间")
+
+        return data
+
+
+class PetServiceRecordUpdateSerializer(serializers.ModelSerializer):
+    """宠物服务记录更新序列化器（用于客户反馈）"""
+
+    class Meta:
+        model = PetServiceRecord
+        fields = ['customer_feedback', 'rating']
+
+    def validate_rating(self, value):
+        """验证评分"""
+        if value is not None and (value < 1 or value > 5):
+            raise serializers.ValidationError("评分必须在1-5之间")
+        return value

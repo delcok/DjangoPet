@@ -6,6 +6,7 @@ from rest_framework import serializers
 from decimal import Decimal
 from bill.models import Bill, ServiceOrder
 from pet.models import Pet
+from service.models import ServiceModel, AdditionalService
 
 
 class BillSerializer(serializers.ModelSerializer):
@@ -58,6 +59,22 @@ class ServiceOrderPetSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'breed', 'age', 'weight']
 
 
+class BaseServiceSerializer(serializers.ModelSerializer):
+    """基础服务序列化器"""
+
+    class Meta:
+        model = ServiceModel
+        fields = ['id', 'name', 'base_price', 'description', 'icon']
+
+
+class AdditionalServiceSerializer(serializers.ModelSerializer):
+    """附加服务序列化器"""
+
+    class Meta:
+        model = AdditionalService
+        fields = ['id', 'name', 'price', 'description', 'icon']
+
+
 class ServiceOrderSerializer(serializers.ModelSerializer):
     """服务订单序列化器"""
     user_info = serializers.SerializerMethodField()
@@ -66,11 +83,18 @@ class ServiceOrderSerializer(serializers.ModelSerializer):
     bill_info = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
 
+    # 新增服务信息
+    base_service_info = BaseServiceSerializer(source='base_service', read_only=True)
+    additional_services_info = AdditionalServiceSerializer(source='additional_services', many=True, read_only=True)
+
     class Meta:
         model = ServiceOrder
         fields = [
             'id', 'bill', 'bill_info', 'user', 'user_info', 'staff', 'staff_info',
-            'pets', 'pets_info', 'scheduled_date', 'scheduled_time', 'duration_minutes',
+            'pets', 'pets_info',
+            'base_service', 'base_service_info',  # 新增
+            'additional_services', 'additional_services_info',  # 新增
+            'scheduled_date', 'scheduled_time', 'duration_minutes',
             'service_address', 'contact_phone', 'base_price', 'additional_price',
             'total_price', 'status', 'status_display', 'customer_notes', 'staff_notes',
             'created_at', 'updated_at'
@@ -117,12 +141,23 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
         many=True,
         help_text="宠物ID列表"
     )
+    base_service = serializers.PrimaryKeyRelatedField(
+        queryset=ServiceModel.objects.filter(is_active=True),
+        help_text="基础服务ID"
+    )
+    additional_services = serializers.PrimaryKeyRelatedField(
+        queryset=AdditionalService.objects.filter(is_active=True),
+        many=True,
+        required=False,
+        help_text="附加服务ID列表"
+    )
 
     class Meta:
         model = ServiceOrder
         fields = [
+            'base_service', 'additional_services',  # 新增
             'scheduled_date', 'scheduled_time', 'duration_minutes',
-            'service_address', 'contact_phone', 'base_price', 'additional_price',
+            'service_address', 'contact_phone',
             'customer_notes', 'pets'
         ]
 
@@ -134,27 +169,62 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(f"宠物 {pet.name} 不属于当前用户")
         return value
 
-    def validate_base_price(self, value):
-        """验证基础价格"""
-        if value <= 0:
-            raise serializers.ValidationError("基础价格必须大于0")
+    def validate_base_service(self, value):
+        """验证基础服务是否激活"""
+        if not value.is_active:
+            raise serializers.ValidationError("该基础服务已停用")
         return value
 
-    def validate_additional_price(self, value):
-        """验证附加价格"""
-        if value < 0:
-            raise serializers.ValidationError("附加价格不能小于0")
+    def validate_additional_services(self, value):
+        """验证附加服务是否激活"""
+        for service in value:
+            if not service.is_active:
+                raise serializers.ValidationError(f"附加服务 {service.name} 已停用")
         return value
+
+    def create(self, validated_data):
+        """创建订单并自动计算价格"""
+        additional_services = validated_data.pop('additional_services', [])
+        pets = validated_data.pop('pets', [])
+
+        # 计算价格
+        base_service = validated_data['base_service']
+        base_price = base_service.base_price
+        additional_price = sum(service.price for service in additional_services)
+
+        # 创建订单
+        order = ServiceOrder.objects.create(
+            **validated_data,
+            base_price=base_price,
+            additional_price=additional_price,
+            total_price=base_price + additional_price
+        )
+
+        # 关联宠物
+        order.pets.set(pets)
+
+        # 关联附加服务
+        if additional_services:
+            order.additional_services.set(additional_services)
+
+        return order
 
 
 class ServiceOrderUpdateSerializer(serializers.ModelSerializer):
     """更新服务订单序列化器"""
+    additional_services = serializers.PrimaryKeyRelatedField(
+        queryset=AdditionalService.objects.filter(is_active=True),
+        many=True,
+        required=False,
+        help_text="附加服务ID列表"
+    )
 
     class Meta:
         model = ServiceOrder
         fields = [
             'staff', 'scheduled_date', 'scheduled_time', 'duration_minutes',
-            'service_address', 'contact_phone', 'status', 'customer_notes', 'staff_notes'
+            'service_address', 'contact_phone', 'status', 'customer_notes',
+            'staff_notes', 'additional_services'  # 允许更新附加服务
         ]
 
     def validate_status(self, value):
@@ -177,20 +247,43 @@ class ServiceOrderUpdateSerializer(serializers.ModelSerializer):
                 )
         return value
 
+    def update(self, instance, validated_data):
+        """更新订单并重新计算价格"""
+        additional_services = validated_data.pop('additional_services', None)
+
+        # 更新基本字段
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        # 如果更新了附加服务,重新计算价格
+        if additional_services is not None:
+            instance.additional_services.set(additional_services)
+            instance.update_prices()  # 使用模型中的方法重新计算价格
+
+        instance.save()
+        return instance
+
 
 class ServiceOrderSimpleSerializer(serializers.ModelSerializer):
     """简单的服务订单序列化器（用于列表展示）"""
     user_name = serializers.CharField(source='user.username', read_only=True)
     pets_count = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    base_service_name = serializers.CharField(source='base_service.name', read_only=True)
+    additional_services_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceOrder
         fields = [
-            'id', 'user_name', 'pets_count', 'scheduled_date', 'scheduled_time',
+            'id', 'user_name', 'pets_count', 'base_service_name',
+            'additional_services_count', 'scheduled_date', 'scheduled_time',
             'total_price', 'status', 'status_display', 'created_at'
         ]
 
     def get_pets_count(self, obj):
         """获取宠物数量"""
         return obj.pets.count()
+
+    def get_additional_services_count(self, obj):
+        """获取附加服务数量"""
+        return obj.additional_services.count()

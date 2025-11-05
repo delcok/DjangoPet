@@ -183,6 +183,7 @@ class ServiceOrderViewSet(ModelViewSet):
         'scheduled_date': ['gte', 'lte', 'exact'],
         'created_at': ['gte', 'lte', 'date'],
         'staff': ['exact'],
+        'base_service': ['exact'],  # 新增:按基础服务过滤
         'total_price': ['gte', 'lte'],
     }
 
@@ -200,13 +201,13 @@ class ServiceOrderViewSet(ModelViewSet):
         # 超级管理员可以查看所有订单
         if hasattr(user, '__class__') and user.__class__.__name__ == 'SuperAdmin':
             return ServiceOrder.objects.select_related(
-                'user', 'staff', 'bill'
-            ).prefetch_related('pets').all()
+                'user', 'staff', 'bill', 'base_service'  # 新增预加载
+            ).prefetch_related('pets', 'additional_services').all()  # 新增预加载
 
         # 普通用户只能查看自己的订单
         return ServiceOrder.objects.select_related(
-            'user', 'staff', 'bill'
-        ).prefetch_related('pets').filter(user=user)
+            'user', 'staff', 'bill', 'base_service'  # 新增预加载
+        ).prefetch_related('pets', 'additional_services').filter(user=user)  # 新增预加载
 
     def get_serializer_class(self):
         """根据动作选择序列化器"""
@@ -219,12 +220,11 @@ class ServiceOrderViewSet(ModelViewSet):
         return ServiceOrderSerializer
 
     def perform_create(self, serializer):
-        """创建订单时设置用户"""
-        # 首先创建账单
-        total_amount = serializer.validated_data['base_price'] + serializer.validated_data.get('additional_price',
-                                                                                               Decimal('0.00'))
-
+        """创建订单时设置用户并创建账单"""
         with transaction.atomic():
+            # 先保存订单以计算价格(在serializer的create方法中已经计算)
+            order = serializer.save(user=self.request.user)
+
             # 生成唯一订单号
             pay_helper = WeChatPayHelper()
             out_trade_no = pay_helper.generate_out_trade_no()
@@ -234,14 +234,15 @@ class ServiceOrderViewSet(ModelViewSet):
                 out_trade_no=out_trade_no,
                 user=self.request.user,
                 transaction_type='payment',
-                amount=total_amount,
+                amount=order.total_price,
                 payment_method='wechat',
                 payment_status='pending',
-                description='宠物服务订单'
+                description=f'宠物服务订单 - {order.base_service.name}'
             )
 
-            # 创建服务订单
-            serializer.save(user=self.request.user, bill=bill)
+            # 关联账单
+            order.bill = bill
+            order.save()
 
     @action(detail=False, methods=['get'])
     def my_orders(self, request):
@@ -321,6 +322,12 @@ class ServiceOrderViewSet(ModelViewSet):
             total_amount=Sum('total_price')
         )
 
+        # 按基础服务统计(新增)
+        service_stats = queryset.values('base_service__name').annotate(
+            count=Count('id'),
+            total_amount=Sum('total_price')
+        )
+
         # 总金额统计
         total_amount = queryset.aggregate(
             total=Sum('total_price')
@@ -334,6 +341,7 @@ class ServiceOrderViewSet(ModelViewSet):
 
         return Response({
             'status_statistics': list(status_stats),
+            'service_statistics': list(service_stats),  # 新增
             'total_amount': total_amount,
             'total_count': queryset.count(),
             'today_orders': today_orders

@@ -15,7 +15,6 @@ class User(models.Model):
         ('O', '其他'),
         ('U', '未设置'),
     ]
-
     # 基础信息
     username = models.CharField(max_length=30, verbose_name='用户名', blank=True)
     avatar = models.URLField(max_length=500, blank=True, default="", verbose_name="头像")

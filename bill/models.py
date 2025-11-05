@@ -2,6 +2,7 @@ from django.db import models
 
 from staff.models import Staff
 from user.models import User
+from service.models import ServiceModel, AdditionalService  # 导入服务模型
 
 
 class Bill(models.Model):
@@ -50,12 +51,25 @@ class ServiceOrder(models.Model):
         ('completed', '已完成'),
         ('cancelled', '已取消'),
     ]
-    bill = models.OneToOneField(Bill, on_delete=models.CASCADE, related_name='service_order', verbose_name='账单')
 
+    bill = models.OneToOneField(Bill, on_delete=models.CASCADE, related_name='service_order', verbose_name='账单')
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='service_orders', verbose_name='用户')
     staff = models.ForeignKey(Staff, on_delete=models.CASCADE, related_name='service_orders', verbose_name='员工',
                               blank=True, null=True)
     pets = models.ManyToManyField("pet.Pet", verbose_name='服务宠物')
+
+    base_service = models.ForeignKey(
+        ServiceModel,
+        on_delete=models.PROTECT,
+        related_name='orders',
+        verbose_name='基础服务'
+    )
+    additional_services = models.ManyToManyField(
+        AdditionalService,
+        blank=True,
+        related_name='orders',
+        verbose_name='附加服务'
+    )
 
     # 服务时间
     scheduled_date = models.DateField(verbose_name='预约日期')
@@ -92,3 +106,22 @@ class ServiceOrder(models.Model):
         # 自动计算总价格
         self.total_price = self.base_price + self.additional_price
         super().save(*args, **kwargs)
+
+    def calculate_total_price(self):
+        """
+        计算订单总价格（基础服务 + 所有附加服务）
+        注意：此方法需要在订单保存后且附加服务关联后调用
+        """
+        base_price = self.base_service.base_price if self.base_service else 0
+        additional_price = sum(service.price for service in self.additional_services.all())
+        return base_price + additional_price
+
+    def update_prices(self):
+        """
+        更新订单价格字段
+        在添加/修改服务后调用此方法来同步价格
+        """
+        self.base_price = self.base_service.base_price if self.base_service else 0
+        self.additional_price = sum(service.price for service in self.additional_services.all())
+        self.total_price = self.base_price + self.additional_price
+        self.save()
