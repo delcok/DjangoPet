@@ -6,20 +6,22 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from bill.views import (
-    wechat_callback, CreatePaymentView,
-    BillViewSet, ServiceOrderViewSet
+    ServiceOrderViewSet,
+    BillViewSet,
+    wechat_callback,
+    CreatePaymentView
 )
 
 # 创建路由器
 router = DefaultRouter()
-router.register(r'bills', BillViewSet, basename='bill')
 router.register(r'service-orders', ServiceOrderViewSet, basename='serviceorder')
+router.register(r'bills', BillViewSet, basename='bill')
 
 urlpatterns = [
     # API路由
     path('', include(router.urls)),
 
     # 支付相关
-    path('wechat_callback/<str:callback_type>/', wechat_callback, name='wechat_pay_notify'),
+    path('wechat_callback/<str:callback_type>/', wechat_callback, name='wechat_callback'),
     path('wechatpay/create_payment/', CreatePaymentView.as_view(), name='create_payment'),
 ]

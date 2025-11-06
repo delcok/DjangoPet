@@ -1,499 +1,531 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2025/8/25 16:40
-# @Author  : Delock
+# @Time    : 2025/11/04
+# @Author  : Modified for better order flow
 
-import logging
-from decimal import Decimal
-from django.db import transaction
-from django.db.models import Q, Sum, Count
-from django.http import HttpResponse
-from rest_framework import status, generics, permissions, filters
-from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework import viewsets, status, filters
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from django.views.decorators.csrf import csrf_exempt
 from rest_framework.views import APIView
-from rest_framework.viewsets import ModelViewSet
 from django_filters.rest_framework import DjangoFilterBackend
-from wechatpy import WeChatPayException
+from django.db.models import Sum, Count
+from django.utils import timezone
 
 from bill.models import Bill, ServiceOrder
 from bill.serializers import (
-    BillSerializer, BillCreateSerializer, ServiceOrderSerializer,
-    ServiceOrderCreateSerializer, ServiceOrderUpdateSerializer,
-    ServiceOrderSimpleSerializer
+    # 服务订单序列化器
+    ServiceOrderListSerializer,
+    ServiceOrderDetailSerializer,
+    ServiceOrderCreateSerializer,
+    ServiceOrderUpdateSerializer,
+    ServiceOrderCancelSerializer,
+    # 账单序列化器
+    BillListSerializer,
+    BillDetailSerializer,
+    CreatePaymentBillSerializer,
+    RefundBillSerializer,
 )
-from bill.pagination import BillPagination, ServiceOrderPagination, SmallResultsSetPagination
-from utils.authentication import UserAuthentication, AdminAuthentication
-from utils.permission import IsOwnerOrAdmin, IsUserOwner
-from utils.wechat_pay import WeChatPayHelper
-
-logger = logging.getLogger(__name__)
+from bill.filters import ServiceOrderFilter, BillFilter
+from bill.pagination import StandardResultsSetPagination
 
 
-class BillViewSet(ModelViewSet):
-    """账单视图集"""
+class ServiceOrderViewSet(viewsets.ModelViewSet):
+    """
+    服务订单视图集
 
-    queryset = Bill.objects.all()
-    serializer_class = BillSerializer
-    authentication_classes = [UserAuthentication, AdminAuthentication]
-    permission_classes = [IsAuthenticated, IsOwnerOrAdmin]
-    pagination_class = BillPagination
+    list: 获取订单列表
+    create: 创建服务订单（选择服务后创建）
+    retrieve: 获取订单详情
+    update/partial_update: 修改订单信息（仅限待支付/已支付状态）
+    destroy: 不允许删除订单
+
+    自定义动作：
+    - cancel: 取消订单
+    - create_payment: 创建支付账单
+    - statistics: 获取订单统计信息
+    """
+    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-
-    # 过滤字段
-    filterset_fields = {
-        'transaction_type': ['exact'],
-        'payment_method': ['exact'],
-        'payment_status': ['exact'],
-        'created_at': ['gte', 'lte', 'exact', 'date'],
-        'amount': ['gte', 'lte'],
-    }
-
-    # 搜索字段
-    search_fields = ['out_trade_no', 'wechat_transaction_id', 'description']
-
-    # 排序字段
-    ordering_fields = ['created_at', 'amount', 'payment_status']
+    filterset_class = ServiceOrderFilter
+    search_fields = ['service_address', 'contact_phone', 'customer_notes']
+    ordering_fields = ['created_at', 'scheduled_date', 'total_price', 'status']
     ordering = ['-created_at']
+    pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
-        """根据用户类型过滤查询集"""
-        user = self.request.user
+        """获取查询集"""
+        queryset = ServiceOrder.objects.select_related(
+            'user', 'staff', 'base_service'
+        ).prefetch_related(
+            'pets', 'additional_services', 'bills'
+        )
 
-        # 超级管理员可以查看所有账单
-        if hasattr(user, '__class__') and user.__class__.__name__ == 'SuperAdmin':
-            return Bill.objects.select_related('user').all()
+        # 普通用户只能看到自己的订单
+        if not self.request.user.is_staff:
+            queryset = queryset.filter(user=self.request.user)
 
-        # 普通用户只能查看自己的账单
-        return Bill.objects.select_related('user').filter(user=user)
+        return queryset
 
     def get_serializer_class(self):
-        """根据动作选择序列化器"""
-        if self.action == 'create':
-            return BillCreateSerializer
-        return BillSerializer
+        """根据操作返回不同的序列化器"""
+        if self.action == 'list':
+            return ServiceOrderListSerializer
+        elif self.action == 'create':
+            return ServiceOrderCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return ServiceOrderUpdateSerializer
+        elif self.action == 'cancel':
+            return ServiceOrderCancelSerializer
+        return ServiceOrderDetailSerializer
+
+    def perform_destroy(self, instance):
+        """禁止删除订单"""
+        raise ValidationError("订单不允许删除")
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """
+        取消订单
+        POST /api/bill/service-orders/{id}/cancel/
+        {
+            "cancel_reason": "取消原因"
+        }
+        """
+        service_order = self.get_object()
+        serializer = ServiceOrderCancelSerializer(
+            service_order,
+            data=request.data,
+            context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({
+            'message': '订单已取消',
+            'order_id': service_order.id,
+            'status': service_order.status
+        })
+
+    @action(detail=True, methods=['post'])
+    def create_payment(self, request, pk=None):
+        """
+        为服务订单创建支付账单
+        POST /api/bill/service-orders/{id}/create_payment/
+        {
+            "payment_method": "wechat"  // wechat/alipay/balance/cash
+        }
+        """
+        service_order = self.get_object()
+
+        # 构建请求数据
+        data = {
+            'service_order_id': service_order.id,
+            'payment_method': request.data.get('payment_method', 'wechat')
+        }
+
+        serializer = CreatePaymentBillSerializer(
+            data=data,
+            context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        bill = serializer.save()
+
+        # 返回创建的账单信息
+        return Response({
+            'message': '支付订单创建成功',
+            'bill': BillDetailSerializer(bill).data,
+            'payment_info': {
+                'out_trade_no': bill.out_trade_no,
+                'amount': str(bill.amount),
+                'payment_method': bill.payment_method,
+                # 这里可以添加调用第三方支付接口的逻辑
+                # 'payment_url': '...',  # 支付链接
+                # 'qr_code': '...',      # 二维码
+            }
+        }, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'])
     def statistics(self, request):
-        """获取账单统计信息"""
+        """
+        获取订单统计信息
+        GET /api/bill/service-orders/statistics/
+        """
         queryset = self.get_queryset()
 
-        # 总金额统计
-        total_amount = queryset.aggregate(
-            total=Sum('amount')
-        )['total'] or Decimal('0.00')
+        # 基础统计
+        total_count = queryset.count()
+        total_amount = queryset.filter(
+            status__in=['paid', 'confirmed', 'assigned', 'in_progress', 'completed']
+        ).aggregate(total=Sum('final_price'))['total'] or 0
 
-        # 按状态统计
-        status_stats = queryset.values('payment_status').annotate(
+        # 状态分布
+        status_distribution = queryset.values('status').annotate(
             count=Count('id'),
-            amount=Sum('amount')
+            amount=Sum('final_price')
+        ).order_by('status')
+
+        # 今日统计
+        today = timezone.now().date()
+        today_orders = queryset.filter(created_at__date=today)
+        today_count = today_orders.count()
+        today_amount = today_orders.filter(
+            status__in=['paid', 'confirmed', 'assigned', 'in_progress', 'completed']
+        ).aggregate(total=Sum('final_price'))['total'] or 0
+
+        # 本月统计
+        current_month = timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_orders = queryset.filter(created_at__gte=current_month)
+        month_count = month_orders.count()
+        month_amount = month_orders.filter(
+            status__in=['paid', 'confirmed', 'assigned', 'in_progress', 'completed']
+        ).aggregate(total=Sum('final_price'))['total'] or 0
+
+        return Response({
+            'total': {
+                'count': total_count,
+                'amount': str(total_amount)
+            },
+            'today': {
+                'count': today_count,
+                'amount': str(today_amount)
+            },
+            'month': {
+                'count': month_count,
+                'amount': str(month_amount)
+            },
+            'status_distribution': [{
+                'status': item['status'],
+                'status_display': dict(ServiceOrder.STATUS_CHOICES).get(item['status']),
+                'count': item['count'],
+                'amount': str(item['amount'] or 0)
+            } for item in status_distribution]
+        })
+
+
+class BillViewSet(viewsets.ModelViewSet):
+    """
+    账单/支付订单视图集
+
+    list: 获取账单列表
+    retrieve: 获取账单详情
+    create: 不允许直接创建账单（通过服务订单创建）
+    update/destroy: 不允许修改或删除账单
+
+    自定义动作：
+    - create_payment: 为服务订单创建支付账单
+    - create_refund: 创建退款账单
+    - check_status: 检查支付状态
+    - statistics: 获取账单统计信息
+    """
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = BillFilter
+    search_fields = ['out_trade_no', 'third_party_no', 'description']
+    ordering_fields = ['created_at', 'amount', 'payment_status']
+    ordering = ['-created_at']
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        """获取查询集"""
+        queryset = Bill.objects.select_related(
+            'user', 'service_order', 'original_bill'
+        )
+
+        # 普通用户只能看到自己的账单
+        if not self.request.user.is_staff:
+            queryset = queryset.filter(user=self.request.user)
+
+        return queryset
+
+    def get_serializer_class(self):
+        """根据操作返回不同的序列化器"""
+        if self.action == 'list':
+            return BillListSerializer
+        return BillDetailSerializer
+
+    def create(self, request, *args, **kwargs):
+        """禁止直接创建账单"""
+        return Response(
+            {'error': '请通过服务订单创建支付账单'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    def update(self, request, *args, **kwargs):
+        """禁止修改账单"""
+        return Response(
+            {'error': '账单不允许修改'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        """禁止删除账单"""
+        return Response(
+            {'error': '账单不允许删除'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    @action(detail=False, methods=['post'])
+    def create_payment(self, request):
+        """
+        为服务订单创建支付账单
+        POST /api/bill/bills/create_payment/
+        {
+            "service_order_id": 1,
+            "payment_method": "wechat"
+        }
+        """
+        serializer = CreatePaymentBillSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        bill = serializer.save()
+
+        return Response({
+            'message': '支付账单创建成功',
+            'bill': BillDetailSerializer(bill).data
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def create_refund(self, request):
+        """
+        创建退款账单
+        POST /api/bill/bills/create_refund/
+        {
+            "service_order_id": 1,
+            "refund_amount": 100.00,  // 可选，不填则全额退款
+            "refund_reason": "退款原因"
+        }
+        """
+        serializer = RefundBillSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        refund_bill = serializer.save()
+
+        return Response({
+            'message': '退款申请已创建',
+            'bill': BillDetailSerializer(refund_bill).data
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'])
+    def check_status(self, request, pk=None):
+        """
+        检查支付状态
+        GET /api/bill/bills/{id}/check_status/
+
+        这里可以调用第三方支付接口查询实际支付状态
+        """
+        bill = self.get_object()
+
+        # TODO: 调用第三方支付接口查询实际状态
+        # 示例逻辑：
+        # if bill.payment_method == 'wechat':
+        #     status = check_wechat_payment_status(bill.out_trade_no)
+        #     if status == 'SUCCESS':
+        #         bill.mark_as_paid(third_party_no='...')
+
+        return Response({
+            'out_trade_no': bill.out_trade_no,
+            'payment_status': bill.payment_status,
+            'payment_status_display': bill.get_payment_status_display(),
+            'amount': str(bill.amount),
+            'paid_at': bill.paid_at
+        })
+
+    @action(detail=False, methods=['get'])
+    def statistics(self, request):
+        """
+        获取账单统计信息
+        GET /api/bill/bills/statistics/
+        """
+        queryset = self.get_queryset()
+
+        # 总体统计
+        total_stats = queryset.aggregate(
+            total_count=Count('id'),
+            total_amount=Sum('amount')
         )
 
         # 按交易类型统计
         type_stats = queryset.values('transaction_type').annotate(
             count=Count('id'),
             amount=Sum('amount')
-        )
+        ).order_by('transaction_type')
+
+        # 按支付方式统计
+        method_stats = queryset.filter(
+            transaction_type='payment',
+            payment_status='success'
+        ).values('payment_method').annotate(
+            count=Count('id'),
+            amount=Sum('amount')
+        ).order_by('payment_method')
+
+        # 今日收入
+        today = timezone.now().date()
+        today_income = queryset.filter(
+            transaction_type='payment',
+            payment_status='success',
+            paid_at__date=today
+        ).aggregate(total=Sum('amount'))['total'] or 0
+
+        # 本月收入
+        current_month = timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_income = queryset.filter(
+            transaction_type='payment',
+            payment_status='success',
+            paid_at__gte=current_month
+        ).aggregate(total=Sum('amount'))['total'] or 0
 
         return Response({
-            'total_amount': total_amount,
-            'status_statistics': list(status_stats),
-            'type_statistics': list(type_stats),
-            'total_count': queryset.count()
+            'total': {
+                'count': total_stats['total_count'] or 0,
+                'amount': str(total_stats['total_amount'] or 0)
+            },
+            'today_income': str(today_income),
+            'month_income': str(month_income),
+            'by_type': [{
+                'type': item['transaction_type'],
+                'type_display': dict(Bill.TRANSACTION_TYPE_CHOICES).get(item['transaction_type']),
+                'count': item['count'],
+                'amount': str(item['amount'] or 0)
+            } for item in type_stats],
+            'by_payment_method': [{
+                'method': item['payment_method'],
+                'method_display': dict(Bill.PAYMENT_CHOICES).get(item['payment_method']),
+                'count': item['count'],
+                'amount': str(item['amount'] or 0)
+            } for item in method_stats]
         })
 
-    @action(detail=True, methods=['post'])
-    def refund(self, request, pk=None):
-        """申请退款"""
-        bill = self.get_object()
 
-        # 检查是否可以退款
-        if bill.transaction_type != 'payment':
-            return Response(
-                {'error': '只有付款记录可以申请退款'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+@api_view(['POST'])
+@permission_classes([AllowAny])  # 支付回调通常不需要认证
+def wechat_callback(request, callback_type):
+    """
+    微信支付回调
+    POST /api/bill/wechat_callback/payment/  支付回调
+    POST /api/bill/wechat_callback/refund/   退款回调
+    """
+    # TODO: 验证微信签名
+    # TODO: 解析微信回调数据
 
-        if bill.payment_status != 'completed':
-            return Response(
-                {'error': '只有已完成的付款可以申请退款'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # 检查是否已经有退款记录
-        if Bill.objects.filter(
-                wechat_transaction_id=bill.wechat_transaction_id,
-                transaction_type='refund'
-        ).exists():
-            return Response(
-                {'error': '该订单已申请过退款'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    if callback_type == 'payment':
+        # 处理支付回调
+        out_trade_no = request.data.get('out_trade_no')
+        transaction_id = request.data.get('transaction_id')
+        result_code = request.data.get('result_code')
 
         try:
-            with transaction.atomic():
-                # 调用微信退款接口
-                pay_helper = WeChatPayHelper()
-                refund_result = pay_helper.create_refund_order(
-                    out_trade_no=bill.out_trade_no,
-                    total_fee=int(bill.amount * 100),
-                    refund_fee=int(bill.amount * 100),
-                    refund_desc='用户申请退款'
-                )
+            bill = Bill.objects.get(out_trade_no=out_trade_no)
 
-                # 创建退款记录
-                refund_bill = Bill.objects.create(
-                    out_trade_no=pay_helper.generate_out_trade_no(),
-                    wechat_transaction_id=bill.wechat_transaction_id,
-                    user=bill.user,
-                    transaction_type='refund',
-                    amount=bill.amount,
-                    payment_method=bill.payment_method,
-                    payment_status='pending',
-                    description=f'退款：{bill.out_trade_no}'
-                )
+            if result_code == 'SUCCESS' and bill.payment_status == 'pending':
+                # 标记为已支付
+                bill.mark_as_paid(third_party_no=transaction_id)
 
                 return Response({
-                    'message': '退款申请成功',
-                    'refund_bill_id': refund_bill.id
+                    'code': 'SUCCESS',
+                    'message': '成功'
                 })
 
-        except WeChatPayException as e:
-            logger.error(f"退款申请失败: {e}")
-            return Response(
-                {'error': '退款申请失败，请稍后重试'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        except Bill.DoesNotExist:
+            return Response({
+                'code': 'FAIL',
+                'message': '订单不存在'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    elif callback_type == 'refund':
+        # 处理退款回调
+        out_refund_no = request.data.get('out_refund_no')
+        refund_status = request.data.get('refund_status')
+
+        try:
+            refund_bill = Bill.objects.get(
+                out_trade_no=out_refund_no,
+                transaction_type='refund'
             )
 
+            if refund_status == 'SUCCESS':
+                refund_bill.payment_status = 'refunded'
+                refund_bill.save()
 
-class ServiceOrderViewSet(ModelViewSet):
-    """服务订单视图集"""
+                # 更新服务订单状态
+                if refund_bill.service_order:
+                    refund_bill.service_order.status = 'refunded'
+                    refund_bill.service_order.save()
 
-    queryset = ServiceOrder.objects.all()
-    serializer_class = ServiceOrderSerializer
-    authentication_classes = [UserAuthentication, AdminAuthentication]
-    permission_classes = [IsAuthenticated, IsOwnerOrAdmin]
-    pagination_class = ServiceOrderPagination
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+                return Response({
+                    'code': 'SUCCESS',
+                    'message': '成功'
+                })
 
-    # 过滤字段
-    filterset_fields = {
-        'status': ['exact'],
-        'scheduled_date': ['gte', 'lte', 'exact'],
-        'created_at': ['gte', 'lte', 'date'],
-        'staff': ['exact'],
-        'base_service': ['exact'],  # 新增:按基础服务过滤
-        'total_price': ['gte', 'lte'],
-    }
+        except Bill.DoesNotExist:
+            return Response({
+                'code': 'FAIL',
+                'message': '退款订单不存在'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-    # 搜索字段
-    search_fields = ['service_address', 'contact_phone', 'customer_notes']
-
-    # 排序字段
-    ordering_fields = ['created_at', 'scheduled_date', 'total_price', 'status']
-    ordering = ['-created_at']
-
-    def get_queryset(self):
-        """根据用户类型过滤查询集"""
-        user = self.request.user
-
-        # 超级管理员可以查看所有订单
-        if hasattr(user, '__class__') and user.__class__.__name__ == 'SuperAdmin':
-            return ServiceOrder.objects.select_related(
-                'user', 'staff', 'bill', 'base_service'  # 新增预加载
-            ).prefetch_related('pets', 'additional_services').all()  # 新增预加载
-
-        # 普通用户只能查看自己的订单
-        return ServiceOrder.objects.select_related(
-            'user', 'staff', 'bill', 'base_service'  # 新增预加载
-        ).prefetch_related('pets', 'additional_services').filter(user=user)  # 新增预加载
-
-    def get_serializer_class(self):
-        """根据动作选择序列化器"""
-        if self.action == 'create':
-            return ServiceOrderCreateSerializer
-        elif self.action in ['update', 'partial_update']:
-            return ServiceOrderUpdateSerializer
-        elif self.action == 'list':
-            return ServiceOrderSimpleSerializer
-        return ServiceOrderSerializer
-
-    def perform_create(self, serializer):
-        """创建订单时设置用户并创建账单"""
-        with transaction.atomic():
-            # 先保存订单以计算价格(在serializer的create方法中已经计算)
-            order = serializer.save(user=self.request.user)
-
-            # 生成唯一订单号
-            pay_helper = WeChatPayHelper()
-            out_trade_no = pay_helper.generate_out_trade_no()
-
-            # 创建账单
-            bill = Bill.objects.create(
-                out_trade_no=out_trade_no,
-                user=self.request.user,
-                transaction_type='payment',
-                amount=order.total_price,
-                payment_method='wechat',
-                payment_status='pending',
-                description=f'宠物服务订单 - {order.base_service.name}'
-            )
-
-            # 关联账单
-            order.bill = bill
-            order.save()
-
-    @action(detail=False, methods=['get'])
-    def my_orders(self, request):
-        """获取我的订单（移动端友好）"""
-        queryset = self.get_queryset().filter(user=request.user)
-
-        # 使用小分页器
-        self.pagination_class = SmallResultsSetPagination
-
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = ServiceOrderSimpleSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = ServiceOrderSimpleSerializer(queryset, many=True)
-        return Response(serializer.data)
-
-    @action(detail=True, methods=['post'])
-    def confirm(self, request, pk=None):
-        """确认订单（管理员操作）"""
-        order = self.get_object()
-
-        if order.status != 'pending':
-            return Response(
-                {'error': '只能确认待确认的订单'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        staff_id = request.data.get('staff_id')
-        if not staff_id:
-            return Response(
-                {'error': '请指定服务员工'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        order.status = 'confirmed'
-        order.staff_id = staff_id
-        order.save()
-
-        serializer = self.get_serializer(order)
-        return Response(serializer.data)
-
-    @action(detail=True, methods=['post'])
-    def cancel(self, request, pk=None):
-        """取消订单"""
-        order = self.get_object()
-
-        if order.status not in ['pending', 'confirmed']:
-            return Response(
-                {'error': '该订单无法取消'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        reason = request.data.get('reason', '')
-
-        with transaction.atomic():
-            order.status = 'cancelled'
-            order.customer_notes = f"{order.customer_notes}\n取消原因：{reason}".strip()
-            order.save()
-
-            # 如果有关联的账单，需要处理退款
-            if order.bill and order.bill.payment_status == 'completed':
-                # 这里可以调用退款接口或创建退款记录
-                pass
-
-        serializer = self.get_serializer(order)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['get'])
-    def statistics(self, request):
-        """获取订单统计信息"""
-        queryset = self.get_queryset()
-
-        # 按状态统计
-        status_stats = queryset.values('status').annotate(
-            count=Count('id'),
-            total_amount=Sum('total_price')
-        )
-
-        # 按基础服务统计(新增)
-        service_stats = queryset.values('base_service__name').annotate(
-            count=Count('id'),
-            total_amount=Sum('total_price')
-        )
-
-        # 总金额统计
-        total_amount = queryset.aggregate(
-            total=Sum('total_price')
-        )['total'] or Decimal('0.00')
-
-        # 今日订单数
-        from django.utils import timezone
-        today_orders = queryset.filter(
-            created_at__date=timezone.now().date()
-        ).count()
-
-        return Response({
-            'status_statistics': list(status_stats),
-            'service_statistics': list(service_stats),  # 新增
-            'total_amount': total_amount,
-            'total_count': queryset.count(),
-            'today_orders': today_orders
-        })
-
-
-# 保持原有的支付相关视图
-def error_response(message, return_code='FAIL'):
-    """统一的错误响应格式"""
-    return HttpResponse(
-        f'<xml><return_code><![CDATA[{return_code}]]></return_code>'
-        f'<return_msg><![CDATA[{message}]]></return_msg></xml>'
-    )
-
-
-def handle_payment_callback(data):
-    """处理支付回调逻辑"""
-    out_trade_no = data.get('out_trade_no')
-    transaction_id = data.get('transaction_id')
-    trade_status = data.get('result_code')
-    bill = None
-    try:
-        bill = Bill.objects.get(out_trade_no=out_trade_no, transaction_type='payment')
-    except Bill.DoesNotExist:
-        logger.error(f"未找到对应的Bill: out_trade_no={out_trade_no}")
-        return
-
-    if trade_status == 'SUCCESS':
-        bill.payment_status = 'completed'
-        bill.save()
-        logger.info(f"Bill已完成: out_trade_no={out_trade_no}, transaction_id={transaction_id}")
-    else:
-        bill.payment_status = 'failed'
-        bill.save()
-        logger.warning(f"支付失败: out_trade_no={out_trade_no}, trade_status={trade_status}")
-
-
-@csrf_exempt
-def wechat_callback(request, callback_type):
-    """统一处理支付和退款的回调"""
-    if request.method != 'POST':
-        return HttpResponse(status=405)
-
-    pay_helper = WeChatPayHelper()
-    xml = request.body
-
-    data = pay_helper.parse_callback(xml, callback_type=callback_type)
-    if callback_type == 'payment':
-        signature = data.get('sign')
-        if not signature:
-            logger.error("签名缺失")
-            return error_response("Missing Signature")
-
-        if not pay_helper.verify_signature(xml, signature):
-            logger.error("签名验证失败")
-            return error_response("Invalid Signature")
-
-    try:
-        if callback_type == 'payment':
-            handle_payment_callback(data)
-        else:
-            logger.error(f"微信支付问题未知的回调类型: {callback_type}")
-            return error_response("Unknown Callback Type")
-
-        return HttpResponse('<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>')
-    except WeChatPayException as e:
-        logger.error(f"WeChatPayException: {e}")
-        return error_response("WeChatPay Exception")
-    except Exception as e:
-        logger.error(f"回调处理失败: {e}")
-        return error_response("Internal Error")
+    return Response({
+        'code': 'FAIL',
+        'message': '未知的回调类型'
+    }, status=status.HTTP_400_BAD_REQUEST)
 
 
 class CreatePaymentView(APIView):
-    """创建支付订单的API视图"""
-
-    authentication_classes = [UserAuthentication]
+    """
+    统一的支付创建接口
+    用于处理各种支付场景
+    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        """创建支付订单"""
-        data = request.data
-        openid = data.get('open_id')
-        total_fee = data.get('total_fee')
-        body = data.get('body', '用户支付')
+        """
+        创建支付
+        POST /api/bill/wechatpay/create_payment/
+        {
+            "payment_type": "service_order",  // 支付类型
+            "service_order_id": 1,            // 服务订单ID
+            "payment_method": "wechat"        // 支付方式
+        }
+        """
+        payment_type = request.data.get('payment_type')
 
-        # 参数验证
-        if not all([openid, total_fee]):
-            return Response(
-                {'error': '缺少必要参数'},
-                status=status.HTTP_400_BAD_REQUEST
+        if payment_type == 'service_order':
+            # 服务订单支付
+            serializer = CreatePaymentBillSerializer(
+                data={
+                    'service_order_id': request.data.get('service_order_id'),
+                    'payment_method': request.data.get('payment_method', 'wechat')
+                },
+                context={'request': request}
             )
+            serializer.is_valid(raise_exception=True)
+            bill = serializer.save()
 
-        try:
-            total_fee = int(total_fee)
-            if total_fee <= 0:
-                raise ValueError("金额必须大于0")
-        except (ValueError, TypeError):
-            return Response(
-                {'error': '金额格式不正确'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            # TODO: 调用第三方支付接口
+            # payment_result = create_wechat_payment(bill)
 
-        # 验证openid
-        if openid != request.user.openid:
-            return Response(
-                {'error': 'openid不匹配'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        logger.info(f"用户开始创建支付订单: 用户ID={request.user.id}, openid={openid}, 金额={total_fee}")
-
-        pay_helper = WeChatPayHelper()
-        try:
-            with transaction.atomic():
-                # 生成唯一订单号
-                out_trade_no = pay_helper.generate_out_trade_no()
-
-                # 创建支付订单
-                order = pay_helper.create_payment_order(
-                    openid, total_fee, body, out_trade_no=out_trade_no
-                )
-
-                # 创建Bill记录
-                bill = Bill.objects.create(
-                    out_trade_no=out_trade_no,
-                    user=request.user,
-                    transaction_type='payment',
-                    amount=Decimal(total_fee) / 100,  # 转换为元
-                    payment_method='wechat',
-                    payment_status='pending',
-                    description=body,
-                )
-
-                logger.info(f"创建支付订单成功: 用户ID={request.user.id}, 订单号={out_trade_no}")
-
-                response_data = {
-                    'order': order,
-                    'bill_id': bill.id,
-                    'out_trade_no': out_trade_no
+            return Response({
+                'success': True,
+                'message': '支付订单创建成功',
+                'data': {
+                    'out_trade_no': bill.out_trade_no,
+                    'amount': str(bill.amount),
+                    'payment_method': bill.payment_method,
+                    # 'payment_url': payment_result.get('payment_url'),
+                    # 'qr_code': payment_result.get('qr_code'),
                 }
-                return Response(response_data, status=status.HTTP_200_OK)
+            }, status=status.HTTP_201_CREATED)
 
-        except WeChatPayException as e:
-            logger.error(f"WeChatPayException: {e}")
-            return Response(
-                {'error': '微信支付异常'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-        except Exception as e:
-            logger.error(f"创建支付订单失败: {e}")
-            return Response(
-                {'error': '创建支付订单失败'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        elif payment_type == 'recharge':
+            # 余额充值
+            # TODO: 实现充值逻辑
+            pass
+
+        else:
+            return Response({
+                'success': False,
+                'message': '不支持的支付类型'
+            }, status=status.HTTP_400_BAD_REQUEST)

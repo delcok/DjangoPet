@@ -1,16 +1,19 @@
-from rest_framework.decorators import api_view, authentication_classes
+from rest_framework.decorators import api_view, authentication_classes, action
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import status, viewsets, permissions
 from django.conf import settings
+from rest_framework import filters
 from django.utils import timezone
 from wechatpy import WeChatClient
 from wechatpy.crypto import WeChatWxaCrypto
 
-from user.models import User, SuperAdmin
-from user.serializers import UserSerializer, SuperAdminSerializer
+from user.models import User, SuperAdmin, UserAddress
+from user.serializers import UserSerializer, SuperAdminSerializer, UserAddressSerializer, UserAddressCreateSerializer
 from utils.authentication import generate_jwt_tokens, UserAuthentication
 from utils.fetch_number import fetch_phone_number
 from django.db import transaction, models
+
+from utils.permission import IsUserOwner
 
 
 @api_view(['POST'])
@@ -301,3 +304,244 @@ def get_integral(request):
     return Response({
         'integral': request.user.integral
     }, status=status.HTTP_200_OK)
+
+
+class UserAddressViewSet(viewsets.ModelViewSet):
+    """用户地址管理ViewSet"""
+    serializer_class = UserAddressSerializer
+    authentication_classes = [UserAuthentication]
+    permission_classes = [permissions.IsAuthenticated, IsUserOwner]
+    filter_backends = [filters.OrderingFilter]
+    ordering_fields = ['created_at', 'is_default']
+    ordering = ['-is_default', '-created_at']
+
+    def get_queryset(self):
+        """只返回当前用户的地址"""
+        return UserAddress.objects.filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        """根据action选择序列化器"""
+        if self.action == 'create':
+            return UserAddressCreateSerializer
+        return UserAddressSerializer
+
+    def perform_create(self, serializer):
+        """创建地址时关联当前用户"""
+        user = self.request.user
+
+        # 如果用户没有地址，自动设为默认地址
+        if not UserAddress.objects.filter(user=user).exists():
+            serializer.validated_data['is_default'] = True
+
+        # 如果设置为默认地址，取消其他默认地址
+        if serializer.validated_data.get('is_default', False):
+            UserAddress.objects.filter(user=user, is_default=True).update(is_default=False)
+
+        serializer.save(user=user)
+
+    def perform_update(self, serializer):
+        """更新地址"""
+        # 如果设置为默认地址，取消其他默认地址
+        if serializer.validated_data.get('is_default', False):
+            UserAddress.objects.filter(
+                user=self.request.user,
+                is_default=True
+            ).exclude(id=serializer.instance.id).update(is_default=False)
+
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        """删除地址时的处理"""
+        user = self.request.user
+        is_default = instance.is_default
+
+        # 删除地址
+        instance.delete()
+
+        # 如果删除的是默认地址，设置第一个地址为默认地址
+        if is_default:
+            first_address = UserAddress.objects.filter(user=user).first()
+            if first_address:
+                first_address.is_default = True
+                first_address.save()
+
+    @action(detail=True, methods=['post'])
+    def set_default(self, request, pk=None):
+        """设置为默认地址"""
+        try:
+            address = self.get_object()
+
+            # 取消当前用户的所有默认地址
+            UserAddress.objects.filter(
+                user=request.user,
+                is_default=True
+            ).update(is_default=False)
+
+            # 设置当前地址为默认
+            address.is_default = True
+            address.save()
+
+            return Response({
+                'message': '已设置为默认地址',
+                'address': UserAddressSerializer(address).data
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'error': f'设置默认地址失败: {str(e)}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'])
+    def default(self, request):
+        """获取默认地址"""
+        try:
+            default_address = UserAddress.objects.filter(
+                user=request.user,
+                is_default=True
+            ).first()
+
+            if default_address:
+                return Response({
+                    'address': UserAddressSerializer(default_address).data
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'message': '暂无默认地址'
+                }, status=status.HTTP_404_NOT_FOUND)
+
+        except Exception as e:
+            return Response({
+                'error': f'获取默认地址失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'])
+    def statistics(self, request):
+        """地址统计信息"""
+        user = request.user
+        queryset = self.get_queryset()
+
+        total = queryset.count()
+        has_default = queryset.filter(is_default=True).exists()
+
+        # 按省份统计
+        province_stats = {}
+        for address in queryset:
+            province = address.province or '未知'
+            province_stats[province] = province_stats.get(province, 0) + 1
+
+        return Response({
+            'total': total,
+            'has_default': has_default,
+            'province_stats': province_stats
+        }, status=status.HTTP_200_OK)
+
+    def list(self, request, *args, **kwargs):
+        """重写列表方法，添加额外信息"""
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+
+        return Response({
+            'count': queryset.count(),
+            'results': serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+# 如果需要单独的地址相关功能视图，可以添加以下函数式视图
+
+@api_view(['POST'])
+@authentication_classes([UserAuthentication])
+def quick_create_address(request):
+    """快速创建地址（用于下单时）"""
+    try:
+        user = request.user
+
+        if not user.is_authenticated:
+            return Response(
+                {'error': '用户未认证'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        serializer = UserAddressCreateSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+
+        if serializer.is_valid():
+            # 如果用户没有地址，自动设为默认地址
+            if not UserAddress.objects.filter(user=user).exists():
+                serializer.validated_data['is_default'] = True
+
+            # 如果设置为默认地址，取消其他默认地址
+            if serializer.validated_data.get('is_default', False):
+                UserAddress.objects.filter(user=user, is_default=True).update(is_default=False)
+
+            address = serializer.save(user=user)
+
+            return Response({
+                'message': '地址创建成功',
+                'address': UserAddressSerializer(address).data
+            }, status=status.HTTP_201_CREATED)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    except Exception as e:
+        return Response({
+            'error': f'创建地址失败: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@authentication_classes([UserAuthentication])
+def get_address_suggestions(request):
+    """获取地址建议（基于用户历史地址）"""
+    try:
+        user = request.user
+
+        if not user.is_authenticated:
+            return Response(
+                {'error': '用户未认证'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        # 获取用户最近使用的省市区
+        recent_addresses = UserAddress.objects.filter(user=user).order_by('-updated_at')[:10]
+
+        suggestions = {
+            'provinces': [],
+            'cities': [],
+            'districts': [],
+            'recent_receivers': []
+        }
+
+        provinces_set = set()
+        cities_set = set()
+        districts_set = set()
+        receivers_set = set()
+
+        for addr in recent_addresses:
+            if addr.province:
+                provinces_set.add(addr.province)
+            if addr.city:
+                cities_set.add(addr.city)
+            if addr.district:
+                districts_set.add(addr.district)
+            if addr.receiver_name:
+                receivers_set.add(addr.receiver_name)
+
+        suggestions['provinces'] = list(provinces_set)
+        suggestions['cities'] = list(cities_set)
+        suggestions['districts'] = list(districts_set)
+        suggestions['recent_receivers'] = list(receivers_set)
+
+        return Response(suggestions, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'error': f'获取地址建议失败: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

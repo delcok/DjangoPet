@@ -7,8 +7,11 @@ from user import views
 
 router = DefaultRouter()
 
+router.register(r'addresses', views.UserAddressViewSet, basename='address')
+
 
 urlpatterns = [
+    path('', include(router.urls)),
     # 用户微信登录
     path('user/wechat-login/', views.wechat_login, name='wechat-login'),
     # 用户信息修改
