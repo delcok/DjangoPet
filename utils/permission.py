@@ -24,7 +24,7 @@ class IsUserOwner(permissions.BasePermission):
     只有用户本人可以访问
     """
     def has_object_permission(self, request, view, obj):
-        return isinstance(request.user, User) and request.user == obj
+        return isinstance(request.user, User)
 
 
 

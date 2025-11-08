@@ -257,7 +257,6 @@ class PetServiceRecordAdmin(admin.ModelAdmin):
         'created_at'
     ]
     search_fields = [
-        'related_order__order_number',
         'related_order__pets__name',
         'related_order__staff__username',
         'service_summary'

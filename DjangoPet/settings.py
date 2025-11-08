@@ -69,7 +69,8 @@ INSTALLED_APPS = [
     'price',
     'staff',
     'user',
-    'service'
+    'service',
+    'feedback'
 
 ]
 

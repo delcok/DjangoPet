@@ -202,6 +202,9 @@ class ServiceOrderFilter(django_filters.FilterSet):
             'staff': ['exact'],
             'user': ['exact'],
             'base_service': ['exact'],  # 新增
+            'province': ['exact'],
+            'city': ['exact'],
+            'district': ['exact'],
         }
 
     def filter_by_scheduled_range(self, queryset, name, value):
@@ -234,7 +237,10 @@ class ServiceOrderFilter(django_filters.FilterSet):
             Q(staff_notes__icontains=value) |
             Q(user__username__icontains=value) |
             Q(staff__name__icontains=value) |
-            Q(base_service__name__icontains=value)  # 新增:搜索基础服务名称
+            Q(base_service__name__icontains=value) |  # 新增:搜索基础服务名称
+            Q(province__icontains=value) |  # 新增:搜索省份
+            Q(city__icontains=value) |  # 新增:搜索城市
+            Q(district__icontains=value)  # 新增:搜索区县
         )
 
     def filter_by_staff(self, queryset, name, value):

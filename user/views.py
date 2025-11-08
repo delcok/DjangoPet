@@ -310,7 +310,7 @@ class UserAddressViewSet(viewsets.ModelViewSet):
     """用户地址管理ViewSet"""
     serializer_class = UserAddressSerializer
     authentication_classes = [UserAuthentication]
-    permission_classes = [permissions.IsAuthenticated, IsUserOwner]
+    permission_classes = [IsUserOwner]
     filter_backends = [filters.OrderingFilter]
     ordering_fields = ['created_at', 'is_default']
     ordering = ['-is_default', '-created_at']

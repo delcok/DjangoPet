@@ -208,7 +208,7 @@ class UserAddressAdmin(admin.ModelAdmin):
 
     def user_link(self, obj):
         """用户链接"""
-        url = reverse('admin:your_app_user_change', args=[obj.user.id])  # 请替换 your_app 为实际应用名
+        url = reverse('admin:user_user_change', args=[obj.user.id])  # 请替换 your_app 为实际应用名
         return format_html('<a href="{}">{}</a>', url, obj.user.display_name)
 
     user_link.short_description = '用户'

@@ -14,11 +14,12 @@ from service.models import ServiceModel, AdditionalService, PetType
 
 class ServiceOrderPetSerializer(serializers.ModelSerializer):
     """服务订单中的宠物信息序列化器"""
-    pet_type_name = serializers.CharField(source='pet_type.name', read_only=True)
+    # 修改：直接使用 category.name，因为 Pet 模型中是 category 字段
+    pet_type_name = serializers.CharField(source='category.name', read_only=True)
 
     class Meta:
         model = Pet
-        fields = ['id', 'name', 'pet_type', 'pet_type_name', 'breed', 'age', 'weight']
+        fields = ['id', 'name', 'pet_type_name', 'breed', 'weight']
 
 
 class BaseServiceSerializer(serializers.ModelSerializer):
@@ -93,6 +94,7 @@ class ServiceOrderDetailSerializer(serializers.ModelSerializer):
             'pets', 'pets_info', 'base_service', 'base_service_info',
             'additional_services', 'additional_services_info',
             'scheduled_date', 'scheduled_time', 'duration_minutes',
+            'province', 'city', 'district',
             'service_address', 'contact_phone', 'contact_name',
             'base_price', 'additional_price', 'total_price',
             'discount_amount', 'final_price',
@@ -165,6 +167,7 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
         fields = [
             'base_service', 'additional_services', 'pets',
             'scheduled_date', 'scheduled_time', 'duration_minutes',
+            'province', 'city', 'district',
             'service_address', 'contact_phone', 'contact_name',
             'customer_notes', 'discount_amount'
         ]
@@ -175,6 +178,8 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
         for pet in value:
             if pet.owner != user:
                 raise serializers.ValidationError(f"宠物 {pet.name} 不属于当前用户")
+            if pet.is_deleted:
+                raise serializers.ValidationError(f"宠物 {pet.name} 已被删除")
         if not value:
             raise serializers.ValidationError("请至少选择一只宠物")
         return value
@@ -192,36 +197,20 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(f"附加服务 {service.name} 已停用")
         return value
 
-    def validate(self, attrs):
-        """验证服务是否适用于所选宠物"""
-        pets = attrs.get('pets', [])
-        base_service = attrs.get('base_service')
-        additional_services = attrs.get('additional_services', [])
-
-        # 验证基础服务是否适用于所有宠物
-        for pet in pets:
-            if not base_service.is_applicable_for_pet(pet.pet_type):
-                raise serializers.ValidationError(
-                    f"基础服务 {base_service.name} 不适用于宠物 {pet.name} 的类型"
-                )
-
-        # 验证附加服务是否适用于所有宠物
-        for service in additional_services:
-            for pet in pets:
-                if not service.is_applicable_for_pet(pet.pet_type):
-                    raise serializers.ValidationError(
-                        f"附加服务 {service.name} 不适用于宠物 {pet.name} 的类型"
-                    )
-
-        return attrs
-
     def create(self, validated_data):
-        """创建服务订单"""
+        """
+        创建服务订单
+        关键修复：先 pop 多对多字段，手动计算价格，创建对象时传入所有价格，
+        最后再设置多对多关系
+        """
+        # 1. 提取多对多字段（必须在创建对象前提取）
         additional_services = validated_data.pop('additional_services', [])
         pets = validated_data.pop('pets', [])
+
+        # 2. 获取当前用户
         user = self.context['request'].user
 
-        # 计算价格
+        # 3. 手动计算价格（不依赖模型的 calculate_prices 方法）
         base_service = validated_data['base_service']
         base_price = base_service.base_price
 
@@ -230,10 +219,11 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
 
         # 计算总价和最终价格
         total_price = base_price + additional_price
-        discount_amount = validated_data.get('discount_amount', 0)
-        final_price = max(0, total_price - discount_amount)
+        discount_amount = validated_data.get('discount_amount', Decimal('0'))
+        final_price = max(Decimal('0'), total_price - discount_amount)
 
-        # 创建订单
+        # 4. 创建订单对象，传入所有计算好的价格
+        # 这样模型的 save() 方法就不需要调用 calculate_prices() 了
         service_order = ServiceOrder.objects.create(
             user=user,
             base_price=base_price,
@@ -243,7 +233,7 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
-        # 关联宠物和附加服务
+        # 5. 现在对象已经有 id 了，可以安全地设置多对多关系
         service_order.pets.set(pets)
         if additional_services:
             service_order.additional_services.set(additional_services)
@@ -258,6 +248,7 @@ class ServiceOrderUpdateSerializer(serializers.ModelSerializer):
         model = ServiceOrder
         fields = [
             'scheduled_date', 'scheduled_time', 'duration_minutes',
+            'province', 'city', 'district',
             'service_address', 'contact_phone', 'contact_name',
             'customer_notes'
         ]

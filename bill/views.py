@@ -28,6 +28,8 @@ from bill.serializers import (
 )
 from bill.filters import ServiceOrderFilter, BillFilter
 from bill.pagination import StandardResultsSetPagination
+from utils.authentication import UserAuthentication
+from utils.permission import IsUserOwner
 
 
 class ServiceOrderViewSet(viewsets.ModelViewSet):
@@ -45,7 +47,8 @@ class ServiceOrderViewSet(viewsets.ModelViewSet):
     - create_payment: 创建支付账单
     - statistics: 获取订单统计信息
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUserOwner]
+    authentication_classes = [UserAuthentication]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = ServiceOrderFilter
     search_fields = ['service_address', 'contact_phone', 'customer_notes']
@@ -180,6 +183,12 @@ class ServiceOrderViewSet(viewsets.ModelViewSet):
             status__in=['paid', 'confirmed', 'assigned', 'in_progress', 'completed']
         ).aggregate(total=Sum('final_price'))['total'] or 0
 
+        # 地区分布统计
+        region_distribution = queryset.values('province', 'city').annotate(
+            count=Count('id'),
+            amount=Sum('final_price')
+        ).order_by('-count')[:10]  # 取前10个地区
+
         return Response({
             'total': {
                 'count': total_count,
@@ -198,7 +207,13 @@ class ServiceOrderViewSet(viewsets.ModelViewSet):
                 'status_display': dict(ServiceOrder.STATUS_CHOICES).get(item['status']),
                 'count': item['count'],
                 'amount': str(item['amount'] or 0)
-            } for item in status_distribution]
+            } for item in status_distribution],
+            'region_distribution': [{
+                'province': item['province'] or '未设置',
+                'city': item['city'] or '未设置',
+                'count': item['count'],
+                'amount': str(item['amount'] or 0)
+            } for item in region_distribution]
         })
 
 
@@ -217,7 +232,9 @@ class BillViewSet(viewsets.ModelViewSet):
     - check_status: 检查支付状态
     - statistics: 获取账单统计信息
     """
-    permission_classes = [IsAuthenticated]
+
+    permission_classes = [IsUserOwner]
+    authentication_classes = [UserAuthentication]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = BillFilter
     search_fields = ['out_trade_no', 'third_party_no', 'description']

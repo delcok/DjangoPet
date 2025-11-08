@@ -55,6 +55,10 @@ class ServiceOrder(models.Model):
     scheduled_time = models.TimeField(verbose_name='预约时间')
     duration_minutes = models.PositiveIntegerField(default=60, verbose_name='预计时长（分钟）')
 
+    province = models.CharField(max_length=10, blank=True, null=True, db_index=True)
+    city = models.CharField(max_length=10, blank=True, null=True, db_index=True)
+    district = models.CharField(max_length=10, blank=True, null=True, db_index=True)
+
     # 地址信息
     service_address = models.TextField(verbose_name='服务地址')
     contact_phone = models.CharField(max_length=20, verbose_name='联系电话')
@@ -128,14 +132,22 @@ class ServiceOrder(models.Model):
         return f"订单#{self.id} - {self.user.username} - {self.scheduled_date}"
 
     def calculate_prices(self):
-        """计算订单价格"""
+        """
+        计算订单价格
+        注意：此方法只能在对象已保存且多对多关系已设置后调用
+        """
         # 基础服务价格
         self.base_price = self.base_service.base_price if self.base_service else 0
 
         # 附加服务总价
-        self.additional_price = sum(
-            service.price for service in self.additional_services.all()
-        )
+        # 修复：检查对象是否已保存（有 pk），才能访问多对多关系
+        if self.pk:
+            self.additional_price = sum(
+                service.price for service in self.additional_services.all()
+            )
+        else:
+            # 如果对象还没保存，additional_price 应该已经在创建时设置了
+            pass
 
         # 总价
         self.total_price = self.base_price + self.additional_price
@@ -146,12 +158,15 @@ class ServiceOrder(models.Model):
         return self.final_price
 
     def save(self, *args, **kwargs):
-        # 如果是新建订单，自动计算价格
-        if not self.pk:
-            self.calculate_prices()
-
-        # 确保最终价格始终正确
-        self.final_price = max(0, self.total_price - self.discount_amount)
+        """
+        保存方法
+        修复：不在新建订单时自动调用 calculate_prices()
+        因为创建时多对多关系还未设置，会导致错误
+        """
+        # 移除自动计算价格的逻辑，改为在 serializer 中手动计算
+        # 只确保最终价格的一致性
+        if self.total_price is not None and self.discount_amount is not None:
+            self.final_price = max(0, self.total_price - self.discount_amount)
 
         super().save(*args, **kwargs)
 
