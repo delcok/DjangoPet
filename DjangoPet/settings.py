@@ -70,7 +70,8 @@ INSTALLED_APPS = [
     'staff',
     'user',
     'service',
-    'feedback'
+    'feedback',
+    'strays'
 
 ]
 

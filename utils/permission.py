@@ -26,5 +26,10 @@ class IsUserOwner(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         return isinstance(request.user, User)
 
-
+class AnyUser(permissions.BasePermission):
+    """
+    任何用户都可以访问
+    """
+    def has_permission(self, request, view):
+        return True
 

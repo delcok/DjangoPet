@@ -142,7 +142,7 @@ def wechat_login(request):
 @api_view(['PATCH'])
 @authentication_classes([UserAuthentication])
 def update_avator_or_username(request):
-    """更新用户头像和用户名"""
+    """更新用户信息（头像、用户名、性别、生日、个人简介、隐私设置等）"""
     try:
         user = request.user
 
@@ -153,27 +153,79 @@ def update_avator_or_username(request):
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
-
-        # 更新用户信息
+        # 获取请求数据
         username = request.data.get('username')
         avatar_url = request.data.get('avatar_url')
-        bio = request.data.get('bio')  # 添加个人简介更新
+        bio = request.data.get('bio')
+        gender = request.data.get('gender')
+        birth_date = request.data.get('birth_date')
+        is_public = request.data.get('is_public')
+        allow_message = request.data.get('allow_message')
 
         updated_fields = []
 
-        if username:
-            user.username = username.strip()
+        # 更新用户名
+        if username is not None:
+            username = username.strip()
+            if len(username) < 2 or len(username) > 20:
+                return Response(
+                    {'error': '用户名长度为2-20个字符'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            user.username = username
             updated_fields.append('username')
 
+        # 更新头像
         if avatar_url:
-            # 根据User模型，字段名是avatar
             user.avatar = avatar_url
             updated_fields.append('avatar')
 
-        if bio is not None:  # 允许设置为空字符串
+        # 更新个人简介
+        if bio is not None:
             user.bio = bio.strip()
             updated_fields.append('bio')
 
+        # 更新性别（前端传 'male'/'female'/''，转换为 'M'/'F'/'U'）
+        if gender is not None:
+            gender_map = {
+                'male': 'M',
+                'female': 'F',
+                '': 'U',
+                'other': 'O'
+            }
+            db_gender = gender_map.get(gender.lower() if gender else '', 'U')
+            user.gender = db_gender
+            updated_fields.append('gender')
+
+        # 更新生日
+        if birth_date is not None:
+            if birth_date:  # 如果有值
+                try:
+                    from datetime import datetime
+                    # 验证日期格式
+                    datetime.strptime(birth_date, '%Y-%m-%d')
+                    user.birth_date = birth_date
+                    updated_fields.append('birth_date')
+                except ValueError:
+                    return Response(
+                        {'error': '生日格式不正确，应为 YYYY-MM-DD'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:  # 如果是空字符串，清空生日
+                user.birth_date = None
+                updated_fields.append('birth_date')
+
+        # 更新隐私设置
+        if is_public is not None:
+            user.is_public = bool(is_public)
+            updated_fields.append('is_public')
+
+        # 更新消息设置
+        if allow_message is not None:
+            user.allow_message = bool(allow_message)
+            updated_fields.append('allow_message')
+
+        # 检查是否有更新
         if not updated_fields:
             return Response(
                 {'error': '没有提供需要更新的字段'},
@@ -182,7 +234,6 @@ def update_avator_or_username(request):
 
         # 保存更新
         user.save(update_fields=updated_fields + ['updated_at'])
-
 
         # 序列化用户数据返回
         serializer = UserSerializer(user)
