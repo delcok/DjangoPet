@@ -3,14 +3,13 @@
 # @Author  : Delock
 
 from django.db import transaction
-from django.db.models import F, Q, Count
+from django.db.models import F, Q, Count, Sum
 from django.utils import timezone
 
 from datetime import timedelta
 
-
 from rest_framework import status, permissions
-from rest_framework.decorators import action, permission_classes, authentication_classes
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet, ViewSet
 from rest_framework.views import APIView
@@ -19,39 +18,39 @@ from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnl
 from community.models import (
     Post, PostCategory, Comment, Topic, UserAction,
     Report, Notification, UserFollow, PostCollection, BlockedUser,
-    PostView,  ReviewLog
+    PostView, ReviewLog
 )
 from community.serializers import (
     PostListSerializer, PostDetailSerializer, CreatePostSerializer, UpdatePostSerializer,
     CommentSerializer, CreateCommentSerializer, UserDetailSerializer, BasicUserSerializer,
     PostCategorySerializer, TopicSerializer, SimpleTopicSerializer, UserActionSerializer,
     ReportSerializer, NotificationSerializer,
-    PostCollectionSerializer,
+    PostCollectionSerializer, UserFollowSerializer,  # 新增
 )
 from community.filters import (
     PostFilter, CommentFilter, UserFilter, TopicFilter, PostCategoryFilter,
     NotificationFilter, ReportFilter, AdminPostFilter, apply_filters
 )
 from community.pagination import (
-     paginate_queryset, create_paginated_response
+    paginate_queryset, create_paginated_response
 )
 from user.models import User
 from utils.authentication import UserAuthentication, AdminAuthentication
-from utils.permission import IsOwnerOrAdmin
+from utils.permission import IsUserOwner
 
 
 # ===== 基础视图类 =====
 class BaseViewSet(ModelViewSet):
     """基础视图集，提供通用功能"""
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticatedOrReadOnly]
+    permission_classes = [IsUserOwner]
 
     def get_permissions(self):
         """根据动作动态设置权限"""
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
             permission_classes = [IsAuthenticated]
         else:
-            permission_classes = [IsAuthenticatedOrReadOnly]
+            permission_classes = [IsUserOwner]
         return [permission() for permission in permission_classes]
 
     def perform_create(self, serializer):
@@ -106,7 +105,7 @@ class UserViewSet(ReadOnlyModelViewSet):
     serializer_class = UserDetailSerializer
     filterset_class = UserFilter
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticatedOrReadOnly]
+    permission_classes = [IsUserOwner]
     lookup_field = 'username'
 
     def get_serializer_class(self):
@@ -209,6 +208,115 @@ class UserViewSet(ReadOnlyModelViewSet):
 
             return Response({'detail': '拉黑成功', 'blocked': True})
 
+    # ===== 新增接口：用户统计信息 =====
+    @action(detail=True, methods=['get'])
+    def stats(self, request, username=None):
+        """获取用户统计信息（粉丝数、关注数、获赞量等）"""
+        user = self.get_object()
+
+        # 粉丝数
+        followers_count = UserFollow.objects.filter(following=user).count()
+
+        # 关注数
+        following_count = UserFollow.objects.filter(follower=user).count()
+
+        # 获赞总量（帖子点赞 + 评论点赞）
+        post_likes = Post.objects.filter(
+            author=user,
+            status='approved'
+        ).aggregate(total_likes=Sum('like_count'))['total_likes'] or 0
+
+        comment_likes = Comment.objects.filter(
+            author=user,
+            is_deleted=False
+        ).aggregate(total_likes=Sum('like_count'))['total_likes'] or 0
+
+        total_likes = post_likes + comment_likes
+
+        # 帖子总数
+        posts_count = Post.objects.filter(
+            author=user,
+            status='approved'
+        ).count()
+
+        # 评论总数
+        comments_count = Comment.objects.filter(
+            author=user,
+            is_deleted=False
+        ).count()
+
+        # 收藏总数
+        collections_count = PostCollection.objects.filter(user=user).count()
+
+        # 浏览总量
+        total_views = Post.objects.filter(
+            author=user,
+            status='approved'
+        ).aggregate(total_views=Sum('view_count'))['total_views'] or 0
+
+        return Response({
+            'success': True,
+            'data': {
+                'user_id': user.id,
+                'username': user.username,
+                'followers_count': followers_count,
+                'following_count': following_count,
+                'total_likes': total_likes,
+                'posts_count': posts_count,
+                'comments_count': comments_count,
+                'collections_count': collections_count,
+                'total_views': total_views,
+            }
+        })
+
+    # ===== 新增接口：关注列表 =====
+    @action(detail=True, methods=['get'])
+    def following_list(self, request, username=None):
+        """获取用户的关注列表"""
+        user = self.get_object()
+
+        # 获取关注关系
+        following_relations = UserFollow.objects.filter(
+            follower=user
+        ).select_related('following').order_by('-created_at')
+
+        # 分页
+        paginated_relations, paginator = paginate_queryset(
+            following_relations, request, 'standard'
+        )
+
+        serializer = UserFollowSerializer(
+            paginated_relations,
+            many=True,
+            context={'request': request, 'type': 'following'}
+        )
+
+        return create_paginated_response(serializer.data, paginator)
+
+    # ===== 新增接口：粉丝列表 =====
+    @action(detail=True, methods=['get'])
+    def followers_list(self, request, username=None):
+        """获取用户的粉丝列表"""
+        user = self.get_object()
+
+        # 获取粉丝关系
+        follower_relations = UserFollow.objects.filter(
+            following=user
+        ).select_related('follower').order_by('-created_at')
+
+        # 分页
+        paginated_relations, paginator = paginate_queryset(
+            follower_relations, request, 'standard'
+        )
+
+        serializer = UserFollowSerializer(
+            paginated_relations,
+            many=True,
+            context={'request': request, 'type': 'followers'}
+        )
+
+        return create_paginated_response(serializer.data, paginator)
+
 
 # ===== 帖子分类视图 =====
 class PostCategoryViewSet(ReadOnlyModelViewSet):
@@ -241,12 +349,14 @@ class PostCategoryViewSet(ReadOnlyModelViewSet):
         return create_paginated_response(serializer.data, paginator)
 
 
-# ===== 话题相关视图 =====
-class TopicViewSet(BaseViewSet):
+# ===== 话题视图 =====
+class TopicViewSet(ReadOnlyModelViewSet):
     """话题视图集"""
     queryset = Topic.objects.filter(status='approved')
     serializer_class = TopicSerializer
     filterset_class = TopicFilter
+    authentication_classes = [UserAuthentication]
+    permission_classes = [permissions.AllowAny]
     lookup_field = 'slug'
 
     def get_serializer_class(self):
@@ -258,13 +368,12 @@ class TopicViewSet(BaseViewSet):
     def posts(self, request, slug=None):
         """获取话题下的帖子"""
         topic = self.get_object()
-        # 这里需要根据实际的帖子-话题关联方式调整
-        # 假设通过content或其他方式关联
         posts = Post.objects.filter(
-            content__icontains=f'#{topic.name}',
+            topics=topic,
             status='approved'
-        ).select_related('author', 'category')
+        ).select_related('author', 'category').order_by('-published_at')
 
+        # 应用过滤
         posts = apply_filters(posts, request, PostFilter)
 
         paginated_posts, paginator = paginate_queryset(
@@ -281,31 +390,32 @@ class TopicViewSet(BaseViewSet):
         """关注/取消关注话题"""
         topic = self.get_object()
 
+        # 检查是否已关注
         action_exists = UserAction.objects.filter(
             user=request.user,
-            topic=topic,
-            action_type='follow_topic'
-        ).first()
+            action_type='follow_topic',
+            topic=topic
+        ).exists()
 
         if action_exists:
-            action_exists.delete()
-            # 更新话题统计
-            topic.follow_count = F('follow_count') - 1
-            topic.save(update_fields=['follow_count'])
+            # 取消关注
+            UserAction.objects.filter(
+                user=request.user,
+                action_type='follow_topic',
+                topic=topic
+            ).delete()
             return Response({'detail': '已取消关注', 'followed': False})
         else:
+            # 关注话题
             UserAction.objects.create(
                 user=request.user,
                 action_type='follow_topic',
                 topic=topic
             )
-            # 更新话题统计
-            topic.follow_count = F('follow_count') + 1
-            topic.save(update_fields=['follow_count'])
             return Response({'detail': '关注成功', 'followed': True})
 
 
-# ===== 帖子相关视图 =====
+# ===== 帖子视图 =====
 class PostViewSet(BaseViewSet):
     """帖子视图集"""
     queryset = Post.objects.select_related('author', 'category').prefetch_related('medias')
@@ -321,190 +431,103 @@ class PostViewSet(BaseViewSet):
         return PostDetailSerializer
 
     def get_queryset(self):
-        """根据动作调整查询集"""
+        """根据不同action返回不同queryset"""
         queryset = super().get_queryset()
 
+        # 列表页只返回审核通过的帖子
         if self.action == 'list':
-            # 列表只显示已审核通过的帖子
             queryset = queryset.filter(status='approved')
-        elif self.action == 'my_posts':
-            # 我的帖子包含所有状态
-            queryset = queryset.filter(author=self.request.user)
-        elif self.action in ['retrieve']:
-            # 详情页允许查看自己的任何状态帖子
-            if self.request.user.is_authenticated:
-                queryset = queryset.filter(
-                    Q(status='approved') | Q(author=self.request.user)
-                )
-            else:
-                queryset = queryset.filter(status='approved')
+
+        # 详情页增加浏览记录
+        if self.action == 'retrieve' and self.request.user.is_authenticated:
+            post_id = self.kwargs.get('pk')
+            if post_id:
+                post = queryset.filter(id=post_id).first()
+                if post:
+                    # 记录浏览
+                    post_view, created = PostView.objects.get_or_create(
+                        user=self.request.user,
+                        post=post
+                    )
+                    if not created:
+                        post_view.view_count += 1
+                        post_view.save()
+
+                    # 增加帖子浏览量
+                    Post.objects.filter(id=post_id).update(view_count=F('view_count') + 1)
 
         return queryset
 
-    def retrieve(self, request, *args, **kwargs):
-        """帖子详情，记录浏览量"""
-        instance = self.get_object()
-
-        # 记录浏览
-        if request.user.is_authenticated:
-            view_record, created = PostView.objects.get_or_create(
-                user=request.user,
-                post=instance,
-                defaults={
-                    'ip_address': self.get_client_ip(request),
-                    'source': request.GET.get('source', 'web')
-                }
-            )
-            if not created:
-                view_record.view_count = F('view_count') + 1
-                view_record.save(update_fields=['view_count'])
-
-        # 更新帖子浏览量
-        Post.objects.filter(id=instance.id).update(
-            view_count=F('view_count') + 1
-        )
-
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
-
-    def get_client_ip(self, request):
-        """获取客户端IP"""
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
-
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
-    def my_posts(self, request):
-        """我的帖子"""
-        posts = self.get_queryset()
-        posts = apply_filters(posts, request, PostFilter)
-
-        paginated_posts, paginator = paginate_queryset(
-            posts, request, 'user_content'
-        )
-
-        serializer = PostListSerializer(
-            paginated_posts, many=True, context={'request': request}
-        )
-        return create_paginated_response(serializer.data, paginator)
-
-    @action(detail=False, methods=['get'])
-    def trending(self, request):
-        """热门帖子"""
-        posts = self.get_queryset().filter(
-            published_at__gte=timezone.now() - timedelta(hours=24)
-        ).order_by('-hot_score')
-
-        paginated_posts, paginator = paginate_queryset(
-            posts, request, 'trending'
-        )
-
-        serializer = PostListSerializer(
-            paginated_posts, many=True, context={'request': request}
-        )
-        return create_paginated_response(serializer.data, paginator)
-
-    @action(detail=False, methods=['get'])
-    def feed(self, request):
-        """个性化推荐Feed"""
-        if not request.user.is_authenticated:
-            # 未登录用户显示热门内容
-            posts = self.get_queryset().order_by('-hot_score')[:50]
-        else:
-            # 登录用户的个性化推荐
-            following_users = UserFollow.objects.filter(
-                follower=request.user
-            ).values_list('following', flat=True)
-
-            if following_users:
-                posts = self.get_queryset().filter(
-                    author__in=following_users
-                ).order_by('-published_at')[:100]
-            else:
-                posts = self.get_queryset().order_by('-hot_score')[:50]
-
-        paginated_posts, paginator = paginate_queryset(
-            posts, request, 'feed'
-        )
-
-        serializer = PostListSerializer(
-            paginated_posts, many=True, context={'request': request}
-        )
-        return create_paginated_response(serializer.data, paginator)
+    def perform_create(self, serializer):
+        """创建帖子"""
+        serializer.save(author=self.request.user)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def like(self, request, pk=None):
-        """点赞/取消点赞"""
+        """点赞/取消点赞帖子"""
         post = self.get_object()
 
+        # 检查是否已点赞
         action_exists = UserAction.objects.filter(
             user=request.user,
-            post=post,
-            action_type='like_post'
-        ).first()
+            action_type='like_post',
+            post=post
+        ).exists()
 
-        if action_exists:
-            action_exists.delete()
-            # 更新帖子点赞数
-            Post.objects.filter(id=post.id).update(
-                like_count=F('like_count') - 1
-            )
-            return Response({'detail': '已取消点赞', 'liked': False})
-        else:
-            UserAction.objects.create(
-                user=request.user,
-                action_type='like_post',
-                post=post
-            )
-            # 更新帖子点赞数
-            Post.objects.filter(id=post.id).update(
-                like_count=F('like_count') + 1
-            )
-
-            # 发送通知给作者
-            if post.author != request.user:
-                Notification.objects.create(
-                    receiver=post.author,
-                    sender=request.user,
-                    notification_type='like_post',
-                    title='有人点赞了你的帖子',
-                    content=f'{request.user.username} 点赞了你的帖子《{post.title}》',
+        with transaction.atomic():
+            if action_exists:
+                # 取消点赞
+                UserAction.objects.filter(
+                    user=request.user,
+                    action_type='like_post',
+                    post=post
+                ).delete()
+                Post.objects.filter(id=post.id).update(like_count=F('like_count') - 1)
+                return Response({'detail': '已取消点赞', 'liked': False})
+            else:
+                # 点赞
+                UserAction.objects.create(
+                    user=request.user,
+                    action_type='like_post',
                     post=post
                 )
+                Post.objects.filter(id=post.id).update(like_count=F('like_count') + 1)
 
-            return Response({'detail': '点赞成功', 'liked': True})
+                # 发送通知给帖子作者
+                if post.author != request.user:
+                    Notification.objects.create(
+                        receiver=post.author,
+                        sender=request.user,
+                        notification_type='like_post',
+                        title='收到新点赞',
+                        content=f'{request.user.username} 赞了你的帖子',
+                        post=post
+                    )
+
+                return Response({'detail': '点赞成功', 'liked': True})
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def collect(self, request, pk=None):
-        """收藏/取消收藏"""
+        """收藏/取消收藏帖子"""
         post = self.get_object()
 
-        collection_exists = PostCollection.objects.filter(
+        collection, created = PostCollection.objects.get_or_create(
             user=request.user,
-            post=post
-        ).first()
+            post=post,
+            defaults={
+                'folder': request.data.get('folder', '默认收藏夹'),
+                'note': request.data.get('note', '')
+            }
+        )
 
-        if collection_exists:
-            collection_exists.delete()
-            # 更新帖子收藏数
-            Post.objects.filter(id=post.id).update(
-                collect_count=F('collect_count') - 1
-            )
-            return Response({'detail': '已取消收藏', 'collected': False})
-        else:
-            PostCollection.objects.create(
-                user=request.user,
-                post=post,
-                folder=request.data.get('folder', '默认收藏夹'),
-                note=request.data.get('note', '')
-            )
-
-            # 更新帖子收藏数
-            Post.objects.filter(id=post.id).update(
-                collect_count=F('collect_count') + 1
-            )
-            return Response({'detail': '收藏成功', 'collected': True})
+        with transaction.atomic():
+            if not created:
+                collection.delete()
+                Post.objects.filter(id=post.id).update(collect_count=F('collect_count') - 1)
+                return Response({'detail': '已取消收藏', 'collected': False})
+            else:
+                Post.objects.filter(id=post.id).update(collect_count=F('collect_count') + 1)
+                return Response({'detail': '收藏成功', 'collected': True})
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def share(self, request, pk=None):
@@ -518,34 +541,65 @@ class PostViewSet(BaseViewSet):
             post=post
         )
 
-        # 更新分享数
-        Post.objects.filter(id=post.id).update(
-            share_count=F('share_count') + 1
-        )
+        # 增加分享计数
+        Post.objects.filter(id=post.id).update(share_count=F('share_count') + 1)
 
         return Response({'detail': '分享成功'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
-    def report(self, request, pk=None):
-        """举报帖子"""
-        post = self.get_object()
+    @action(detail=False, methods=['get'])
+    def trending(self, request):
+        """热门帖子"""
+        posts = Post.objects.filter(
+            status='approved'
+        ).order_by('-hot_score', '-like_count')[:20]
 
-        serializer = ReportSerializer(data={
-            **request.data,
-            'content_type': 'post',
-            'content_id': post.id
-        }, context={'request': request})
+        serializer = PostListSerializer(posts, many=True, context={'request': request})
+        return Response({'posts': serializer.data})
 
-        if serializer.is_valid():
-            serializer.save()
-            return Response({'detail': '举报成功，感谢您的反馈'})
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def feed(self, request):
+        """关注动态"""
+        # 获取用户关注的人
+        following_users = UserFollow.objects.filter(
+            follower=request.user
+        ).values_list('following', flat=True)
+
+        posts = Post.objects.filter(
+            author__in=following_users,
+            status='approved'
+        ).select_related('author', 'category').order_by('-published_at')
+
+        paginated_posts, paginator = paginate_queryset(
+            posts, request, 'standard'
+        )
+
+        serializer = PostListSerializer(
+            paginated_posts, many=True, context={'request': request}
+        )
+        return create_paginated_response(serializer.data, paginator)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_posts(self, request):
+        """我的帖子"""
+        posts = Post.objects.filter(
+            author=request.user
+        ).select_related('category').order_by('-created_at')
+
+        paginated_posts, paginator = paginate_queryset(
+            posts, request, 'standard'
+        )
+
+        serializer = PostListSerializer(
+            paginated_posts, many=True, context={'request': request}
+        )
+        return create_paginated_response(serializer.data, paginator)
 
 
-# ===== 评论相关视图 =====
+# ===== 评论视图 =====
 class CommentViewSet(BaseViewSet):
     """评论视图集"""
     queryset = Comment.objects.filter(is_deleted=False).select_related('author', 'post')
+    serializer_class = CommentSerializer
     filterset_class = CommentFilter
 
     def get_serializer_class(self):
@@ -553,54 +607,40 @@ class CommentViewSet(BaseViewSet):
             return CreateCommentSerializer
         return CommentSerializer
 
-    def get_permissions(self):
-        """评论需要登录"""
-        if self.action in ['create', 'like', 'report']:
-            return [IsAuthenticated()]
-        elif self.action in ['update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsOwnerOrAdmin()]
-        return [IsAuthenticatedOrReadOnly()]
-
-    def get_queryset(self):
-        """根据帖子过滤评论"""
-        queryset = super().get_queryset()
-        post_id = self.request.query_params.get('post_id')
-        if post_id:
-            queryset = queryset.filter(post_id=post_id)
-        return queryset
-
     def perform_create(self, serializer):
         """创建评论"""
-        comment = serializer.save()
+        comment = serializer.save(author=self.request.user)
 
-        # 更新帖子评论数
+        # 增加帖子评论数
         Post.objects.filter(id=comment.post.id).update(
             comment_count=F('comment_count') + 1
         )
 
         # 发送通知
-        if comment.post.author != self.request.user:
-            Notification.objects.create(
-                receiver=comment.post.author,
-                sender=self.request.user,
-                notification_type='comment_post',
-                title='有人评论了你的帖子',
-                content=f'{self.request.user.username} 评论了你的帖子',
-                post=comment.post,
-                comment=comment
-            )
-
-        # 如果是回复评论
-        if comment.parent and comment.parent.author != self.request.user:
-            Notification.objects.create(
-                receiver=comment.parent.author,
-                sender=self.request.user,
-                notification_type='reply_comment',
-                title='有人回复了你的评论',
-                content=f'{self.request.user.username} 回复了你的评论',
-                post=comment.post,
-                comment=comment
-            )
+        if comment.parent:
+            # 回复评论
+            if comment.parent.author != self.request.user:
+                Notification.objects.create(
+                    receiver=comment.parent.author,
+                    sender=self.request.user,
+                    notification_type='reply_comment',
+                    title='收到新回复',
+                    content=f'{self.request.user.username} 回复了你的评论',
+                    post=comment.post,
+                    comment=comment
+                )
+        else:
+            # 评论帖子
+            if comment.post.author != self.request.user:
+                Notification.objects.create(
+                    receiver=comment.post.author,
+                    sender=self.request.user,
+                    notification_type='comment_post',
+                    title='收到新评论',
+                    content=f'{self.request.user.username} 评论了你的帖子',
+                    post=comment.post,
+                    comment=comment
+                )
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def like(self, request, pk=None):
@@ -609,74 +649,54 @@ class CommentViewSet(BaseViewSet):
 
         action_exists = UserAction.objects.filter(
             user=request.user,
-            comment=comment,
-            action_type='like_comment'
-        ).first()
+            action_type='like_comment',
+            comment=comment
+        ).exists()
 
-        if action_exists:
-            action_exists.delete()
-            Comment.objects.filter(id=comment.id).update(
-                like_count=F('like_count') - 1
-            )
-            return Response({'detail': '已取消点赞', 'liked': False})
-        else:
-            UserAction.objects.create(
-                user=request.user,
-                action_type='like_comment',
-                comment=comment
-            )
-            Comment.objects.filter(id=comment.id).update(
-                like_count=F('like_count') + 1
-            )
-            return Response({'detail': '点赞成功', 'liked': True})
-
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
-    def report(self, request, pk=None):
-        """举报评论"""
-        comment = self.get_object()
-
-        serializer = ReportSerializer(data={
-            **request.data,
-            'content_type': 'comment',
-            'content_id': comment.id
-        }, context={'request': request})
-
-        if serializer.is_valid():
-            serializer.save()
-            return Response({'detail': '举报成功，感谢您的反馈'})
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            if action_exists:
+                UserAction.objects.filter(
+                    user=request.user,
+                    action_type='like_comment',
+                    comment=comment
+                ).delete()
+                Comment.objects.filter(id=comment.id).update(like_count=F('like_count') - 1)
+                return Response({'detail': '已取消点赞', 'liked': False})
+            else:
+                UserAction.objects.create(
+                    user=request.user,
+                    action_type='like_comment',
+                    comment=comment
+                )
+                Comment.objects.filter(id=comment.id).update(like_count=F('like_count') + 1)
+                return Response({'detail': '点赞成功', 'liked': True})
 
 
-# ===== 用户行为相关视图 =====
-class UserActionViewSet(BaseViewSet):
-    """用户行为视图集"""
+# ===== 用户行为视图 =====
+class UserActionViewSet(ReadOnlyModelViewSet):
+    """用户行为记录视图集"""
     serializer_class = UserActionSerializer
+    authentication_classes = [UserAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return UserAction.objects.filter(user=self.request.user)
-
-    @action(detail=False, methods=['get'])
-    def statistics(self, request):
-        """用户行为统计"""
-        stats = UserAction.objects.filter(user=request.user).values(
-            'action_type'
-        ).annotate(count=Count('id'))
-
-        return Response({'statistics': list(stats)})
+        return UserAction.objects.filter(
+            user=self.request.user
+        ).select_related('post', 'comment', 'topic', 'target_user').order_by('-created_at')
 
 
-# ===== 通知相关视图 =====
-class NotificationViewSet(BaseViewSet):
+# ===== 通知视图 =====
+class NotificationViewSet(ReadOnlyModelViewSet):
     """通知视图集"""
     serializer_class = NotificationSerializer
     filterset_class = NotificationFilter
+    authentication_classes = [UserAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         return Notification.objects.filter(
             receiver=self.request.user
-        ).select_related('sender', 'post')
+        ).select_related('sender', 'post', 'comment').order_by('-created_at')
 
     @action(detail=True, methods=['post'])
     def mark_read(self, request, pk=None):
@@ -692,85 +712,82 @@ class NotificationViewSet(BaseViewSet):
             receiver=request.user,
             is_read=False
         ).update(is_read=True, read_at=timezone.now())
-
-        return Response({'detail': '全部标记为已读'})
+        return Response({'detail': '全部已标记为已读'})
 
     @action(detail=False, methods=['get'])
     def unread_count(self, request):
-        """未读数量"""
+        """未读通知数量"""
         count = Notification.objects.filter(
             receiver=request.user,
             is_read=False
         ).count()
-
         return Response({'unread_count': count})
 
 
-# ===== 举报相关视图 =====
+# ===== 举报视图 =====
 class ReportViewSet(BaseViewSet):
     """举报视图集"""
+    queryset = Report.objects.all()
     serializer_class = ReportSerializer
     filterset_class = ReportFilter
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        if self.request.user.is_staff:
+            return Report.objects.all()
         return Report.objects.filter(reporter=self.request.user)
 
+    def perform_create(self, serializer):
+        serializer.save(reporter=self.request.user)
 
-# ===== 搜索相关视图 =====
+
+# ===== 搜索视图 =====
 class SearchView(APIView):
-    """搜索视图"""
+    """搜索功能"""
     authentication_classes = [UserAuthentication]
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        query = request.GET.get('q', '').strip()
-        if not query:
-            return Response({'detail': '搜索关键词不能为空'}, status=status.HTTP_400_BAD_REQUEST)
-
-        search_type = request.GET.get('type', 'all')  # all, posts, users, topics
+        query = request.GET.get('q', '')
+        search_type = request.GET.get('type', 'all')  # all, post, user, topic
 
         results = {}
 
-        if search_type in ['all', 'posts']:
+        if search_type in ['all', 'post']:
             posts = Post.objects.filter(
                 Q(title__icontains=query) | Q(content__icontains=query),
                 status='approved'
             ).select_related('author', 'category')[:10]
+            results['posts'] = PostListSerializer(posts, many=True, context={'request': request}).data
 
-            results['posts'] = PostListSerializer(
-                posts, many=True, context={'request': request}
-            ).data
-
-        if search_type in ['all', 'users']:
+        if search_type in ['all', 'user']:
             users = User.objects.filter(
-                Q(username__icontains=query) | Q(first_name__icontains=query),
+                Q(username__icontains=query) | Q(first_name__icontains=query) | Q(last_name__icontains=query),
                 is_active=True
             )[:10]
-
             results['users'] = BasicUserSerializer(users, many=True).data
 
-        if search_type in ['all', 'topics']:
+        if search_type in ['all', 'topic']:
             topics = Topic.objects.filter(
                 Q(name__icontains=query) | Q(description__icontains=query),
                 status='approved'
             )[:10]
-
             results['topics'] = SimpleTopicSerializer(topics, many=True).data
 
         return Response(results)
 
 
-# ===== 管理员相关视图 =====
-@authentication_classes([AdminAuthentication])
-@permission_classes([permissions.IsAdminUser])
+# ===== 管理员审核视图 =====
 class AdminPostViewSet(ModelViewSet):
-    """管理员帖子管理"""
+    """管理员帖子审核视图"""
     queryset = Post.objects.all()
+    serializer_class = PostDetailSerializer
     filterset_class = AdminPostFilter
+    authentication_classes = [AdminAuthentication]
+    permission_classes = [IsAuthenticated]
 
-    def get_serializer_class(self):
-        return PostDetailSerializer
+    def get_queryset(self):
+        # 管理员可以看到所有状态的帖子
+        return Post.objects.select_related('author', 'category', 'reviewer').order_by('-created_at')
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -836,7 +853,7 @@ class AdminPostViewSet(ModelViewSet):
                 receiver=post.author,
                 notification_type='post_rejected',
                 title='帖子审核未通过',
-                content=f'你的帖子《{post.title}》审核未通过，原因：{reason}',
+                content=f'你的帖子《{post.title}》审核未通过，原因:{reason}',
                 post=post
             )
 

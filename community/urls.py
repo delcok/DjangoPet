@@ -24,22 +24,22 @@ router.register(r'community', views.PetCommunityViewSet, basename='community')
 admin_router = DefaultRouter()
 admin_router.register(r'posts', views.AdminPostViewSet, basename='admin-post')
 
-app_name = 'pet_community'
+
+# ==================== URL配置 ====================
 
 urlpatterns = [
-        # ViewSet路由
-        path('', include(router.urls)),
+    # ========== ViewSet路由（自动生成标准REST接口）==========
+    path('', include(router.urls)),
 
-        # 管理员路由
-        path('admin/', include(admin_router.urls)),
+    # ========== 管理员路由 ==========
+    path('admin/', include(admin_router.urls)),
 
-        # 自定义API端点（独立的APIView）
-        path('search/', views.SearchView.as_view(), name='search'),
-        path('statistics/', views.StatisticsView.as_view(), name='statistics'),
-        path('realtime/', views.RealtimeView.as_view(), name='realtime'),
+    # ========== 独立API端点 ==========
+    path('search/', views.SearchView.as_view(), name='search'),
+    path('statistics/', views.StatisticsView.as_view(), name='statistics'),
+    path('realtime/', views.RealtimeView.as_view(), name='realtime'),
 
-
-    # 页面路由（前端路由，如果需要）
+    # ========== 页面路由（前端路由,如果需要）==========
     path('', include([
         # 首页
         path('', views.PetCommunityViewSet.as_view({'get': 'list'}), name='home'),

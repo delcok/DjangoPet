@@ -6,7 +6,7 @@ from django_filters import rest_framework as filters
 from django.db.models import Q, Count
 from django.utils import timezone
 from datetime import timedelta, datetime
-from django.contrib.auth.models import User
+from user.models import User
 
 from .models import (
     Post, PostCategory, Comment, Topic, UserAction,
@@ -52,6 +52,54 @@ class BaseFilter(filters.FilterSet):
             return queryset.filter(created_at__gte=start_date)
 
         return queryset
+
+
+# ===== 用户过滤器 =====
+class UserFilter(BaseFilter):
+    """用户过滤器"""
+
+    # 基础字段过滤
+    username = filters.CharFilter(field_name='username', lookup_expr='icontains')
+    email = filters.CharFilter(field_name='email', lookup_expr='icontains')
+    phone = filters.CharFilter(field_name='phone', lookup_expr='icontains')
+
+    # 文本搜索
+    search = filters.CharFilter(method='filter_search')
+
+    # 布尔字段
+    is_active = filters.BooleanFilter()
+    is_staff = filters.BooleanFilter()
+    is_vip = filters.BooleanFilter()
+    is_verified = filters.BooleanFilter()
+
+    # 排序
+    ordering = filters.OrderingFilter(
+        fields=(
+            ('date_joined', 'date_joined'),
+            ('last_login', 'last_login'),
+            ('username', 'username'),
+        ),
+        field_labels={
+            'date_joined': '注册时间',
+            'last_login': '最后登录',
+            'username': '用户名',
+        }
+    )
+
+    class Meta:
+        model = User  # ✅ 现在使用正确的User模型
+        fields = []
+
+    def filter_search(self, queryset, name, value):
+        """用户搜索"""
+        if not value:
+            return queryset
+
+        return queryset.filter(
+            Q(username__icontains=value) |
+            Q(email__icontains=value) |
+            Q(phone__icontains=value)
+        )
 
 
 # ===== 帖子过滤器 =====
@@ -227,10 +275,11 @@ class PostFilter(BaseFilter):
     def filter_liked_by_user(self, queryset, name, value):
         """用户点赞的帖子"""
         if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
+            from .models import UserAction
             liked_posts = UserAction.objects.filter(
                 user=self.request.user,
                 action_type='like_post'
-            ).values_list('post', flat=True)
+            ).values_list('post_id', flat=True)
             return queryset.filter(id__in=liked_posts)
         return queryset
 
@@ -239,7 +288,7 @@ class PostFilter(BaseFilter):
         if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
             collected_posts = PostCollection.objects.filter(
                 user=self.request.user
-            ).values_list('post', flat=True)
+            ).values_list('post_id', flat=True)
             return queryset.filter(id__in=collected_posts)
         return queryset
 
@@ -248,8 +297,8 @@ class PostFilter(BaseFilter):
         if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
             following_users = UserFollow.objects.filter(
                 follower=self.request.user
-            ).values_list('following', flat=True)
-            return queryset.filter(author__in=following_users)
+            ).values_list('following_id', flat=True)
+            return queryset.filter(author_id__in=following_users)
         return queryset
 
 
@@ -258,9 +307,9 @@ class CommentFilter(BaseFilter):
     """评论过滤器"""
 
     # 基础字段过滤
+    post = filters.ModelChoiceFilter(queryset=Post.objects.all())
     author = filters.ModelChoiceFilter(queryset=User.objects.all())
     author_username = filters.CharFilter(field_name='author__username', lookup_expr='icontains')
-    post = filters.ModelChoiceFilter(queryset=Post.objects.all())
     parent = filters.ModelChoiceFilter(queryset=Comment.objects.all())
 
     # 文本搜索
@@ -271,19 +320,9 @@ class CommentFilter(BaseFilter):
     is_author_reply = filters.BooleanFilter()
     is_featured = filters.BooleanFilter()
     is_deleted = filters.BooleanFilter()
-    is_top_level = filters.BooleanFilter(method='filter_is_top_level')
 
-    # 数值范围过滤
+    # 数值过滤
     like_count_min = filters.NumberFilter(field_name='like_count', lookup_expr='gte')
-    like_count_max = filters.NumberFilter(field_name='like_count', lookup_expr='lte')
-    reply_count_min = filters.NumberFilter(field_name='reply_count', lookup_expr='gte')
-    reply_count_max = filters.NumberFilter(field_name='reply_count', lookup_expr='lte')
-
-    # 位置过滤
-    location = filters.CharFilter(field_name='location', lookup_expr='icontains')
-
-    # 用户相关过滤
-    liked_by_user = filters.BooleanFilter(method='filter_liked_by_user')
 
     # 排序
     ordering = filters.OrderingFilter(
@@ -313,144 +352,6 @@ class CommentFilter(BaseFilter):
             Q(author__username__icontains=value)
         )
 
-    def filter_is_top_level(self, queryset, name, value):
-        """顶级评论过滤"""
-        if value:
-            return queryset.filter(parent__isnull=True)
-        else:
-            return queryset.filter(parent__isnull=False)
-
-    def filter_liked_by_user(self, queryset, name, value):
-        """用户点赞的评论"""
-        if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            liked_comments = UserAction.objects.filter(
-                user=self.request.user,
-                action_type='like_comment'
-            ).values_list('comment', flat=True)
-            return queryset.filter(id__in=liked_comments)
-        return queryset
-
-
-# ===== 用户过滤器 =====
-class UserFilter(BaseFilter):
-    """用户过滤器"""
-
-    # 基础字段过滤
-    username = filters.CharFilter(field_name='username', lookup_expr='icontains')
-    email = filters.CharFilter(field_name='email', lookup_expr='icontains')
-    first_name = filters.CharFilter(field_name='first_name', lookup_expr='icontains')
-    last_name = filters.CharFilter(field_name='last_name', lookup_expr='icontains')
-
-    # 文本搜索
-    search = filters.CharFilter(method='filter_search')
-
-    # 布尔字段
-    is_active = filters.BooleanFilter()
-    is_staff = filters.BooleanFilter()
-    is_superuser = filters.BooleanFilter()
-
-    # 时间过滤
-    joined_after = filters.DateTimeFilter(field_name='date_joined', lookup_expr='gte')
-    joined_before = filters.DateTimeFilter(field_name='date_joined', lookup_expr='lte')
-    last_login_after = filters.DateTimeFilter(field_name='last_login', lookup_expr='gte')
-    last_login_before = filters.DateTimeFilter(field_name='last_login', lookup_expr='lte')
-
-    # 统计过滤
-    min_posts = filters.NumberFilter(method='filter_min_posts')
-    min_followers = filters.NumberFilter(method='filter_min_followers')
-    min_following = filters.NumberFilter(method='filter_min_following')
-
-    # 用户关系过滤
-    is_followed = filters.BooleanFilter(method='filter_is_followed')
-    is_following = filters.BooleanFilter(method='filter_is_following')
-    is_blocked = filters.BooleanFilter(method='filter_is_blocked')
-    mutual_follow = filters.BooleanFilter(method='filter_mutual_follow')
-
-    # 排序
-    ordering = filters.OrderingFilter(
-        fields=(
-            ('date_joined', 'date_joined'),
-            ('last_login', 'last_login'),
-            ('username', 'username'),
-        ),
-        field_labels={
-            'date_joined': '注册时间',
-            'last_login': '最后登录',
-            'username': '用户名',
-        }
-    )
-
-    class Meta:
-        model = User
-        fields = []
-
-    def filter_search(self, queryset, name, value):
-        """用户搜索"""
-        if not value:
-            return queryset
-
-        return queryset.filter(
-            Q(username__icontains=value) |
-            Q(first_name__icontains=value) |
-            Q(last_name__icontains=value) |
-            Q(email__icontains=value)
-        )
-
-    def filter_min_posts(self, queryset, name, value):
-        """最少帖子数过滤"""
-        return queryset.annotate(
-            posts_count=Count('posts', filter=Q(posts__status='approved'))
-        ).filter(posts_count__gte=value)
-
-    def filter_min_followers(self, queryset, name, value):
-        """最少粉丝数过滤"""
-        return queryset.annotate(
-            followers_count=Count('followers')
-        ).filter(followers_count__gte=value)
-
-    def filter_min_following(self, queryset, name, value):
-        """最少关注数过滤"""
-        return queryset.annotate(
-            following_count=Count('following')
-        ).filter(following_count__gte=value)
-
-    def filter_is_followed(self, queryset, name, value):
-        """当前用户关注的用户"""
-        if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            followed_users = UserFollow.objects.filter(
-                follower=self.request.user
-            ).values_list('following', flat=True)
-            return queryset.filter(id__in=followed_users)
-        return queryset
-
-    def filter_is_following(self, queryset, name, value):
-        """关注当前用户的用户"""
-        if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            followers = UserFollow.objects.filter(
-                following=self.request.user
-            ).values_list('follower', flat=True)
-            return queryset.filter(id__in=followers)
-        return queryset
-
-    def filter_is_blocked(self, queryset, name, value):
-        """被当前用户拉黑的用户"""
-        if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            blocked_users = BlockedUser.objects.filter(
-                user=self.request.user
-            ).values_list('blocked_user', flat=True)
-            return queryset.filter(id__in=blocked_users)
-        return queryset
-
-    def filter_mutual_follow(self, queryset, name, value):
-        """互相关注的用户"""
-        if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            mutual_follows = UserFollow.objects.filter(
-                follower=self.request.user,
-                is_mutual=True
-            ).values_list('following', flat=True)
-            return queryset.filter(id__in=mutual_follows)
-        return queryset
-
 
 # ===== 话题过滤器 =====
 class TopicFilter(BaseFilter):
@@ -460,7 +361,6 @@ class TopicFilter(BaseFilter):
     name = filters.CharFilter(field_name='name', lookup_expr='icontains')
     slug = filters.CharFilter(field_name='slug')
     creator = filters.ModelChoiceFilter(queryset=User.objects.all())
-    creator_username = filters.CharFilter(field_name='creator__username', lookup_expr='icontains')
     status = filters.MultipleChoiceFilter(choices=Topic.STATUS_CHOICES)
 
     # 文本搜索
@@ -472,19 +372,10 @@ class TopicFilter(BaseFilter):
     is_trending = filters.BooleanFilter()
     is_featured = filters.BooleanFilter()
 
-    # 数值范围过滤
+    # 数值过滤
     post_count_min = filters.NumberFilter(field_name='post_count', lookup_expr='gte')
-    post_count_max = filters.NumberFilter(field_name='post_count', lookup_expr='lte')
     follow_count_min = filters.NumberFilter(field_name='follow_count', lookup_expr='gte')
-    follow_count_max = filters.NumberFilter(field_name='follow_count', lookup_expr='lte')
     hot_score_min = filters.NumberFilter(field_name='hot_score', lookup_expr='gte')
-
-    # 特殊过滤
-    popular = filters.BooleanFilter(method='filter_popular')
-    active = filters.BooleanFilter(method='filter_active')
-
-    # 用户相关过滤
-    followed_by_user = filters.BooleanFilter(method='filter_followed_by_user')
 
     # 排序
     ordering = filters.OrderingFilter(
@@ -493,14 +384,12 @@ class TopicFilter(BaseFilter):
             ('post_count', 'post_count'),
             ('follow_count', 'follow_count'),
             ('hot_score', 'hot_score'),
-            ('name', 'name'),
         ),
         field_labels={
             'created_at': '创建时间',
             'post_count': '帖子数',
             'follow_count': '关注数',
             'hot_score': '热度分数',
-            'name': '话题名称',
         }
     )
 
@@ -515,40 +404,8 @@ class TopicFilter(BaseFilter):
 
         return queryset.filter(
             Q(name__icontains=value) |
-            Q(description__icontains=value) |
-            Q(creator__username__icontains=value)
+            Q(description__icontains=value)
         )
-
-    def filter_popular(self, queryset, name, value):
-        """热门话题过滤"""
-        if value:
-            return queryset.filter(
-                Q(post_count__gte=10) |
-                Q(follow_count__gte=20) |
-                Q(hot_score__gte=30)
-            ).order_by('-hot_score')
-        return queryset
-
-    def filter_active(self, queryset, name, value):
-        """活跃话题过滤（最近有新帖子）"""
-        if value:
-            recent_time = timezone.now() - timedelta(days=7)
-            active_topics = Post.objects.filter(
-                published_at__gte=recent_time
-                # 这里需要根据实际的话题-帖子关联方式调整
-            ).values_list('topic', flat=True).distinct()
-            return queryset.filter(id__in=active_topics)
-        return queryset
-
-    def filter_followed_by_user(self, queryset, name, value):
-        """用户关注的话题"""
-        if value and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            followed_topics = UserAction.objects.filter(
-                user=self.request.user,
-                action_type='follow_topic'
-            ).values_list('topic', flat=True)
-            return queryset.filter(id__in=followed_topics)
-        return queryset
 
 
 # ===== 分类过滤器 =====
@@ -558,34 +415,21 @@ class PostCategoryFilter(BaseFilter):
     # 基础字段过滤
     name = filters.CharFilter(field_name='name', lookup_expr='icontains')
     slug = filters.CharFilter(field_name='slug')
-    color = filters.CharFilter()
+    is_active = filters.BooleanFilter()
 
     # 文本搜索
     search = filters.CharFilter(method='filter_search')
-
-    # 布尔字段
-    is_active = filters.BooleanFilter()
-
-    # 数值范围过滤
-    post_count_min = filters.NumberFilter(field_name='post_count', lookup_expr='gte')
-    post_count_max = filters.NumberFilter(field_name='post_count', lookup_expr='lte')
-    sort_order = filters.NumberFilter()
-
-    # 特殊过滤
-    has_posts = filters.BooleanFilter(method='filter_has_posts')
 
     # 排序
     ordering = filters.OrderingFilter(
         fields=(
             ('sort_order', 'sort_order'),
             ('post_count', 'post_count'),
-            ('name', 'name'),
             ('created_at', 'created_at'),
         ),
         field_labels={
             'sort_order': '排序',
             'post_count': '帖子数',
-            'name': '分类名称',
             'created_at': '创建时间',
         }
     )
@@ -599,14 +443,10 @@ class PostCategoryFilter(BaseFilter):
         if not value:
             return queryset
 
-        return queryset.filter(name__icontains=value)
-
-    def filter_has_posts(self, queryset, name, value):
-        """有帖子的分类"""
-        if value:
-            return queryset.filter(post_count__gt=0)
-        else:
-            return queryset.filter(post_count=0)
+        return queryset.filter(
+            Q(name__icontains=value) |
+            Q(slug__icontains=value)
+        )
 
 
 # ===== 通知过滤器 =====
@@ -614,8 +454,8 @@ class NotificationFilter(BaseFilter):
     """通知过滤器"""
 
     # 基础字段过滤
+    receiver = filters.ModelChoiceFilter(queryset=User.objects.all())
     sender = filters.ModelChoiceFilter(queryset=User.objects.all())
-    sender_username = filters.CharFilter(field_name='sender__username', lookup_expr='icontains')
     notification_type = filters.MultipleChoiceFilter(choices=Notification.NOTIFICATION_TYPE_CHOICES)
 
     # 文本搜索
@@ -729,10 +569,10 @@ class AdminPostFilter(PostFilter):
     author = filters.ModelChoiceFilter(queryset=User.objects.all())
     author_username = filters.CharFilter(field_name='author__username', lookup_expr='icontains')
     category = filters.ModelChoiceFilter(queryset=PostCategory.objects.filter(is_active=True))
-    category_slug = filters.CharFilter(field_name='category__slug')  # 添加这行
+    category_slug = filters.CharFilter(field_name='category__slug')
 
     # 审核相关过滤
-    reviewer = filters.ModelChoiceFilter(queryset=User.objects.filter(is_staff=True))
+    reviewer = filters.ModelChoiceFilter(queryset=User.objects.all())
     review_priority = filters.NumberFilter()
     review_priority_min = filters.NumberFilter(field_name='review_priority', lookup_expr='gte')
     auto_review_score_min = filters.NumberFilter(field_name='auto_review_score', lookup_expr='gte')
@@ -775,7 +615,7 @@ class AdminPostFilter(PostFilter):
 
     class Meta:
         model = Post
-        fields = ['category_slug']  # 添加到fields中
+        fields = ['category_slug']
 
 
 # ===== 过滤器工具函数 =====

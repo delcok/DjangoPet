@@ -12,6 +12,7 @@ from .models import (
 )
 
 
+
 # ===== 基础用户信息序列化 =====
 class BasicUserSerializer(serializers.ModelSerializer):
     """基础用户信息（用于嵌套）"""
@@ -23,7 +24,7 @@ class BasicUserSerializer(serializers.ModelSerializer):
 
     def get_avatar(self, obj):
         # 这里可以根据实际的用户头像字段调整
-        return f"https://ui-avatars.com/api/?name={obj.username}&background=random"
+        return f"{obj.avatar}"
 
 
 class UserDetailSerializer(serializers.ModelSerializer):
@@ -412,14 +413,42 @@ class CreateCollectionSerializer(serializers.ModelSerializer):
 
 # ===== 关注相关序列化 =====
 class UserFollowSerializer(serializers.ModelSerializer):
-    """用户关注"""
-    follower = BasicUserSerializer(read_only=True)
-    following = BasicUserSerializer(read_only=True)
+    """用户关注关系序列化器"""
+    user = serializers.SerializerMethodField()
 
     class Meta:
         model = UserFollow
-        fields = ['id', 'follower', 'following', 'is_mutual', 'created_at']
-        read_only_fields = ['id', 'is_mutual', 'created_at']
+        fields = ['id', 'user', 'is_mutual', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def get_user(self, obj):
+        """根据context中的type返回对应的用户信息"""
+        request = self.context.get('request')
+        follow_type = self.context.get('type', 'following')
+
+        if follow_type == 'following':
+            # 显示被关注的用户
+            user = obj.following
+        else:
+            # 显示关注者
+            user = obj.follower
+
+        # 返回用户详细信息
+        data = {
+            'id': user.id,
+            'username': user.username,
+            'avatar': f"https://ui-avatars.com/api/?name={user.username}&background=random",
+            'is_mutual': obj.is_mutual,
+        }
+
+        # 如果有请求上下文，添加当前用户是否关注该用户
+        if request and request.user.is_authenticated:
+            data['is_followed'] = UserFollow.objects.filter(
+                follower=request.user,
+                following=user
+            ).exists()
+
+        return data
 
 
 # ===== 举报相关序列化 =====
