@@ -25,7 +25,7 @@ from community.serializers import (
     CommentSerializer, CreateCommentSerializer, UserDetailSerializer, BasicUserSerializer,
     PostCategorySerializer, TopicSerializer, SimpleTopicSerializer, UserActionSerializer,
     ReportSerializer, NotificationSerializer,
-    PostCollectionSerializer, UserFollowSerializer,  # 新增
+    PostCollectionSerializer, UserFollowSerializer,
 )
 from community.filters import (
     PostFilter, CommentFilter, UserFilter, TopicFilter, PostCategoryFilter,
@@ -100,13 +100,42 @@ class BaseViewSet(ModelViewSet):
 
 # ===== 用户相关视图 =====
 class UserViewSet(ReadOnlyModelViewSet):
-    """用户视图集"""
+    """用户视图集 - 支持通过 id 或 username 查询"""
     queryset = User.objects.filter(is_active=True)
     serializer_class = UserDetailSerializer
     filterset_class = UserFilter
     authentication_classes = [UserAuthentication]
     permission_classes = [IsUserOwner]
-    lookup_field = 'username'
+    lookup_field = 'username'  # 默认使用 username
+
+    def get_object(self):
+        """
+        支持通过 id 或 username 查询用户
+        - URL中的值如果是纯数字，则按ID查询
+        - 否则按username查询
+
+        示例:
+        - /users/123/  -> 按ID查询
+        - /users/john_doe/  -> 按username查询
+        """
+        lookup_value = self.kwargs.get(self.lookup_field)
+
+        try:
+            # 判断是数字ID还是username
+            if lookup_value.isdigit():
+                # 如果是纯数字，按ID查询
+                user = User.objects.filter(is_active=True).get(id=int(lookup_value))
+            else:
+                # 否则按username查询
+                user = User.objects.filter(is_active=True).get(username=lookup_value)
+
+            # 检查权限
+            self.check_object_permissions(self.request, user)
+            return user
+
+        except User.DoesNotExist:
+            from rest_framework.exceptions import NotFound
+            raise NotFound('用户不存在')
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -115,7 +144,14 @@ class UserViewSet(ReadOnlyModelViewSet):
 
     @action(detail=True, methods=['get'])
     def posts(self, request, username=None):
-        """获取用户的帖子"""
+        """
+        获取用户的帖子
+        支持通过 id 或 username 访问
+
+        URL示例:
+        - /users/123/posts/  -> 通过ID
+        - /users/john_doe/posts/  -> 通过username
+        """
         user = self.get_object()
         posts = Post.objects.filter(
             author=user,
@@ -208,10 +244,13 @@ class UserViewSet(ReadOnlyModelViewSet):
 
             return Response({'detail': '拉黑成功', 'blocked': True})
 
-    # ===== 新增接口：用户统计信息 =====
+    # ===== 用户统计信息 =====
     @action(detail=True, methods=['get'])
     def stats(self, request, username=None):
-        """获取用户统计信息（粉丝数、关注数、获赞量等）"""
+        """
+        获取用户统计信息（粉丝数、关注数、获赞量等）
+        支持通过 id 或 username 访问
+        """
         user = self.get_object()
 
         # 粉丝数
@@ -269,10 +308,13 @@ class UserViewSet(ReadOnlyModelViewSet):
             }
         })
 
-    # ===== 新增接口：关注列表 =====
+    # ===== 关注列表 =====
     @action(detail=True, methods=['get'])
     def following_list(self, request, username=None):
-        """获取用户的关注列表"""
+        """
+        获取用户的关注列表
+        支持通过 id 或 username 访问
+        """
         user = self.get_object()
 
         # 获取关注关系
@@ -293,10 +335,13 @@ class UserViewSet(ReadOnlyModelViewSet):
 
         return create_paginated_response(serializer.data, paginator)
 
-    # ===== 新增接口：粉丝列表 =====
+    # ===== 粉丝列表 =====
     @action(detail=True, methods=['get'])
     def followers_list(self, request, username=None):
-        """获取用户的粉丝列表"""
+        """
+        获取用户的粉丝列表
+        支持通过 id 或 username 访问
+        """
         user = self.get_object()
 
         # 获取粉丝关系
@@ -316,6 +361,57 @@ class UserViewSet(ReadOnlyModelViewSet):
         )
 
         return create_paginated_response(serializer.data, paginator)
+
+    # ===== 新增：用户完整信息接口（用于详情页） =====
+    @action(detail=True, methods=['get'])
+    def profile(self, request, username=None):
+        """
+        获取用户完整资料（用于详情页展示）
+        包含：用户基本信息 + 统计数据 + 最新帖子
+
+        URL示例:
+        - /users/123/profile/  -> 通过ID
+        - /users/john_doe/profile/  -> 通过username
+        """
+        user = self.get_object()
+
+        # 用户基本信息
+        user_data = UserDetailSerializer(user, context={'request': request}).data
+
+        # 统计数据
+        stats = {
+            'followers_count': UserFollow.objects.filter(following=user).count(),
+            'following_count': UserFollow.objects.filter(follower=user).count(),
+            'posts_count': Post.objects.filter(author=user, status='approved').count(),
+            'total_likes': (
+                                   Post.objects.filter(author=user, status='approved')
+                                   .aggregate(total=Sum('like_count'))['total'] or 0
+                           ) + (
+                                   Comment.objects.filter(author=user, is_deleted=False)
+                                   .aggregate(total=Sum('like_count'))['total'] or 0
+                           ),
+        }
+
+        # 最新帖子（前10条）
+        recent_posts = Post.objects.filter(
+            author=user,
+            status='approved'
+        ).select_related('category').prefetch_related('medias').order_by('-published_at')[:10]
+
+        posts_data = PostListSerializer(
+            recent_posts,
+            many=True,
+            context={'request': request}
+        ).data
+
+        return Response({
+            'success': True,
+            'data': {
+                'user': user_data,
+                'stats': stats,
+                'recent_posts': posts_data
+            }
+        })
 
 
 # ===== 帖子分类视图 =====

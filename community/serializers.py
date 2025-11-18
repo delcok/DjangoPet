@@ -46,7 +46,7 @@ class UserDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'date_joined', 'email']
 
     def get_avatar(self, obj):
-        return f"https://ui-avatars.com/api/?name={obj.username}&background=random"
+        return f"{obj.avatar}"
 
     def get_followers_count(self, obj):
         return obj.followers.count()
@@ -437,7 +437,7 @@ class UserFollowSerializer(serializers.ModelSerializer):
         data = {
             'id': user.id,
             'username': user.username,
-            'avatar': f"https://ui-avatars.com/api/?name={user.username}&background=random",
+            'avatar': f"{user.avatar}",
             'is_mutual': obj.is_mutual,
         }
 
