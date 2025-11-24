@@ -308,6 +308,7 @@ class CommentFilter(BaseFilter):
 
     # 基础字段过滤
     post = filters.ModelChoiceFilter(queryset=Post.objects.all())
+    post_id = filters.NumberFilter(field_name='post_id')  # 支持 post_id 参数
     author = filters.ModelChoiceFilter(queryset=User.objects.all())
     author_username = filters.CharFilter(field_name='author__username', lookup_expr='icontains')
     parent = filters.ModelChoiceFilter(queryset=Comment.objects.all())

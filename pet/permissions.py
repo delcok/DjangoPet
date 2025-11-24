@@ -15,7 +15,7 @@ class IsOwnerOrReadOnly(permissions.BasePermission):
             return True
 
         # 写入权限只允许所有者
-        return obj.owner == request.user or request.user.type == 'admin'
+        return obj.author == request.user or request.user.type == 'admin'
 
 
 class IsPetOwner(permissions.BasePermission):
@@ -38,7 +38,7 @@ class IsPetDiaryAuthor(permissions.BasePermission):
         # 管理员可以访问所有内容
 
         # 宠物主人可以查看自己宠物的所有日记
-        if obj.pet.owner == request.user:
+        if obj.pet.author == request.user:
             return True
 
         # 日记作者可以编辑自己的日记

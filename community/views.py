@@ -681,6 +681,10 @@ class PostViewSet(BaseViewSet):
             author=request.user
         ).select_related('category').order_by('-created_at')
 
+        status_param = request.query_params.get('status')
+        if status_param and status_param != 'all':
+            posts = posts.filter(status=status_param)
+
         paginated_posts, paginator = paginate_queryset(
             posts, request, 'standard'
         )

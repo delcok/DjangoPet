@@ -65,8 +65,7 @@ class ServiceOrderViewSet(viewsets.ModelViewSet):
         )
 
         # 普通用户只能看到自己的订单
-        if not self.request.user.is_staff:
-            queryset = queryset.filter(user=self.request.user)
+        queryset = queryset.filter(user=self.request.user)
 
         return queryset
 
@@ -249,8 +248,8 @@ class BillViewSet(viewsets.ModelViewSet):
         )
 
         # 普通用户只能看到自己的账单
-        if not self.request.user.is_staff:
-            queryset = queryset.filter(user=self.request.user)
+
+        queryset = queryset.filter(user=self.request.user)
 
         return queryset
 

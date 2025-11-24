@@ -440,7 +440,7 @@ class RefundBillSerializer(serializers.Serializer):
 
         # 验证权限
         user = self.context['request'].user
-        if service_order.user != user and not user.is_staff:
+        if service_order.user != user:
             raise serializers.ValidationError("无权操作此订单")
 
         # 验证订单是否可退款
