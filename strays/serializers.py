@@ -5,7 +5,12 @@
 from rest_framework import serializers
 
 from user.models import User
-from strays.models import StrayAnimal, StrayAnimalInteraction
+from strays.models import (
+    StrayAnimal,
+    StrayAnimalInteraction,
+    StrayAnimalFavorite,
+    StrayAnimalReport
+)
 
 
 class UserSimpleSerializer(serializers.ModelSerializer):
@@ -22,6 +27,7 @@ class StrayAnimalListSerializer(serializers.ModelSerializer):
     animal_type_display = serializers.CharField(source='get_animal_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     distance = serializers.SerializerMethodField()
+    is_favorited = serializers.SerializerMethodField()
 
     class Meta:
         model = StrayAnimal
@@ -29,8 +35,8 @@ class StrayAnimalListSerializer(serializers.ModelSerializer):
             'id', 'animal_type', 'animal_type_display', 'nickname',
             'main_image_url', 'province', 'city', 'district',
             'status', 'status_display', 'health_status',
-            'last_seen_date', 'view_count', 'interaction_count',
-            'reporter', 'distance', 'created_at'
+            'last_seen_date', 'view_count', 'interaction_count', 'favorite_count',
+            'reporter', 'distance', 'is_favorited', 'created_at'
         ]
 
     def get_distance(self, obj):
@@ -64,6 +70,16 @@ class StrayAnimalListSerializer(serializers.ModelSerializer):
                 pass
         return None
 
+    def get_is_favorited(self, obj):
+        """判断当前用户是否已收藏"""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            return StrayAnimalFavorite.objects.filter(
+                user=request.user,
+                animal=obj
+            ).exists()
+        return False
+
 
 class StrayAnimalDetailSerializer(serializers.ModelSerializer):
     """流浪动物详情序列化器"""
@@ -74,16 +90,27 @@ class StrayAnimalDetailSerializer(serializers.ModelSerializer):
     health_status_display = serializers.CharField(source='get_health_status_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     recent_interactions = serializers.SerializerMethodField()
+    is_favorited = serializers.SerializerMethodField()
 
     class Meta:
         model = StrayAnimal
         fields = '__all__'
-        read_only_fields = ['reporter', 'view_count', 'interaction_count', 'created_at', 'updated_at']
+        read_only_fields = ['reporter', 'view_count', 'interaction_count', 'favorite_count', 'created_at', 'updated_at']
 
     def get_recent_interactions(self, obj):
         """获取最近的互动记录"""
         interactions = obj.interactions.all()[:10]
         return StrayAnimalInteractionSerializer(interactions, many=True).data
+
+    def get_is_favorited(self, obj):
+        """判断当前用户是否已收藏"""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            return StrayAnimalFavorite.objects.filter(
+                user=request.user,
+                animal=obj
+            ).exists()
+        return False
 
 
 class StrayAnimalCreateSerializer(serializers.ModelSerializer):
@@ -96,7 +123,7 @@ class StrayAnimalCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StrayAnimal
-        exclude = ['reporter', 'view_count', 'interaction_count']
+        exclude = ['reporter', 'view_count', 'interaction_count', 'favorite_count']
 
     def validate_image_urls(self, value):
         """验证图片URL列表"""
@@ -120,7 +147,7 @@ class StrayAnimalUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StrayAnimal
-        exclude = ['reporter', 'view_count', 'interaction_count', 'created_at']
+        exclude = ['reporter', 'view_count', 'interaction_count', 'favorite_count', 'created_at']
         read_only_fields = ['reporter']
 
     def validate_image_urls(self, value):
@@ -169,14 +196,26 @@ class NearbyAnimalSerializer(serializers.ModelSerializer):
     distance = serializers.FloatField()
     reporter = UserSimpleSerializer(read_only=True)
     animal_type_display = serializers.CharField(source='get_animal_type_display', read_only=True)
+    is_favorited = serializers.SerializerMethodField()
 
     class Meta:
         model = StrayAnimal
         fields = [
             'id', 'animal_type', 'animal_type_display', 'nickname',
             'main_image_url', 'latitude', 'longitude', 'detail_address',
-            'distance', 'health_status', 'last_seen_date', 'reporter'
+            'distance', 'health_status', 'last_seen_date', 'reporter',
+            'is_favorited', 'favorite_count'
         ]
+
+    def get_is_favorited(self, obj):
+        """判断当前用户是否已收藏"""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            return StrayAnimalFavorite.objects.filter(
+                user=request.user,
+                animal=obj
+            ).exists()
+        return False
 
 
 class StatisticsSerializer(serializers.Serializer):
@@ -189,3 +228,97 @@ class StatisticsSerializer(serializers.Serializer):
     recent_week_reports = serializers.IntegerField()
     by_type = serializers.DictField()
     by_district = serializers.DictField()
+
+
+# ========== 收藏相关 ==========
+
+class StrayAnimalFavoriteSerializer(serializers.ModelSerializer):
+    """收藏记录序列化器"""
+    user = UserSimpleSerializer(read_only=True)
+    animal = StrayAnimalListSerializer(read_only=True)
+
+    class Meta:
+        model = StrayAnimalFavorite
+        fields = '__all__'
+        read_only_fields = ['user', 'created_at']
+
+
+class FavoriteAnimalSimpleSerializer(serializers.ModelSerializer):
+    """收藏列表中的动物简化序列化器"""
+    animal_type_display = serializers.CharField(source='get_animal_type_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = StrayAnimal
+        fields = [
+            'id', 'animal_type', 'animal_type_display', 'nickname',
+            'main_image_url', 'city', 'district', 'status', 'status_display',
+            'health_status', 'last_seen_date', 'favorite_count'
+        ]
+
+
+# ========== 举报相关 ==========
+
+class StrayAnimalReportCreateSerializer(serializers.ModelSerializer):
+    """创建举报记录序列化器"""
+
+    class Meta:
+        model = StrayAnimalReport
+        fields = ['animal', 'interaction', 'report_type', 'reason']
+
+    def validate(self, attrs):
+        """验证举报数据"""
+        animal = attrs.get('animal')
+        interaction = attrs.get('interaction')
+
+        # 必须有一个举报目标
+        if not animal and not interaction:
+            raise serializers.ValidationError("必须指定举报目标（动物或互动）")
+
+        # 不能同时举报两个
+        if animal and interaction:
+            raise serializers.ValidationError("只能举报一个目标")
+
+        return attrs
+
+    def create(self, validated_data):
+        """创建举报记录"""
+        validated_data['reporter'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class StrayAnimalReportSerializer(serializers.ModelSerializer):
+    """举报记录序列化器"""
+    reporter = UserSimpleSerializer(read_only=True)
+    handler = UserSimpleSerializer(read_only=True)
+    report_type_display = serializers.CharField(source='get_report_type_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    # 被举报对象的简要信息
+    animal_info = serializers.SerializerMethodField()
+    interaction_info = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StrayAnimalReport
+        fields = '__all__'
+        read_only_fields = ['reporter', 'handler', 'handled_at', 'created_at']
+
+    def get_animal_info(self, obj):
+        """获取被举报动物的简要信息"""
+        if obj.animal:
+            return {
+                'id': obj.animal.id,
+                'nickname': obj.animal.nickname or '未命名',
+                'animal_type': obj.animal.get_animal_type_display()
+            }
+        return None
+
+    def get_interaction_info(self, obj):
+        """获取被举报互动的简要信息"""
+        if obj.interaction:
+            return {
+                'id': obj.interaction.id,
+                'type': obj.interaction.get_interaction_type_display(),
+                'content': obj.interaction.content[:50] if obj.interaction.content else None
+            }
+        return None

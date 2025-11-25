@@ -1,14 +1,20 @@
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Count
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Count, Q
 from django.utils import timezone
 from datetime import timedelta
 import math
 
 from utils.authentication import UserAuthentication
 from utils.permission import AnyUser
-from .models import StrayAnimal, StrayAnimalInteraction
+from .models import (
+    StrayAnimal,
+    StrayAnimalInteraction,
+    StrayAnimalFavorite,
+    StrayAnimalReport
+)
 from .serializers import (
     StrayAnimalListSerializer,
     StrayAnimalDetailSerializer,
@@ -17,7 +23,11 @@ from .serializers import (
     StrayAnimalInteractionSerializer,
     StrayAnimalInteractionCreateSerializer,
     NearbyAnimalSerializer,
-    StatisticsSerializer
+    StatisticsSerializer,
+    StrayAnimalFavoriteSerializer,
+    FavoriteAnimalSimpleSerializer,
+    StrayAnimalReportCreateSerializer,
+    StrayAnimalReportSerializer,
 )
 
 
@@ -28,7 +38,7 @@ class StrayAnimalViewSet(viewsets.ModelViewSet):
     permission_classes = [AnyUser]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['nickname', 'breed', 'distinctive_features', 'detail_address']
-    ordering_fields = ['created_at', 'last_seen_date', 'view_count', 'interaction_count']
+    ordering_fields = ['created_at', 'last_seen_date', 'view_count', 'interaction_count', 'favorite_count']
     ordering = ['-last_seen_date']
 
     def get_serializer_class(self):
@@ -317,6 +327,70 @@ class StrayAnimalViewSet(viewsets.ModelViewSet):
 
         return Response({'message': '状态已更新'})
 
+    # ========== 收藏功能 ==========
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def favorite(self, request, pk=None):
+        """收藏动物"""
+        animal = self.get_object()
+
+        # 检查是否已收藏
+        favorite, created = StrayAnimalFavorite.objects.get_or_create(
+            user=request.user,
+            animal=animal
+        )
+
+        if created:
+            return Response(
+                {'message': '收藏成功', 'is_favorited': True},
+                status=status.HTTP_201_CREATED
+            )
+        else:
+            return Response(
+                {'message': '已经收藏过了', 'is_favorited': True},
+                status=status.HTTP_200_OK
+            )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def unfavorite(self, request, pk=None):
+        """取消收藏动物"""
+        animal = self.get_object()
+
+        deleted_count = StrayAnimalFavorite.objects.filter(
+            user=request.user,
+            animal=animal
+        ).delete()[0]
+
+        if deleted_count > 0:
+            return Response(
+                {'message': '取消收藏成功', 'is_favorited': False},
+                status=status.HTTP_200_OK
+            )
+        else:
+            return Response(
+                {'message': '未收藏该动物', 'is_favorited': False},
+                status=status.HTTP_200_OK
+            )
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_favorites(self, request):
+        """获取我的收藏列表"""
+        favorites = StrayAnimalFavorite.objects.filter(
+            user=request.user
+        ).select_related('animal')
+
+        # 提取动物列表
+        animals = [f.animal for f in favorites if f.animal.is_active]
+
+        # 分页
+        page = self.paginate_queryset(animals)
+        if page is not None:
+            serializer = StrayAnimalListSerializer(page, many=True, context={'request': request})
+            return self.get_paginated_response(serializer.data)
+
+        serializer = StrayAnimalListSerializer(animals, many=True, context={'request': request})
+        return Response(serializer.data)
+
 
 class StrayAnimalInteractionViewSet(viewsets.ReadOnlyModelViewSet):
     """互动记录视图集（只读）"""
@@ -366,3 +440,94 @@ class StrayAnimalInteractionViewSet(viewsets.ReadOnlyModelViewSet):
 
         serializer = self.get_serializer(interactions, many=True)
         return Response(serializer.data)
+
+
+class StrayAnimalFavoriteViewSet(viewsets.ReadOnlyModelViewSet):
+    """收藏记录视图集（只读，主要用于管理）"""
+    queryset = StrayAnimalFavorite.objects.all()
+    serializer_class = StrayAnimalFavoriteSerializer
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.OrderingFilter]
+    ordering = ['-created_at']
+
+    def get_queryset(self):
+        """只返回当前用户的收藏"""
+        return super().get_queryset().filter(user=self.request.user)
+
+
+class StrayAnimalReportViewSet(viewsets.ModelViewSet):
+    """举报记录视图集"""
+    queryset = StrayAnimalReport.objects.all()
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.OrderingFilter]
+    ordering = ['-created_at']
+
+    def get_serializer_class(self):
+        """根据操作返回对应的序列化器"""
+        if self.action == 'create':
+            return StrayAnimalReportCreateSerializer
+        return StrayAnimalReportSerializer
+
+    def get_queryset(self):
+        """普通用户只能看到自己的举报，管理员可以看到所有"""
+        queryset = super().get_queryset()
+
+        # 如果是管理员，可以看到所有举报
+        if self.request.user.is_staff:
+            # 支持按状态过滤
+            report_status = self.request.query_params.get('status')
+            if report_status:
+                queryset = queryset.filter(status=report_status)
+            return queryset
+
+        # 普通用户只能看到自己提交的举报
+        return queryset.filter(reporter=self.request.user)
+
+    def perform_create(self, serializer):
+        """创建举报时设置举报人"""
+        serializer.save(reporter=self.request.user)
+
+    @action(detail=False, methods=['get'])
+    def my_reports(self, request):
+        """获取我的举报记录"""
+        reports = self.get_queryset().filter(reporter=request.user)
+
+        page = self.paginate_queryset(reports)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(reports, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def handle(self, request, pk=None):
+        """处理举报（仅管理员）"""
+        if not request.user.is_staff:
+            return Response(
+                {'error': '只有管理员可以处理举报'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        report = self.get_object()
+        new_status = request.data.get('status')
+        handler_note = request.data.get('handler_note', '')
+
+        if new_status not in ['processing', 'resolved', 'rejected']:
+            return Response(
+                {'error': '无效的处理状态'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        report.status = new_status
+        report.handler = request.user
+        report.handler_note = handler_note
+        report.handled_at = timezone.now()
+        report.save()
+
+        return Response(
+            StrayAnimalReportSerializer(report).data,
+            status=status.HTTP_200_OK
+        )
