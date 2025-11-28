@@ -49,9 +49,9 @@ class WeChatPayHelper:
             order = self.pay.order.create(
                 body=body,
                 trade_type=self.trade_type,
-                notify_url="https://khjade.com:8080/api/v1/wechat_callback/payment/",
+                notify_url="https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/payment/",
                 total_fee=total_fee,
-                client_ip='47.96.134.13',  # 替换为您的服务器IP
+                client_ip='121.196.245.220',  # 替换为您的服务器IP
                 user_id=openid,
                 out_trade_no=out_trade_no,
             )
@@ -110,4 +110,11 @@ class WeChatPayHelper:
             logger.error(f"签名验证失败: 计算签名={calculated_signature}, 回调签名={signature}")
             return False
 
-
+    def cancel_payment_order(self, out_trade_no):
+        try:
+            # 调用微信支付的接口来关闭订单
+            result = self.pay.order.close(out_trade_no=out_trade_no)
+            return result
+        except WeChatPayException as e:
+            logger.error(f"取消支付订单失败: {e}")
+            raise e

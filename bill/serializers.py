@@ -165,6 +165,7 @@ class ServiceOrderCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ServiceOrder
         fields = [
+            'id',
             'base_service', 'additional_services', 'pets',
             'scheduled_date', 'scheduled_time', 'duration_minutes',
             'province', 'city', 'district',

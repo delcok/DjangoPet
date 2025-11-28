@@ -7,15 +7,13 @@ from rest_framework.routers import DefaultRouter
 
 from bill.views import (
     ServiceOrderViewSet,
-    BillViewSet,
     wechat_callback,
-    CreatePaymentView
+    CreatePaymentView, QueryPaymentView
 )
 
 # 创建路由器
 router = DefaultRouter()
 router.register(r'service-orders', ServiceOrderViewSet, basename='serviceorder')
-router.register(r'bills', BillViewSet, basename='bill')
 
 urlpatterns = [
     # API路由
@@ -24,4 +22,5 @@ urlpatterns = [
     # 支付相关
     path('wechat_callback/<str:callback_type>/', wechat_callback, name='wechat_callback'),
     path('wechatpay/create_payment/', CreatePaymentView.as_view(), name='create_payment'),
+    path('wechatpay/query/', QueryPaymentView.as_view(), name='query_payment'),
 ]

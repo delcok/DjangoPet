@@ -450,7 +450,7 @@ class StrayAnimalReportAdmin(admin.ModelAdmin):
         from django.utils import timezone
         updated = queryset.filter(status='pending').update(
             status='processing',
-            handler=request.user,
+            handler_id=request.user.id,  # 修改这里：使用 handler_id
             handled_at=timezone.now()
         )
         self.message_user(request, f'成功标记 {updated} 条举报为处理中')
@@ -461,7 +461,7 @@ class StrayAnimalReportAdmin(admin.ModelAdmin):
         from django.utils import timezone
         updated = queryset.filter(status__in=['pending', 'processing']).update(
             status='resolved',
-            handler=request.user,
+            handler_id=request.user.id,  # 修改这里：使用 handler_id
             handled_at=timezone.now()
         )
         self.message_user(request, f'成功标记 {updated} 条举报为已处理')
@@ -472,7 +472,7 @@ class StrayAnimalReportAdmin(admin.ModelAdmin):
         from django.utils import timezone
         updated = queryset.filter(status__in=['pending', 'processing']).update(
             status='rejected',
-            handler=request.user,
+            handler_id=request.user.id,  # 修改这里：使用 handler_id
             handled_at=timezone.now()
         )
         self.message_user(request, f'成功标记 {updated} 条举报为已驳回')

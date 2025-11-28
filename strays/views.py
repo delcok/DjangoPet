@@ -473,17 +473,14 @@ class StrayAnimalReportViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """普通用户只能看到自己的举报，管理员可以看到所有"""
         queryset = super().get_queryset()
+        queryset = queryset.filter(reporter=self.request.user)
 
-        # 如果是管理员，可以看到所有举报
-        if self.request.user.is_staff:
-            # 支持按状态过滤
-            report_status = self.request.query_params.get('status')
-            if report_status:
-                queryset = queryset.filter(status=report_status)
-            return queryset
+        # 添加状态过滤
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
 
-        # 普通用户只能看到自己提交的举报
-        return queryset.filter(reporter=self.request.user)
+        return queryset
 
     def perform_create(self, serializer):
         """创建举报时设置举报人"""
