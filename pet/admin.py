@@ -124,6 +124,8 @@ class PetAdmin(admin.ModelAdmin):
 
     def age_display(self, obj):
         """年龄显示"""
+        if obj.age_months is None:
+            return '-'
         years = obj.age_years
         months = obj.age_months % 12
         if years > 0:
@@ -229,7 +231,6 @@ class PetDiaryAdmin(admin.ModelAdmin):
         )
 
     has_images.short_description = '图片'
-    has_images.boolean = True
 
     def has_videos(self, obj):
         """是否有视频"""
@@ -241,7 +242,6 @@ class PetDiaryAdmin(admin.ModelAdmin):
         )
 
     has_videos.short_description = '视频'
-    has_videos.boolean = True
 
 
 @admin.register(PetServiceRecord)
@@ -257,8 +257,8 @@ class PetServiceRecordAdmin(admin.ModelAdmin):
         'created_at'
     ]
     search_fields = [
-        'related_order__pets__name',
-        'related_order__staff__username',
+        'related_order__id',
+        'related_order__user__username',
         'service_summary'
     ]
     ordering = ['-actual_start_time']
@@ -314,11 +314,11 @@ class PetServiceRecordAdmin(admin.ModelAdmin):
         from django.urls import reverse
         url = reverse('admin:bill_serviceorder_change', args=[obj.related_order.id])
         return format_html(
-            '<a href="{}">#{}</a>',
-            url, obj.related_order.order_number
+            '<a href="{}">订单#{}</a>',
+            url, obj.related_order.id
         )
 
-    order_link.short_description = '订单'
+    order_link.short_description = '关联订单'
 
     def pet_display(self, obj):
         """宠物显示"""
@@ -344,7 +344,9 @@ class PetServiceRecordAdmin(admin.ModelAdmin):
 
     def service_date(self, obj):
         """服务日期"""
-        return obj.actual_start_time.strftime('%Y-%m-%d')
+        if obj.actual_start_time:
+            return obj.actual_start_time.strftime('%Y-%m-%d')
+        return '-'
 
     service_date.short_description = '服务日期'
 
@@ -379,4 +381,3 @@ class PetServiceRecordAdmin(admin.ModelAdmin):
         )
 
     has_feedback.short_description = '客户反馈'
-    has_feedback.boolean = True

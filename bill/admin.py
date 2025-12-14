@@ -8,6 +8,44 @@ from django.utils.safestring import mark_safe
 from .models import ServiceOrder, Bill
 
 
+class PetServiceRecordInline(admin.StackedInline):
+    """服务记录内联编辑"""
+    from pet.models import PetServiceRecord
+    model = PetServiceRecord
+    extra = 0
+    max_num = 1
+    can_delete = False
+
+    fieldsets = (
+        ('服务时间', {
+            'fields': ('actual_start_time', 'actual_end_time', 'actual_duration')
+        }),
+        ('宠物状况', {
+            'fields': ('pet_condition_before', 'pet_condition_after', 'pet_behavior_notes')
+        }),
+        ('服务结果', {
+            'fields': ('service_summary', 'professional_recommendations', 'next_service_suggestion')
+        }),
+        ('媒体记录', {
+            'fields': ('before_images', 'after_images', 'process_videos'),
+            'classes': ('collapse',)
+        }),
+        ('客户反馈', {
+            'fields': ('customer_feedback', 'rating')
+        }),
+        ('其他', {
+            'fields': ('special_notes', 'related_diary'),
+            'classes': ('collapse',)
+        }),
+    )
+
+    readonly_fields = ['actual_duration']
+    autocomplete_fields = ['related_diary']
+
+    verbose_name = '服务记录'
+    verbose_name_plural = '服务记录'
+
+
 @admin.register(ServiceOrder)
 class ServiceOrderAdmin(admin.ModelAdmin):
     """服务订单管理"""
@@ -15,7 +53,7 @@ class ServiceOrderAdmin(admin.ModelAdmin):
     list_display = [
         'id', 'user_info', 'base_service_info', 'pets_count',
         'scheduled_datetime', 'status_badge', 'price_info',
-        'created_at'
+        'has_service_record', 'created_at'
     ]
     list_filter = ['status', 'scheduled_date', 'created_at', 'province', 'city']
     search_fields = ['user__username', 'contact_phone', 'contact_name', 'service_address']
@@ -57,6 +95,9 @@ class ServiceOrderAdmin(admin.ModelAdmin):
     )
 
     filter_horizontal = ['pets', 'additional_services']
+
+    # 添加服务记录内联
+    inlines = [PetServiceRecordInline]
 
     def user_info(self, obj):
         """用户信息"""
@@ -141,11 +182,22 @@ class ServiceOrderAdmin(admin.ModelAdmin):
 
     price_info.short_description = '价格'
 
+    def has_service_record(self, obj):
+        """是否有服务记录"""
+        has_record = hasattr(obj, 'service_record') and obj.service_record is not None
+        return format_html(
+            '<span style="color: {};">{}</span>',
+            '#52c41a' if has_record else '#d9d9d9',
+            '✓' if has_record else '✗'
+        )
+
+    has_service_record.short_description = '服务记录'
+
     def get_queryset(self, request):
         """优化查询"""
         queryset = super().get_queryset(request)
         return queryset.select_related(
-            'user', 'staff', 'base_service'
+            'user', 'staff', 'base_service', 'service_record'
         ).prefetch_related('pets', 'additional_services')
 
 

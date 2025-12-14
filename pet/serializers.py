@@ -129,18 +129,20 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
     def validate(self, data):
         """验证数据完整性"""
         # 如果设置了封面图，确保它在图片列表中
-        if data.get('cover_image') and data.get('images'):
-            if data['cover_image'] not in data['images']:
+        images = data.get('images')
+        cover_image = data.get('cover_image')
+        if cover_image and images and len(images) > 0:
+            if cover_image not in images:
                 raise serializers.ValidationError("封面图片必须在图片列表中")
-        return data
 
+        return data
 
 class PetServiceRecordListSerializer(serializers.ModelSerializer):
     """宠物服务记录列表序列化器"""
     pet_name = serializers.SerializerMethodField()
     service_name = serializers.SerializerMethodField()
     provider_name = serializers.SerializerMethodField()
-    order_number = serializers.CharField(source='related_order.order_number', read_only=True)
+    order_number = serializers.SerializerMethodField()
     order_status = serializers.CharField(source='related_order.status', read_only=True)
 
     class Meta:
@@ -153,16 +155,27 @@ class PetServiceRecordListSerializer(serializers.ModelSerializer):
         ]
 
     def get_pet_name(self, obj):
+        """获取宠物名称"""
         pet = obj.pet
         return pet.name if pet else None
 
     def get_service_name(self, obj):
-        service = obj.related_order.service
-        return service.name if service else None
+        """获取服务名称 - 修复：使用 base_service 而不是 service"""
+        try:
+            if obj.related_order and obj.related_order.base_service:
+                return obj.related_order.base_service.name
+        except Exception:
+            pass
+        return None
 
     def get_provider_name(self, obj):
+        """获取服务提供者名称"""
         provider = obj.service_provider
         return provider.username if provider else None
+
+    def get_order_number(self, obj):
+        """获取订单ID作为订单号"""
+        return f"#{obj.related_order.id}" if obj.related_order else None
 
 
 class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
@@ -188,6 +201,7 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at', 'updated_at', 'actual_duration']
 
     def get_pet_info(self, obj):
+        """获取宠物信息"""
         pet = obj.pet
         if pet:
             return {
@@ -201,15 +215,20 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_service_info(self, obj):
-        service = obj.related_order.service
-        if service:
-            return {
-                'id': service.id,
-                'name': service.name,
-            }
+        """获取服务信息 - 修复：使用 base_service 而不是 service"""
+        try:
+            if obj.related_order and obj.related_order.base_service:
+                service = obj.related_order.base_service
+                return {
+                    'id': service.id,
+                    'name': service.name,
+                }
+        except Exception:
+            pass
         return None
 
     def get_provider_info(self, obj):
+        """获取服务提供者信息"""
         provider = obj.service_provider
         if provider:
             return {
@@ -219,10 +238,11 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_order_info(self, obj):
+        """获取订单信息"""
         order = obj.related_order
         return {
             'id': order.id,
-            'order_number': order.order_number,
+            'order_number': f"#{order.id}",
             'status': order.status,
             'status_display': order.get_status_display(),
         }

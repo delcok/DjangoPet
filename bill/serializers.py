@@ -4,11 +4,8 @@
 
 from rest_framework import serializers
 from decimal import Decimal
-from django.utils import timezone
 from bill.models import Bill, ServiceOrder
 from pet.models import Pet
-from staff.models import Staff
-from user.models import User
 from service.models import ServiceModel, AdditionalService, PetType
 
 
@@ -113,11 +110,13 @@ class ServiceOrderDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_staff_info(self, obj):
+        """获取员工信息 - 修复：使用 username 而不是 name"""
         if obj.staff:
             return {
                 'id': obj.staff.id,
-                'name': obj.staff.name,
+                'username': obj.staff.username,  # 修复：从 name 改为 username
                 'phone': getattr(obj.staff, 'phone', ''),
+                'avatar': getattr(obj.staff, 'avatar', ''),
             }
         return None
 

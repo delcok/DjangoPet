@@ -3,14 +3,15 @@
 # @Author  : Delock
 
 from rest_framework import serializers
-from django.contrib.auth.models import User
+
 from django.db import transaction
+
+from user.models import User
 from .models import (
     PostCategory, Post, PostMedia, Comment, Topic, UserAction,
     Report, Notification,
     UserFollow, PostCollection, BlockedUser
 )
-
 
 
 # ===== 基础用户信息序列化 =====
@@ -23,7 +24,6 @@ class BasicUserSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'avatar']
 
     def get_avatar(self, obj):
-        # 这里可以根据实际的用户头像字段调整
         return f"{obj.avatar}"
 
 
@@ -39,11 +39,10 @@ class UserDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'username', 'email', 'first_name', 'last_name',
-            'date_joined', 'avatar', 'followers_count', 'following_count',
+            'id', 'username', 'email', 'avatar', 'followers_count', 'following_count',
             'posts_count', 'is_followed', 'is_blocked'
         ]
-        read_only_fields = ['id', 'date_joined', 'email']
+        read_only_fields = ['id', 'email']
 
     def get_avatar(self, obj):
         return f"{obj.avatar}"
@@ -167,6 +166,7 @@ class CommentSerializer(serializers.ModelSerializer):
 
     def get_is_liked(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return UserAction.objects.filter(
                 user=request.user, comment=obj, action_type='like_comment'
@@ -175,8 +175,9 @@ class CommentSerializer(serializers.ModelSerializer):
 
     def get_can_delete(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
-            return obj.author == request.user or request.user.typ == 'admin'
+            return obj.author == request.user
         return False
 
 
@@ -242,6 +243,7 @@ class PostListSerializer(serializers.ModelSerializer):
 
     def get_is_liked(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return UserAction.objects.filter(
                 user=request.user, post=obj, action_type='like_post'
@@ -250,6 +252,7 @@ class PostListSerializer(serializers.ModelSerializer):
 
     def get_is_collected(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return PostCollection.objects.filter(
                 user=request.user, post=obj
@@ -277,7 +280,7 @@ class PostDetailSerializer(serializers.ModelSerializer):
             'share_count', 'hot_score', 'quality_score', 'is_featured',
             'is_top', 'published_at', 'created_at', 'updated_at',
             'recent_comments', 'is_liked', 'is_collected', 'can_edit',
-            'can_delete', 'engagement_rate'
+            'can_delete', 'engagement_rate','status'
         ]
 
     def get_recent_comments(self, obj):
@@ -286,6 +289,7 @@ class PostDetailSerializer(serializers.ModelSerializer):
 
     def get_is_liked(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return UserAction.objects.filter(
                 user=request.user, post=obj, action_type='like_post'
@@ -294,6 +298,7 @@ class PostDetailSerializer(serializers.ModelSerializer):
 
     def get_is_collected(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return PostCollection.objects.filter(
                 user=request.user, post=obj
@@ -302,12 +307,14 @@ class PostDetailSerializer(serializers.ModelSerializer):
 
     def get_can_edit(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return obj.author == request.user and obj.status in ['draft', 'pending']
         return False
 
     def get_can_delete(self, obj):
         request = self.context.get('request')
+        # 🔥 未登录返回 False
         if request and request.user.is_authenticated:
             return obj.author == request.user
         return False

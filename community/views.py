@@ -516,6 +516,18 @@ class PostViewSet(BaseViewSet):
     """帖子视图集"""
     queryset = Post.objects.select_related('author', 'category').prefetch_related('medias')
     filterset_class = PostFilter
+    permission_classes = [IsAuthenticatedOrReadOnly]
+
+    def get_permissions(self):
+        """根据动作动态设置权限"""
+        if self.action in ['create', 'update', 'partial_update', 'destroy',
+                           'like', 'collect', 'share', 'report']:
+            # 需要登录的操作
+            permission_classes = [IsUserOwner]
+        else:
+            # 查看类操作：允许未登录
+            permission_classes = [IsAuthenticatedOrReadOnly]
+        return [permission() for permission in permission_classes]
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -534,22 +546,23 @@ class PostViewSet(BaseViewSet):
         if self.action == 'list':
             queryset = queryset.filter(status='approved')
 
-        # 详情页增加浏览记录
-        if self.action == 'retrieve' and self.request.user.is_authenticated:
+        # 详情页增加浏览记录 - 🔥 关键修改：只有登录用户才记录浏览
+        if self.action == 'retrieve':
             post_id = self.kwargs.get('pk')
             if post_id:
                 post = queryset.filter(id=post_id).first()
                 if post:
-                    # 记录浏览
-                    post_view, created = PostView.objects.get_or_create(
-                        user=self.request.user,
-                        post=post
-                    )
-                    if not created:
-                        post_view.view_count += 1
-                        post_view.save()
+                    # 🔥 只有登录用户才记录浏览
+                    if self.request.user.is_authenticated:
+                        post_view, created = PostView.objects.get_or_create(
+                            user=self.request.user,
+                            post=post
+                        )
+                        if not created:
+                            post_view.view_count += 1
+                            post_view.save()
 
-                    # 增加帖子浏览量
+                    # 增加帖子浏览量（无论是否登录都计数）
                     Post.objects.filter(id=post_id).update(view_count=F('view_count') + 1)
 
         return queryset
@@ -677,14 +690,25 @@ class PostViewSet(BaseViewSet):
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def my_posts(self, request):
         """我的帖子"""
+        # 获取当前用户的所有帖子
         posts = Post.objects.filter(
             author=request.user
         ).select_related('category').order_by('-created_at')
 
+        # 状态筛选
         status_param = request.query_params.get('status')
         if status_param and status_param != 'all':
             posts = posts.filter(status=status_param)
 
+        # ⭐️ 计算统计信息（在分页前）
+        stats = posts.aggregate(
+            total_posts=Count('id'),
+            total_views=Sum('view_count'),
+            total_likes=Sum('like_count'),
+            total_comments=Sum('comment_count')
+        )
+
+        # 分页
         paginated_posts, paginator = paginate_queryset(
             posts, request, 'standard'
         )
@@ -692,7 +716,77 @@ class PostViewSet(BaseViewSet):
         serializer = PostListSerializer(
             paginated_posts, many=True, context={'request': request}
         )
-        return create_paginated_response(serializer.data, paginator)
+
+        # ⭐️ 使用原有的分页响应函数，然后添加统计信息
+        response = create_paginated_response(serializer.data, paginator)
+
+        # ⭐️ 在响应数据中添加统计信息
+        if isinstance(response, Response):
+            response.data['user_stats'] = {
+                'total_posts': stats['total_posts'] or 0,
+                'total_views': stats['total_views'] or 0,
+                'total_likes': stats['total_likes'] or 0,
+                'total_comments': stats['total_comments'] or 0
+            }
+
+        return response
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def report(self, request, pk=None):
+        """举报帖子"""
+        post = self.get_object()
+
+        # 检查是否已经举报过
+        existing_report = Report.objects.filter(
+            reporter=request.user,
+            content_type='post',
+            content_id=post.id
+        ).first()
+
+        if existing_report:
+            return Response(
+                {'detail': '您已经举报过该帖子'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 获取举报信息
+        report_type = request.data.get('report_type')
+        reason = request.data.get('reason')
+        evidence = request.data.get('evidence', [])
+
+        if not report_type or not reason:
+            return Response(
+                {'detail': '请提供举报类型和理由'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 获取IP地址
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip_address = x_forwarded_for.split(',')[0]
+        else:
+            ip_address = request.META.get('REMOTE_ADDR')
+
+        # 创建举报记录
+        report = Report.objects.create(
+            reporter=request.user,
+            content_type='post',
+            content_id=post.id,
+            report_type=report_type,
+            reason=reason,
+            evidence=evidence,
+            ip_address=ip_address
+        )
+
+        # 增加帖子举报计数
+        Post.objects.filter(id=post.id).update(
+            report_count=F('report_count') + 1
+        )
+
+        return Response({
+            'detail': '举报成功，我们会尽快处理',
+            'report_id': report.id
+        }, status=status.HTTP_201_CREATED)
 
 
 # ===== 评论视图 =====
@@ -701,6 +795,17 @@ class CommentViewSet(BaseViewSet):
     queryset = Comment.objects.filter(is_deleted=False).select_related('author', 'post')
     serializer_class = CommentSerializer
     filterset_class = CommentFilter
+    permission_classes = [IsAuthenticatedOrReadOnly]
+
+    def get_permissions(self):
+        """根据动作动态设置权限"""
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'like']:
+            # 需要登录的操作
+            permission_classes = [IsUserOwner]
+        else:
+            # 查看评论：允许未登录
+            permission_classes = [IsAuthenticatedOrReadOnly]
+        return [permission() for permission in permission_classes]
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -958,7 +1063,6 @@ class AdminPostViewSet(ModelViewSet):
             )
 
         return Response({'detail': '审核拒绝'})
-
 
 # ===== 宠物社区特色功能视图 =====
 class PetCommunityViewSet(ViewSet):
