@@ -46,7 +46,7 @@ MINI_PROGRAM_SETTINGS = {
 ALIYUN_ACCESS_KEY_ID = env('ALIYUN_ACCESS_KEY_ID')
 ALIYUN_ACCESS_KEY_SECRET = env('ALIYUN_ACCESS_KEY_SECRET')
 
-CSRF_TRUSTED_ORIGINS = ['https://delock.top:8080']
+CSRF_TRUSTED_ORIGINS = ['https://delock.top:8080', 'https://pet.yimengzhiyuan.com:8080']
 
 # Application definition
 
@@ -71,7 +71,8 @@ INSTALLED_APPS = [
     'user',
     'service',
     'feedback',
-    'strays'
+    'strays',
+    'points'
 
 ]
 

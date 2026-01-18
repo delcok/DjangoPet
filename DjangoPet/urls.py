@@ -27,4 +27,5 @@ urlpatterns = [
     path('api/v1/', include('bill.urls')),
     path('api/v1/', include('feedback.urls')),
     path('api/v1/', include('strays.urls')),
+    path('api/v1/', include('points.urls')),
 ]
