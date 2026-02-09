@@ -72,7 +72,8 @@ INSTALLED_APPS = [
     'service',
     'feedback',
     'strays',
-    'points'
+    'points',
+    'mall'
 
 ]
 

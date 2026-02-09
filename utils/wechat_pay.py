@@ -41,7 +41,9 @@ class WeChatPayHelper:
     def generate_out_trade_no(self):
         return f"{settings.WECHAT_PAY_CONFIG['MCH_ID']}{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
 
-    def create_payment_order(self, openid, total_fee, body, out_trade_no=None):
+    def create_payment_order(self, openid, total_fee, body, out_trade_no=None, notify_url=None):
+        if not notify_url:
+            notify_url = "https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/payment/"
         if not out_trade_no:
             out_trade_no = self.generate_out_trade_no()
         try:
@@ -49,7 +51,7 @@ class WeChatPayHelper:
             order = self.pay.order.create(
                 body=body,
                 trade_type=self.trade_type,
-                notify_url="https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/payment/",
+                notify_url=notify_url,
                 total_fee=total_fee,
                 client_ip='121.196.245.220',  # 替换为您的服务器IP
                 user_id=openid,

@@ -7,7 +7,8 @@ from rest_framework_simplejwt.authentication import JWTAuthentication, AuthUser
 from rest_framework_simplejwt.exceptions import InvalidToken
 from django.utils.translation import gettext_lazy as _
 from rest_framework_simplejwt.tokens import RefreshToken, Token
-from user.models import User, SuperAdmin
+from user.models import User
+from staff.models import Staff
 
 
 # 自定义生成token
@@ -50,8 +51,8 @@ class AdminAuthentication(JWTAuthentication):
             raise InvalidToken(_('Token contained no recognizable user identification'))
 
         try:
-            if utype == 'user':
-                user = User.objects.get(id=user_id, is_active=True)
+            if utype == 'admin':
+                user = Staff.objects.get(id=user_id, is_active=True)
             else:
                 raise InvalidToken(_('Invalid user type'))
         except (User.DoesNotExist):
