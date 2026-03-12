@@ -165,13 +165,12 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         return list(spec_dict.values())
 
     def get_is_favorited(self, obj):
-        """检查当前用户是否收藏"""
         request = self.context.get('request')
         if request and request.user.is_authenticated:
-            return ProductFavorite.objects.filter(
-                user=request.user,
-                product=obj
+            result = ProductFavorite.objects.filter(
+                user=request.user, product=obj
             ).exists()
+            return result
         return False
 
 
@@ -622,11 +621,17 @@ class ProductFavoriteSerializer(serializers.ModelSerializer):
         read_only_fields = ['user']
 
     def get_product_info(self, obj):
+        product = obj.product
+        # 区分"下架"和"售罄"：status != ON_SALE 才是真正下架
+        from .models import PRODUCT_STATUS_ON_SALE
+        is_on_sale = product.status == PRODUCT_STATUS_ON_SALE
         return {
-            'id': obj.product.id,
-            'name': obj.product.name,
-            'cover_image_url': obj.product.cover_image_url,
-            'price': str(obj.product.price),
-            'original_price': str(obj.product.original_price) if obj.product.original_price else None,
-            'is_on_sale': obj.product.is_on_sale
+            'id': product.id,
+            'name': product.name,
+            'cover_image_url': product.cover_image_url,
+            'price': str(product.price),
+            'original_price': str(product.original_price) if product.original_price else None,
+            'is_on_sale': is_on_sale,
+            'stock': product.stock,
+            'status': product.status,
         }

@@ -569,7 +569,14 @@ class PostViewSet(BaseViewSet):
 
     def perform_create(self, serializer):
         """创建帖子"""
-        serializer.save(author=self.request.user)
+        from django.db.models import F
+
+        post = serializer.save(author=self.request.user)
+
+        # 发帖奖励 +10 积分
+        user = self.request.user
+        user.integral = F('integral') + 10
+        user.save(update_fields=['integral'])
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def like(self, request, pk=None):

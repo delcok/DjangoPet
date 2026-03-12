@@ -172,11 +172,33 @@ class Post(BaseModel):
         return f"{self.author.username} - {self.title}"
 
     def save(self, *args, **kwargs):
-        # 发布时间逻辑
+        # 获取旧状态用于对比
+        old = None
+        if self.pk:
+            try:
+                old = Post.objects.get(pk=self.pk)
+            except Post.DoesNotExist:
+                old = None
+
+        # 发布时间逻辑（原有）
         if not self.published_at and self.status == 'approved':
             self.published_at = timezone.now()
             self.last_active_at = timezone.now()
+
         super().save(*args, **kwargs)
+
+        # ===== 积分奖励 =====
+        from django.db.models import F
+
+        # 审核通过 +50
+        if old and old.status != 'approved' and self.status == 'approved':
+            self.author.integral = F('integral') + 50
+            self.author.save(update_fields=['integral'])
+
+        # 设为精选 +50
+        if old and not old.is_featured and self.is_featured:
+            self.author.integral = F('integral') + 50
+            self.author.save(update_fields=['integral'])
 
     @property
     def is_published(self):

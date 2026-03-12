@@ -16,7 +16,7 @@ from rest_framework.response import Response
 
 from wechatpy.exceptions import WeChatPayException
 
-from utils.authentication import UserAuthentication, AdminAuthentication
+from utils.authentication import UserAuthentication, AdminAuthentication, OptionalUserAuthentication
 from utils.permission import IsUserOwner, IsOwnerOrAdmin, AnyUser
 from .filters import ProductFilter, OrderFilter
 from .models import (
@@ -102,12 +102,16 @@ class ProductViewSet(viewsets.ModelViewSet):
     def get_authenticators(self):
         # GET/HEAD/OPTIONS 为公开接口无需认证，写操作需要管理员认证
         if self.request and self.request.method in ('GET', 'HEAD', 'OPTIONS'):
-            return []
+            return [OptionalUserAuthentication()]
         return [AdminAuthentication()]
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        if not self.request.user.is_staff:
+        # 普通用户和未登录用户只能看到在售商品
+        # 管理员（SuperAdmin）可以看到所有状态的商品
+        user = self.request.user
+        is_admin = user and hasattr(user, '__class__') and user.__class__.__name__ == 'SuperAdmin'
+        if not is_admin:
             queryset = queryset.filter(status=PRODUCT_STATUS_ON_SALE)
         return queryset
 

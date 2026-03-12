@@ -73,7 +73,8 @@ INSTALLED_APPS = [
     'feedback',
     'strays',
     'points',
-    'mall'
+    'mall',
+    'prize'
 
 ]
 
@@ -92,8 +93,7 @@ ROOT_URLCONF = 'DjangoPet.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / 'templates']
-        ,
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [

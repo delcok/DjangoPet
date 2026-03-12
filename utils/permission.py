@@ -3,6 +3,7 @@
 # @Author  : Delock
 from rest_framework import permissions
 
+from staff.models import Staff
 from user.models import User, SuperAdmin
 
 
@@ -33,3 +34,18 @@ class AnyUser(permissions.BasePermission):
     def has_permission(self, request, view):
         return True
 
+
+class IsStaffAdmin(permissions.BasePermission):
+    """
+    仅 Staff 管理员可访问
+    """
+    def has_permission(self, request, view):
+        return isinstance(request.user, Staff) and request.user.is_active
+
+
+class IsUserClient(permissions.BasePermission):
+    """
+    仅普通用户可访问
+    """
+    def has_permission(self, request, view):
+        return isinstance(request.user, User) and request.user.is_active

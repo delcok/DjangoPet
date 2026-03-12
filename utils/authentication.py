@@ -55,7 +55,22 @@ class AdminAuthentication(JWTAuthentication):
                 user = Staff.objects.get(id=user_id, is_active=True)
             else:
                 raise InvalidToken(_('Invalid user type'))
-        except (User.DoesNotExist):
+        except Staff.DoesNotExist:
             raise InvalidToken(_('User not found'))
         return user
 
+
+class OptionalUserAuthentication(UserAuthentication):
+    """
+    可选的用户认证：有 token 就认证，没有就跳过（不报错）
+    用于公开接口但需要识别已登录用户的场景
+    """
+    def authenticate(self, request):
+        # 如果请求中没有 token，返回 None（不认证但也不报错）
+        token = request.META.get('HTTP_AUTHORIZATION', '') or request.query_params.get('token', '')
+        if not token:
+            return None
+        try:
+            return super().authenticate(request)
+        except Exception:
+            return None

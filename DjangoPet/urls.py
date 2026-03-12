@@ -29,4 +29,6 @@ urlpatterns = [
     path('api/v1/', include('strays.urls')),
     path('api/v1/', include('points.urls')),
     path('api/v1/', include('mall.urls')),
+
+    path('api/v1/', include('prize.urls'))
 ]

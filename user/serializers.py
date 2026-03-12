@@ -45,7 +45,7 @@ class UserSerializer(serializers.ModelSerializer):
             else:
                 return f"https://cdn.khjade.com/{obj.avatar}"
         # 默认头像
-        return "https://cdn.yimengzhiyuan.com/avatar/av1.jpg"
+        return "https://cdn.yimengzhiyuan.com/avatar/av-gen.png"
 
     def get_vip_status(self, obj):
         """获取VIP状态"""

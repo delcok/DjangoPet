@@ -6,6 +6,11 @@ from django.db import models
 from .models import Product, Order
 
 
+class NumberInFilter(django_filters.BaseInFilter, django_filters.NumberFilter):
+    """支持逗号分隔的数字列表过滤，如 ?status__in=5,6"""
+    pass
+
+
 class ProductFilter(django_filters.FilterSet):
     """商品过滤器"""
 
@@ -84,6 +89,9 @@ class OrderFilter(django_filters.FilterSet):
     # 订单状态
     status = django_filters.NumberFilter()
 
+    # 订单状态（支持多状态查询，如 ?status__in=5,6）
+    status__in = NumberInFilter(field_name='status', lookup_expr='in')
+
     # 时间范围
     start_date = django_filters.DateTimeFilter(
         field_name='created_at',
@@ -116,4 +124,4 @@ class OrderFilter(django_filters.FilterSet):
 
     class Meta:
         model = Order
-        fields = ['status', 'payment_method', 'order_no']
+        fields = ['status', 'status__in', 'payment_method', 'order_no']

@@ -121,7 +121,7 @@ def wechat_login(request):
                 unionid=unionid,
                 username=username,
                 # 设置头像URL，根据用户信息中的头像
-                avatar=user_info.get('avatarUrl', ''),
+                avatar='https://cdn.yimengzhiyuan.com/avatar/av-gen.png',
                 gender='M' if user_info.get('gender') == 1 else 'F'
             )
             user.last_login = timezone.now()
