@@ -3,6 +3,8 @@
 # @Author  : Delock
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+from rest_framework_simplejwt.views import TokenRefreshView
+
 from user import views
 
 router = DefaultRouter()
@@ -22,6 +24,8 @@ urlpatterns = [
     path('user/integral/add/', views.add_integral, name='add-integral'),
     path('user/integral/deduct/', views.deduct_integral, name='deduct-integral'),
     path('user/integral/', views.get_integral, name='get-integral'),
+
+    path('auth/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
 
     ]
 

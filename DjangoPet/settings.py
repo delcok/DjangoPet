@@ -46,7 +46,7 @@ MINI_PROGRAM_SETTINGS = {
 ALIYUN_ACCESS_KEY_ID = env('ALIYUN_ACCESS_KEY_ID')
 ALIYUN_ACCESS_KEY_SECRET = env('ALIYUN_ACCESS_KEY_SECRET')
 
-CSRF_TRUSTED_ORIGINS = ['https://delock.top:8080', 'https://pet.yimengzhiyuan.com:8080']
+CSRF_TRUSTED_ORIGINS = ['https://delock.top:8080', 'https://pet.yimengzhiyuan.com:8080','http://localhost:5173']
 
 # Application definition
 
@@ -79,6 +79,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',

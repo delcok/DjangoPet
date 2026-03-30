@@ -1,12 +1,14 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+
 from django.db import transaction
 from django.db.models import Sum  # 添加这一行
 from django.utils import timezone
 from datetime import timedelta
 
+from utils.authentication import UserAuthentication
+from utils.permission import IsUserClient
 from .models import (
     IntegralProduct, IntegralOrder, IntegralRecord,
     UserIntegralProduct
@@ -22,7 +24,8 @@ class IntegralProductViewSet(viewsets.ReadOnlyModelViewSet):
     """积分商品视图集"""
 
     queryset = IntegralProduct.objects.filter(status='on_sale')
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUserClient]
+    authentication_classes = [UserAuthentication]
 
     def get_serializer_class(self):
         if self.action == 'retrieve':
@@ -60,7 +63,8 @@ class IntegralOrderViewSet(viewsets.ModelViewSet):
     """积分订单视图集"""
 
     serializer_class = IntegralOrderSerializer
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUserClient]
 
     def get_queryset(self):
         return IntegralOrder.objects.filter(user=self.request.user)
@@ -211,7 +215,8 @@ class IntegralRecordViewSet(viewsets.ReadOnlyModelViewSet):
     """积分记录视图集"""
 
     serializer_class = IntegralRecordSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUserClient]
+    authentication_classes = [UserAuthentication]
 
     def get_queryset(self):
         queryset = IntegralRecord.objects.filter(user=self.request.user)
@@ -246,7 +251,8 @@ class UserIntegralProductViewSet(viewsets.ReadOnlyModelViewSet):
     """用户虚拟商品视图集"""
 
     serializer_class = UserIntegralProductSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUserClient]
+    authentication_classes = [UserAuthentication]
 
     def get_queryset(self):
         return UserIntegralProduct.objects.filter(user=self.request.user)

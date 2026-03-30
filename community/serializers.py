@@ -268,6 +268,8 @@ class PostDetailSerializer(serializers.ModelSerializer):
     recent_comments = serializers.SerializerMethodField()
     is_liked = serializers.SerializerMethodField()
     is_collected = serializers.SerializerMethodField()
+    is_following = serializers.SerializerMethodField()
+    is_mine = serializers.SerializerMethodField()
     can_edit = serializers.SerializerMethodField()
     can_delete = serializers.SerializerMethodField()
 
@@ -279,8 +281,8 @@ class PostDetailSerializer(serializers.ModelSerializer):
             'view_count', 'like_count', 'comment_count', 'collect_count',
             'share_count', 'hot_score', 'quality_score', 'is_featured',
             'is_top', 'published_at', 'created_at', 'updated_at',
-            'recent_comments', 'is_liked', 'is_collected', 'can_edit',
-            'can_delete', 'engagement_rate','status'
+            'recent_comments', 'is_liked', 'is_collected', 'is_following',
+            'is_mine', 'can_edit', 'can_delete', 'engagement_rate', 'status'
         ]
 
     def get_recent_comments(self, obj):
@@ -303,6 +305,25 @@ class PostDetailSerializer(serializers.ModelSerializer):
             return PostCollection.objects.filter(
                 user=request.user, post=obj
             ).exists()
+        return False
+
+    def get_is_following(self, obj):
+        """当前用户是否关注了帖子作者"""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            # 自己的帖子不需要判断关注
+            if obj.author == request.user:
+                return False
+            return UserFollow.objects.filter(
+                follower=request.user, following=obj.author
+            ).exists()
+        return False
+
+    def get_is_mine(self, obj):
+        """是否是当前用户自己的帖子"""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            return obj.author == request.user
         return False
 
     def get_can_edit(self, obj):
