@@ -10,20 +10,8 @@ from django.conf import settings
 import uuid
 from datetime import datetime
 
-import time
-import random
-import string
-import json
-from base64 import b64encode, b64decode
-from urllib.parse import urlparse
-
-import requests
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 logger = logging.getLogger(__name__)
+
 
 class WeChatPayHelper:
     def __init__(self):
@@ -41,13 +29,17 @@ class WeChatPayHelper:
     def generate_out_trade_no(self):
         return f"{settings.WECHAT_PAY_CONFIG['MCH_ID']}{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
 
+    def generate_refund_no(self):
+        """生成退款单号"""
+        return f"R{settings.WECHAT_PAY_CONFIG['MCH_ID']}{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
+
     def create_payment_order(self, openid, total_fee, body, out_trade_no=None, notify_url=None):
         if not notify_url:
             notify_url = "https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/payment/"
         if not out_trade_no:
             out_trade_no = self.generate_out_trade_no()
         try:
-            logger.info(f"delock开始创建支付订单: openid={openid}, total_fee={total_fee}, body={body}, out_trade_no={out_trade_no}")
+            logger.info(f"开始创建支付订单: openid={openid}, total_fee={total_fee}, body={body}, out_trade_no={out_trade_no}")
             order = self.pay.order.create(
                 body=body,
                 trade_type=self.trade_type,
@@ -66,6 +58,48 @@ class WeChatPayHelper:
             logger.error(f"创建支付订单失败: {e}")
             raise e
 
+    def process_refund(self, transaction_id, out_refund_no, total_fee, refund_fee,
+                       reason=None, notify_url=None):
+        """
+        发起微信退款
+        :param transaction_id: 微信支付交易号（payment_no）
+        :param out_refund_no: 商户退款单号
+        :param total_fee: 订单总金额（单位：分）
+        :param refund_fee: 退款金额（单位：分）
+        :param reason: 退款原因
+        :param notify_url: 退款结果回调地址
+        :return: 微信退款接口返回结果
+        """
+        if not notify_url:
+            notify_url = "https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/refund/"
+        try:
+            refund = self.pay.refund.apply(
+                transaction_id=transaction_id,
+                out_refund_no=out_refund_no,
+                total_fee=total_fee,
+                refund_fee=refund_fee,
+                refund_desc=reason,
+                notify_url=notify_url,
+            )
+            logger.info(f"微信退款请求成功: out_refund_no={out_refund_no}, refund_fee={refund_fee}")
+            return refund
+        except WeChatPayException as e:
+            logger.error(f"微信退款请求失败: out_refund_no={out_refund_no}, error={e}")
+            raise e
+
+    def query_refund(self, out_refund_no):
+        """
+        查询退款状态
+        :param out_refund_no: 商户退款单号
+        :return: 退款查询结果
+        """
+        try:
+            result = self.pay.refund.query(out_refund_no=out_refund_no)
+            return result
+        except WeChatPayException as e:
+            logger.error(f"查询退款状态失败: out_refund_no={out_refund_no}, error={e}")
+            raise e
+
     def parse_callback(self, xml_data, callback_type):
         """
         解析并验证回调数据
@@ -73,10 +107,11 @@ class WeChatPayHelper:
         :param callback_type: 回调类型，'payment' 或 'refund'
         :return: 解析后的数据字典
         """
-
         try:
             if callback_type == 'payment':
                 data = self.pay.parse_payment_result(xml_data)
+            elif callback_type == 'refund':
+                data = self.pay.parse_refund_notify_result(xml_data)
             else:
                 raise ValueError("Invalid callback_type")
             return data

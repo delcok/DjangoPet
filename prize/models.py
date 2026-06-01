@@ -9,6 +9,12 @@ from django.core.exceptions import ValidationError
 class Prize(models.Model):
     """
     奖品模板
+
+    说明：
+    - owner_type = platform：平台管理员创建的奖品
+    - owner_type = merchant：商户创建的奖品
+    - merchant 为空表示平台奖品
+    - merchant 不为空表示商户奖品
     """
 
     PRIZE_TYPE_CHOICES = (
@@ -16,10 +22,31 @@ class Prize(models.Model):
         ('physical', '实物类'),
     )
 
+    OWNER_TYPE_CHOICES = (
+        ('platform', '平台'),
+        ('merchant', '商户'),
+    )
+
     STATUS_CHOICES = (
         ('draft', '草稿'),
         ('active', '启用'),
         ('disabled', '停用'),
+    )
+
+    owner_type = models.CharField(
+        max_length=20,
+        choices=OWNER_TYPE_CHOICES,
+        default='platform',
+        verbose_name='归属类型'
+    )
+
+    merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='prizes',
+        verbose_name='所属商户'
     )
 
     name = models.CharField(max_length=100, verbose_name='奖品名称')
@@ -45,21 +72,40 @@ class Prize(models.Model):
     sort = models.IntegerField(default=0, verbose_name='排序')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active', verbose_name='状态')
 
-    created_by = models.ForeignKey(
-        'staff.Staff',
+    created_by_manager = models.ForeignKey(
+        'managers.Manager',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='created_prizes',
+        related_name='created_platform_prizes',
         verbose_name='创建管理员'
     )
-    updated_by = models.ForeignKey(
-        'staff.Staff',
+
+    updated_by_manager = models.ForeignKey(
+        'managers.Manager',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='updated_prizes',
+        related_name='updated_platform_prizes',
         verbose_name='更新管理员'
+    )
+
+    created_by_merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_merchant_prizes',
+        verbose_name='创建商户'
+    )
+
+    updated_by_merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='updated_merchant_prizes',
+        verbose_name='更新商户'
     )
 
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')
@@ -71,6 +117,7 @@ class Prize(models.Model):
         verbose_name_plural = '奖品模板'
         ordering = ['-id']
         indexes = [
+            models.Index(fields=['owner_type', 'merchant']),
             models.Index(fields=['prize_type', 'status']),
             models.Index(fields=['status', 'sort']),
             models.Index(fields=['created_at']),
@@ -80,6 +127,12 @@ class Prize(models.Model):
         return self.name
 
     def clean(self):
+        if self.owner_type == 'merchant' and not self.merchant_id:
+            raise ValidationError('商户奖品必须绑定商户')
+
+        if self.owner_type == 'platform' and self.merchant_id:
+            raise ValidationError('平台奖品不能绑定商户')
+
         if self.prize_type == 'physical' and not self.need_address:
             raise ValidationError('实物类奖品必须需要收货地址')
 
@@ -106,7 +159,7 @@ class UserPrize(models.Model):
     )
 
     SOURCE_CHOICES = (
-        ('manual', '管理员手动发放'),
+        ('manual', '手动发放'),
         ('activity', '活动中奖'),
         ('system', '系统发放'),
     )
@@ -117,6 +170,7 @@ class UserPrize(models.Model):
         related_name='user_prizes',
         verbose_name='中奖用户'
     )
+
     prize = models.ForeignKey(
         'prize.Prize',
         on_delete=models.PROTECT,
@@ -124,7 +178,15 @@ class UserPrize(models.Model):
         verbose_name='奖品模板'
     )
 
-    # 快照
+    merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='user_prizes',
+        verbose_name='所属商户'
+    )
+
     prize_snapshot_name = models.CharField(max_length=100, verbose_name='奖品名称快照')
     prize_snapshot_type = models.CharField(max_length=20, verbose_name='奖品类型快照')
     title = models.CharField(max_length=200, verbose_name='中奖标题快照')
@@ -154,13 +216,12 @@ class UserPrize(models.Model):
     claimed_at = models.DateTimeField(null=True, blank=True, verbose_name='申请兑奖时间')
     redeemed_at = models.DateTimeField(null=True, blank=True, verbose_name='兑奖完成时间')
 
-    # 用户提交信息
     contact_name = models.CharField(max_length=50, blank=True, default='', verbose_name='联系人')
     contact_phone = models.CharField(max_length=20, blank=True, default='', verbose_name='联系电话')
     user_remark = models.CharField(max_length=255, blank=True, default='', verbose_name='用户备注')
 
     address = models.ForeignKey(
-        'user.UserAddress',
+        'address.UserAddress',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -168,7 +229,6 @@ class UserPrize(models.Model):
         verbose_name='收货地址'
     )
 
-    # 地址快照
     receiver_name_snapshot = models.CharField(max_length=50, blank=True, default='', verbose_name='收货人快照')
     receiver_phone_snapshot = models.CharField(max_length=20, blank=True, default='', verbose_name='收货手机号快照')
     province_snapshot = models.CharField(max_length=20, blank=True, default='', verbose_name='省快照')
@@ -176,23 +236,42 @@ class UserPrize(models.Model):
     district_snapshot = models.CharField(max_length=20, blank=True, default='', verbose_name='区快照')
     detail_address_snapshot = models.CharField(max_length=255, blank=True, default='', verbose_name='详细地址快照')
 
-    admin_remark = models.CharField(max_length=255, blank=True, default='', verbose_name='管理员备注')
+    admin_remark = models.CharField(max_length=255, blank=True, default='', verbose_name='后台备注')
 
-    issued_by = models.ForeignKey(
-        'staff.Staff',
+    issued_by_manager = models.ForeignKey(
+        'managers.Manager',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='issued_user_prizes',
         verbose_name='发放管理员'
     )
-    handled_by = models.ForeignKey(
-        'staff.Staff',
+
+    handled_by_manager = models.ForeignKey(
+        'managers.Manager',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='handled_user_prizes',
         verbose_name='处理管理员'
+    )
+
+    issued_by_merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='issued_user_prizes',
+        verbose_name='发放商户'
+    )
+
+    handled_by_merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='handled_user_prizes',
+        verbose_name='处理商户'
     )
 
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')
@@ -205,6 +284,7 @@ class UserPrize(models.Model):
         ordering = ['-id']
         indexes = [
             models.Index(fields=['user', 'status']),
+            models.Index(fields=['merchant', 'status']),
             models.Index(fields=['status', 'issued_at']),
             models.Index(fields=['valid_end_time']),
             models.Index(fields=['batch_no']),
@@ -223,6 +303,9 @@ class UserPrize(models.Model):
             self.exchange_code = self.generate_exchange_code()
 
         if self.prize_id:
+            if not self.merchant_id:
+                self.merchant = self.prize.merchant
+
             if not self.prize_snapshot_name:
                 self.prize_snapshot_name = self.prize.name
             if not self.prize_snapshot_type:
@@ -261,16 +344,21 @@ class UserPrize(models.Model):
     def can_claim(self):
         if self.status != 'pending':
             return False
+
         now = timezone.now()
+
         if self.valid_start_time and now < self.valid_start_time:
             return False
+
         if self.valid_end_time and now > self.valid_end_time:
             return False
+
         return True
 
     def set_address_snapshot(self, address):
         if not address:
             return
+
         self.receiver_name_snapshot = address.receiver_name or ''
         self.receiver_phone_snapshot = address.receiver_phone or ''
         self.province_snapshot = address.province or ''
@@ -283,14 +371,18 @@ class UserPrize(models.Model):
             old_status = self.status
             self.status = 'expired'
             self.save(update_fields=['status', 'updated_at'])
+
             UserPrizeLog.objects.create(
                 user_prize=self,
                 action='expire',
+                operator_type='system',
                 old_status=old_status,
                 new_status='expired',
                 note='系统自动过期'
             )
+
             return True
+
         return False
 
 
@@ -311,21 +403,49 @@ class UserPrizeLog(models.Model):
         ('edit', '编辑'),
     )
 
+    OPERATOR_TYPE_CHOICES = (
+        ('system', '系统'),
+        ('manager', '管理员'),
+        ('merchant', '商户'),
+        ('user', '用户'),
+    )
+
     user_prize = models.ForeignKey(
         'prize.UserPrize',
         on_delete=models.CASCADE,
         related_name='logs',
         verbose_name='用户奖品记录'
     )
+
     action = models.CharField(max_length=20, choices=ACTION_CHOICES, verbose_name='操作类型')
-    operator_staff = models.ForeignKey(
-        'staff.Staff',
+
+    operator_type = models.CharField(
+        max_length=20,
+        choices=OPERATOR_TYPE_CHOICES,
+        default='system',
+        verbose_name='操作人类型'
+    )
+
+    operator_name = models.CharField(max_length=100, blank=True, default='', verbose_name='操作人名称')
+
+    operator_manager = models.ForeignKey(
+        'managers.Manager',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='prize_logs',
         verbose_name='操作管理员'
     )
+
+    operator_merchant = models.ForeignKey(
+        'merchants.Merchant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='prize_logs',
+        verbose_name='操作商户'
+    )
+
     old_status = models.CharField(max_length=20, blank=True, default='', verbose_name='旧状态')
     new_status = models.CharField(max_length=20, blank=True, default='', verbose_name='新状态')
     note = models.CharField(max_length=255, blank=True, default='', verbose_name='备注')
@@ -338,6 +458,7 @@ class UserPrizeLog(models.Model):
         ordering = ['-id']
         indexes = [
             models.Index(fields=['action', 'created_at']),
+            models.Index(fields=['operator_type', 'created_at']),
             models.Index(fields=['user_prize', 'created_at']),
         ]
 

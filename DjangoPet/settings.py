@@ -62,19 +62,31 @@ INSTALLED_APPS = [
     'django_filters',
     'corsheaders',
 
+    # 已检查
     'attach',
     'bill',
     'community',
-    'pet',
-    'price',
-    'staff',
     'user',
-    'service',
     'feedback',
-    'strays',
+    'pet',
     'points',
-    'mall',
-    'prize'
+    'strays',
+    'prize',
+    # 新增
+    'address',
+    'attract',
+    'campaigns',
+    'comments',
+    'managers',
+    'merchants',
+    'pay',
+    'product',
+    'promotions',
+    'services',
+    'staffs',
+    'wallet',
+
+
 
 ]
 

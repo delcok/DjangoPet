@@ -1,7 +1,8 @@
 from django.db import models
 from django.utils import timezone
 from django.core.validators import MinValueValidator
-from user.models import User, UserAddress
+from address.models import UserAddress
+from user.models import User
 
 
 class IntegralProduct(models.Model):

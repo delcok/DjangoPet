@@ -187,18 +187,41 @@ class Post(BaseModel):
 
         super().save(*args, **kwargs)
 
-        # ===== 积分奖励 =====
-        from django.db.models import F
-
+        # ===== 积分奖励（改为走 UserWallet）=====
+        # 注意：钱包变动放在 super().save() 之后，且用幂等键防重复发放，
+        # 避免在 model.save() 内部嵌套钱包的 select_for_update 事务。
         # 审核通过 +50
         if old and old.status != 'approved' and self.status == 'approved':
-            self.author.integral = F('integral') + 50
-            self.author.save(update_fields=['integral'])
+            self._grant_post_reward(50, scene='approved')
 
         # 设为精选 +50
         if old and not old.is_featured and self.is_featured:
-            self.author.integral = F('integral') + 50
-            self.author.save(update_fields=['integral'])
+            self._grant_post_reward(50, scene='featured')
+
+    def _grant_post_reward(self, points, scene):
+        """
+        给作者发帖子积分奖励（走 UserWallet，幂等防重）。
+        失败不影响帖子保存本身。
+        scene: 'approved' | 'featured'，用于拼幂等键，保证每篇帖子每个场景只发一次。
+        """
+        try:
+            # 延迟导入，避免 app 之间循环依赖
+            from wallet.models import UserWallet, WalletTransaction
+
+            wallet, _ = UserWallet.objects.get_or_create(user_id=self.author_id)
+            wallet.change_points(
+                amount=points,
+                action=WalletTransaction.Action.ACTIVITY_REWARD,
+                operator_id=self.author_id,
+                operator_role='system',
+                related_type='post',
+                related_id=self.pk,
+                remark=f'帖子奖励（{scene}）+{points}',
+                idempotent_key=f'post_{scene}_reward_{self.pk}',
+            )
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
     @property
     def is_published(self):

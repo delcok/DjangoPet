@@ -1,598 +1,982 @@
-from rest_framework.decorators import api_view, authentication_classes, action
-from rest_framework.response import Response
-from rest_framework import status, viewsets, permissions
-from django.conf import settings
-from rest_framework import filters
+# -*- coding: utf-8 -*-
+import secrets
+from datetime import datetime
+
+from django.db import transaction, IntegrityError
+from django.db.models import Count, F, Sum
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from wechatpy import WeChatClient
+
+from rest_framework import status
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.response import Response
+
 from wechatpy.crypto import WeChatWxaCrypto
 
-from user.models import User, SuperAdmin, UserAddress
-from user.serializers import UserSerializer, SuperAdminSerializer, UserAddressSerializer, UserAddressCreateSerializer
-from utils.authentication import generate_jwt_tokens, UserAuthentication
-from utils.fetch_number import fetch_phone_number
-from django.db import transaction, models
+from user.models import User, UserAuthProvider, UserLoginLog, InviteReward
+from user.serializers import (
+    UserSerializer,
+    AdminUserListSerializer,
+    AdminUserDetailSerializer,
+    AdminUserUpdateSerializer,
+    AdminBanUserSerializer,
+    AdminToggleActiveSerializer,
+    AdminSetVipSerializer,
+    AdminCancelVipSerializer,
+    AdminVerifyUserSerializer,
+    AdminChangeLevelSerializer,
+    AdminResetPasswordSerializer,
+)
+from user.filters import UserFilter, UserLoginLogFilter
+from user.paginations import AdminUserPagination, LoginLogPagination, StandardPagination
 
-from utils.permission import IsUserOwner
+from utils.authentication import generate_jwt_tokens, UserAuthentication, ManagerAuthentication
+from utils.permission import IsManager, IsSuperAdmin
+from utils.fetch_number import fetch_phone_number
+from utils.account_factory import register_user
+from utils.wechat_client import get_user_mini_client
+from wallet.models import WalletTransaction, UserWallet
+
+
+# ═══════════════════════════════════════════════════════════════
+# 用户端接口
+# ═══════════════════════════════════════════════════════════════
+
+def _parse_wx_gender(v):
+    """
+    微信返回: 0=未知 / 1=男 / 2=女
+    注: 2021-04 后 getUserProfile 的 gender 基本都是 0（隐私政策收紧）
+    """
+    return {1: 'M', 2: 'F'}.get(v, 'U')
+
+
+def _build_login_response(user, openid=None):
+    """统一的登录返回（generate_jwt_tokens 返回的是 dict，不是 tuple）"""
+    tokens = generate_jwt_tokens(user, 'user')
+    data = {
+        'access': tokens['access_token'],
+        'refresh': tokens['refresh_token'],
+        'token_type': tokens.get('token_type', 'Bearer'),
+        'expires_in': tokens.get('expires_in'),
+        'user_info': UserSerializer(user).data,
+    }
+    if openid:
+        data['openid'] = openid
+    return data
 
 
 @api_view(['POST'])
 def wechat_login(request):
-    """
-    微信小程序登录
-    :param request:
-    :return:
-    """
-    app_id = settings.MINI_PROGRAM_SETTINGS['USER']['APPID']
-    app_secret = settings.MINI_PROGRAM_SETTINGS['USER']['APPSECRET']
-
+    """微信小程序登录"""
     code = request.data.get('code')
-    phone_code = request.data.get('phone_code')  # 获取微信小程序手机码，设置为可选
-    iv = request.data.get('iv')  # 前端传来的iv
-    encrypted_data = request.data.get('encryptedData')  # 前端传来的加密数据
+    phone_code = request.data.get('phone_code')
+    iv = request.data.get('iv')
+    encrypted_data = request.data.get('encryptedData')
     openid = request.data.get('openid')
+    invite_code = (request.data.get('invite_code') or '').strip()
 
+    # 已有 openid → 尝试快速登录
     if openid:
-        try:
-            user = User.objects.get(openid=openid)
-            if user.is_active:
+        auth_provider = UserAuthProvider.objects.filter(
+            provider='wx_mini', provider_uid=openid
+        ).select_related('user').first()
+
+        if auth_provider:
+            user = auth_provider.user
+            if user.is_active and not user.is_banned:
                 user.last_login = timezone.now()
-                user.save()
-                refresh, access = generate_jwt_tokens(user, 'user')
-                return Response({
-                    'refresh': refresh,
-                    'access': access,
-                    'user_info': UserSerializer(user).data
-                }, status=status.HTTP_200_OK)
+                user.save(update_fields=['last_login'])
+                return Response(_build_login_response(user, openid), status=status.HTTP_200_OK)
+            elif user.is_banned:
+                return Response({'error': f'您已被封禁: {user.ban_reason}'},
+                                status=status.HTTP_400_BAD_REQUEST)
             else:
-                return Response({'error': '您已被禁用，请联系客服!'}, status=status.HTTP_400_BAD_REQUEST)
-        except User.DoesNotExist:
-            pass
+                return Response({'error': '您已被禁用，请联系客服!'},
+                                status=status.HTTP_400_BAD_REQUEST)
 
     if not code:
         return Response({'error': 'Missing code'}, status=status.HTTP_400_BAD_REQUEST)
 
-    wechat_client = WeChatClient(app_id, app_secret)
+    wechat_client = get_user_mini_client()
+    app_id = wechat_client.appid
+
     try:
-        # 通过 code 获取 session 信息
         result = wechat_client.wxa.code_to_session(code)
         session_key = result.get('session_key')
         openid = result.get('openid')
         unionid = result.get('unionid', '')
-
         if not openid:
-            return Response({'error': 'Failed to get openid from WeChat'}, status=status.HTTP_400_BAD_REQUEST)
-
+            return Response({'error': 'Failed to get openid from WeChat'},
+                            status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({'error': f'Failed to get session from WeChat: {str(e)}'},
                         status=status.HTTP_400_BAD_REQUEST)
 
-    # 尝试通过 openid 查找用户
-    try:
-        user = User.objects.get(openid=openid)
-        if user.is_active:
+    auth_provider = UserAuthProvider.objects.filter(
+        provider='wx_mini', provider_uid=openid
+    ).select_related('user').first()
+
+    if auth_provider:
+        user = auth_provider.user
+        if user.is_active and not user.is_banned:
             user.last_login = timezone.now()
-            user.save()
-            refresh, access = generate_jwt_tokens(user, 'user')
-            return Response({
-                'refresh': refresh,
-                'access': access,
-                'user_info': UserSerializer(user).data,
-                'openid': openid
-            }, status=status.HTTP_200_OK)
+            user.save(update_fields=['last_login'])
+            if unionid and not auth_provider.union_id:
+                auth_provider.union_id = unionid
+                auth_provider.save(update_fields=['union_id', 'updated_at'])
+            return Response(_build_login_response(user, openid), status=status.HTTP_200_OK)
+        elif user.is_banned:
+            return Response({'error': f'您已被封禁: {user.ban_reason}'},
+                            status=status.HTTP_400_BAD_REQUEST)
         else:
-            return Response({'error': '您已被禁用，请联系客服!'}, status=status.HTTP_400_BAD_REQUEST)
-    except User.DoesNotExist:
-        # 用户不存在，需要创建新用户
-        if not phone_code:
-            return Response({'error': 'User does not exist and phone_code is required to register'},
+            return Response({'error': '您已被禁用，请联系客服!'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # 获取 access_token
-        try:
-            token_data = wechat_client.fetch_access_token()
-            access_token = token_data.get('access_token')
-            if not access_token:
-                return Response({'error': 'Failed to fetch access_token from WeChat'},
-                                status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            return Response({'error': f'Failed to fetch access_token: {str(e)}'},
-                            status=status.HTTP_400_BAD_REQUEST)
+    if not phone_code:
+        return Response({'error': 'User does not exist and phone_code is required to register'},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-        # 获取用户的手机号
-        phone_number = fetch_phone_number(access_token, phone_code)
-        if not phone_number:
-            return Response({'error': 'Failed to fetch phone number'}, status=status.HTTP_400_BAD_REQUEST)
+    phone_number = fetch_phone_number(phone_code)
+    if not phone_number:
+        return Response({'error': 'Failed to fetch phone number'},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-        # 解密用户信息
-        try:
-            crypto = WeChatWxaCrypto(session_key, iv, app_id)
-            user_info = crypto.decrypt_message(encrypted_data)
-        except Exception as e:
-            return Response({'error': f'Failed to decrypt user information: {str(e)}'},
-                            status=status.HTTP_400_BAD_REQUEST)
+    try:
+        user_info = {}
+        if encrypted_data and iv:
+            try:
+                crypto = WeChatWxaCrypto(session_key, iv, app_id)
+                user_info = crypto.decrypt_message(encrypted_data)
+            except Exception:
+                user_info = {}
+    except Exception as e:
+        return Response({'error': f'Failed to decrypt user information: {str(e)}'},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-        # 创建新用户
-        username = f"铲屎官-{phone_number[-4:]}"
-        try:
-            user = User.objects.create(
-                openid=openid,
+    existing_user = None
+    if unionid:
+        existing_provider = UserAuthProvider.objects.filter(union_id=unionid).select_related('user').first()
+        if existing_provider:
+            existing_user = existing_provider.user
+    if not existing_user:
+        existing_user = User.objects.filter(phone=phone_number).first()
+
+    is_new_register = False
+
+    if existing_user:
+        # 老用户绑新渠道，不发邀请奖励
+        user = existing_user
+        UserAuthProvider.objects.create(
+            user=user, provider='wx_mini', provider_uid=openid,
+            union_id=unionid, extra_data=user_info,
+        )
+    else:
+        username = f"用户{phone_number[-4:]}"
+        with transaction.atomic():
+            user = register_user(
                 phone=phone_number,
-                unionid=unionid,
                 username=username,
-                # 设置头像URL，根据用户信息中的头像
                 avatar='https://cdn.yimengzhiyuan.com/avatar/av-gen.png',
-                gender='M' if user_info.get('gender') == 1 else 'F'
+                gender=_parse_wx_gender(user_info.get('gender')),
+                register_channel='wx_mini',
             )
-            user.last_login = timezone.now()
-            user.save()
-        except Exception as e:
-            return Response({'error': f'Failed to create user: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+            UserAuthProvider.objects.create(
+                user=user, provider='wx_mini', provider_uid=openid,
+                union_id=unionid, extra_data=user_info,
+            )
+        is_new_register = True
 
-        # 生成 JWT token
-        refresh, access = generate_jwt_tokens(user, 'user')
-        return Response({
-            'refresh': refresh,
-            'access': access,
-            'user_info': UserSerializer(user).data,
-            'openid': openid
-        }, status=status.HTTP_200_OK)
+    # 邀请奖励放在主事务【之外】发，失败不影响注册
+    if is_new_register and invite_code:
+        _process_invite_reward(user, invite_code)
+
+    user.last_login = timezone.now()
+    user.save(update_fields=['last_login'])
+    return Response(_build_login_response(user, openid), status=status.HTTP_200_OK)
 
 
 @api_view(['PATCH'])
 @authentication_classes([UserAuthentication])
-def update_avator_or_username(request):
-    """更新用户信息（头像、用户名、性别、生日、个人简介、隐私设置等）"""
+def update_user_info(request):
+    """
+    更新用户信息(用户端)
+
+    修复点(对比旧版):
+    1. gender:统一映射 M/F/O/U 与旧的 male/female/other,前后兼容。
+    2. avatar:'avatar' 和 'avatar_url' 两个字段名都接受。
+    3. email:补上处理。
+    4. username 长度上限对齐 serializer 的 30 个字符。
+    注：社交统计（followers_count 等）系统维护，用户端不可改。
+    """
     try:
         user = request.user
 
-        # 验证用户是否已认证
-        if not user.is_authenticated:
-            return Response(
-                {'error': '用户未认证'},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        # 获取请求数据
-        username = request.data.get('username')
-        avatar_url = request.data.get('avatar_url')
-        bio = request.data.get('bio')
-        gender = request.data.get('gender')
-        birth_date = request.data.get('birth_date')
-        is_public = request.data.get('is_public')
+        username      = request.data.get('username')
+        avatar        = request.data.get('avatar') or request.data.get('avatar_url')
+        bio           = request.data.get('bio')
+        gender        = request.data.get('gender')
+        birth_date    = request.data.get('birth_date')
+        email         = request.data.get('email')
+        is_public     = request.data.get('is_public')
         allow_message = request.data.get('allow_message')
 
         updated_fields = []
 
-        # 更新用户名
+        # ── 昵称 ──
         if username is not None:
             username = username.strip()
-            if len(username) < 2 or len(username) > 20:
-                return Response(
-                    {'error': '用户名长度为2-20个字符'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+            if len(username) < 2 or len(username) > 30:
+                return Response({'error': '用户名长度为 2-30 个字符'},
+                                status=status.HTTP_400_BAD_REQUEST)
             user.username = username
             updated_fields.append('username')
 
-        # 更新头像
-        if avatar_url:
-            user.avatar = avatar_url
+        # ── 头像 ──
+        if avatar:
+            user.avatar = avatar.strip()
             updated_fields.append('avatar')
 
-        # 更新个人简介
+        # ── 简介 ──
         if bio is not None:
-            user.bio = bio.strip()
+            bio = bio.strip()
+            if len(bio) > 200:
+                return Response({'error': '简介不能超过 200 个字符'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            user.bio = bio
             updated_fields.append('bio')
 
-        # 更新性别（前端传 'male'/'female'/''，转换为 'M'/'F'/'U'）
+        # ── 性别(兼容 M/F/O/U 和旧的 male/female/other) ──
         if gender is not None:
-            gender_map = {
-                'male': 'M',
-                'female': 'F',
+            GENDER_MAP = {
+                'M': 'M', 'F': 'F', 'O': 'O', 'U': 'U',
+                'male': 'M', 'female': 'F', 'other': 'O',
                 '': 'U',
-                'other': 'O'
             }
-            db_gender = gender_map.get(gender.lower() if gender else '', 'U')
+            key = gender.strip() if isinstance(gender, str) else ''
+            db_gender = GENDER_MAP.get(key) or GENDER_MAP.get(key.lower())
+            if db_gender is None:
+                return Response({'error': f'性别值不合法: {gender}'},
+                                status=status.HTTP_400_BAD_REQUEST)
             user.gender = db_gender
             updated_fields.append('gender')
 
-        # 更新生日
+        # ── 生日 ──
         if birth_date is not None:
-            if birth_date:  # 如果有值
+            if birth_date:
                 try:
-                    from datetime import datetime
-                    # 验证日期格式
                     datetime.strptime(birth_date, '%Y-%m-%d')
                     user.birth_date = birth_date
-                    updated_fields.append('birth_date')
                 except ValueError:
-                    return Response(
-                        {'error': '生日格式不正确，应为 YYYY-MM-DD'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            else:  # 如果是空字符串，清空生日
+                    return Response({'error': '生日格式不正确,应为 YYYY-MM-DD'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+            else:
                 user.birth_date = None
-                updated_fields.append('birth_date')
+            updated_fields.append('birth_date')
 
-        # 更新隐私设置
+        # ── 邮箱 ──
+        if email is not None:
+            email = (email or '').strip() if isinstance(email, str) else ''
+            if email:
+                from django.core.validators import EmailValidator
+                from django.core.exceptions import ValidationError as DjangoValidationError
+                try:
+                    EmailValidator()(email)
+                except DjangoValidationError:
+                    return Response({'error': '邮箱格式不正确'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                user.email = email
+            else:
+                user.email = None
+            updated_fields.append('email')
+
+        # ── 隐私 ──
         if is_public is not None:
             user.is_public = bool(is_public)
             updated_fields.append('is_public')
 
-        # 更新消息设置
         if allow_message is not None:
             user.allow_message = bool(allow_message)
             updated_fields.append('allow_message')
 
-        # 检查是否有更新
         if not updated_fields:
-            return Response(
-                {'error': '没有提供需要更新的字段'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': '没有提供需要更新的字段'},
+                            status=status.HTTP_400_BAD_REQUEST)
 
-        # 保存更新
         user.save(update_fields=updated_fields + ['updated_at'])
-
-        # 序列化用户数据返回
-        serializer = UserSerializer(user)
         return Response({
             'message': '更新成功',
-            'user': serializer.data,
-            'updated_fields': updated_fields
+            'user': UserSerializer(user).data,
+            'updated_fields': updated_fields,
         }, status=status.HTTP_200_OK)
 
     except Exception as e:
-        print(f"更新用户信息失败: {str(e)}")
         import traceback
         traceback.print_exc()
-        return Response(
-            {'error': f'更新失败: {str(e)}'},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@api_view(['POST'])
-def admin_login(request):
-    """管理员/超级管理员登录"""
-    username = request.data.get('username')
-    password = request.data.get('password')
-
-    if not username:
-        return Response({'error': '请提供用户名'}, status=status.HTTP_400_BAD_REQUEST)
-
-    UserModel = SuperAdmin
-    token_type = 'super_admin'
-    serializer_class = SuperAdminSerializer
-
-    # 查找用户
-    user = None
-    if username:
-        try:
-            user = UserModel.objects.get(username=username, is_active=True)
-        except UserModel.DoesNotExist:
-            pass
-
-    if not user:
-        return Response({'error': '用户不存在或已被禁用'}, status=status.HTTP_400_BAD_REQUEST)
-
-    # 密码登录
-    if password:
-        if user.check_password(password):
-            user.last_login = timezone.now()
-            user.save()
-            refresh, access = generate_jwt_tokens(user, token_type)
-            return Response({
-                'refresh': refresh,
-                'access': access,
-                'user_info': serializer_class(user).data,
-                'user_type': token_type
-            }, status=status.HTTP_200_OK)
-        else:
-            return Response({'error': '密码错误'}, status=status.HTTP_400_BAD_REQUEST)
-
-
-    return Response({'error': '请提供密码'}, status=status.HTTP_400_BAD_REQUEST)
-
-
-
-@api_view(['POST'])
-@authentication_classes([UserAuthentication])
-def add_integral(request):
-    """增加积分"""
-    user = request.user
-    amount = request.data.get('amount')
-
-    if not amount or int(amount) <= 0:
-        return Response({'error': '积分数量必须大于0'}, status=status.HTTP_400_BAD_REQUEST)
-
-    try:
-        with transaction.atomic():
-            user.integral = models.F('integral') + int(amount)
-            user.save(update_fields=['integral', 'updated_at'])
-            user.refresh_from_db()
-
-        return Response({
-            'message': '积分增加成功',
-            'integral': user.integral
-        }, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-@api_view(['POST'])
-@authentication_classes([UserAuthentication])
-def deduct_integral(request):
-    """扣除积分"""
-    user = request.user
-    amount = request.data.get('amount')
-
-    if not amount or int(amount) <= 0:
-        return Response({'error': '积分数量必须大于0'}, status=status.HTTP_400_BAD_REQUEST)
-
-    if user.integral < int(amount):
-        return Response({'error': '积分不足'}, status=status.HTTP_400_BAD_REQUEST)
-
-    try:
-        with transaction.atomic():
-            user.integral = models.F('integral') - int(amount)
-            user.save(update_fields=['integral', 'updated_at'])
-            user.refresh_from_db()
-
-        return Response({
-            'message': '积分扣除成功',
-            'integral': user.integral
-        }, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'error': f'更新失败: {str(e)}'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @authentication_classes([UserAuthentication])
-def get_integral(request):
-    """查询积分"""
+def get_user_info(request):
+    """获取当前用户信息"""
+    user = request.user
+    user.update_last_active()
+    return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 用户列表 / 详情
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_user_list(request):
+    """管理员 - 用户列表（筛选+分页+排序，含钱包概要）"""
+    queryset = (
+        User.objects.all()
+        .select_related('invited_by', 'wallet')
+    )
+
+    filtered = UserFilter(request.GET, queryset=queryset).qs
+    paginator = AdminUserPagination()
+    page = paginator.paginate_queryset(filtered, request)
+    serializer = AdminUserListSerializer(page, many=True)
+    return paginator.get_paginated_response(serializer.data)
+
+
+@api_view(['GET'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_user_detail(request, user_id):
+    """管理员 - 用户详情（含钱包、设备、绑定渠道、最近登录）"""
+    user = (
+        User.objects
+        .select_related('invited_by')
+        .prefetch_related('auth_providers', 'devices', 'login_logs')
+        .filter(id=user_id)
+        .first()
+    )
+    if not user:
+        return Response({'error': '用户不存在'}, status=status.HTTP_404_NOT_FOUND)
+    return Response(AdminUserDetailSerializer(user).data)
+
+
+@api_view(['PATCH'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_update_user(request, user_id):
+    """管理员 - 编辑用户基本资料"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminUserUpdateSerializer(user, data=request.data, partial=True)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    serializer.save()
     return Response({
-        'integral': request.user.integral
+        'message': '更新成功',
+        'user': AdminUserDetailSerializer(user).data
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 状态管理（高危 → 仅超管）
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsSuperAdmin])
+def admin_ban_user(request, user_id):
+    """管理员 - 封禁/解封用户（仅超管）"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminBanUserSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    user.is_banned = data['is_banned']
+    user.ban_reason = data.get('ban_reason', '') if data['is_banned'] else ''
+    user.save(update_fields=['is_banned', 'ban_reason', 'updated_at'])
+
+    return Response({
+        'message': '封禁成功' if data['is_banned'] else '解封成功',
+        'user_id': user.id,
+        'is_banned': user.is_banned,
+        'ban_reason': user.ban_reason,
+        'operator_id': request.user.id,
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsSuperAdmin])
+def admin_toggle_active(request, user_id):
+    """管理员 - 启用/禁用用户（仅超管）"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminToggleActiveSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    user.is_active = serializer.validated_data['is_active']
+    user.save(update_fields=['is_active', 'updated_at'])
+
+    return Response({
+        'message': '启用成功' if user.is_active else '禁用成功',
+        'user_id': user.id,
+        'is_active': user.is_active,
+        'operator_id': request.user.id,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - VIP 管理
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_set_vip(request, user_id):
+    """管理员 - 开通/续费/升级 VIP"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminSetVipSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    now = timezone.now()
+
+    if data.get('vip_expired_at'):
+        new_expired_at = data['vip_expired_at']
+    else:
+        days = data['duration_days']
+        if data.get('extend') and user.is_vip and user.vip_expired_at and user.vip_expired_at > now:
+            base = user.vip_expired_at
+        else:
+            base = now
+        new_expired_at = base + timezone.timedelta(days=days)
+
+    user.is_vip = True
+    user.vip_level = data['vip_level']
+    user.vip_expired_at = new_expired_at
+    user.save(update_fields=['is_vip', 'vip_level', 'vip_expired_at', 'updated_at'])
+
+    return Response({
+        'message': 'VIP 设置成功',
+        'user_id': user.id,
+        'is_vip': user.is_vip,
+        'vip_level': user.vip_level,
+        'vip_expired_at': user.vip_expired_at,
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_cancel_vip(request, user_id):
+    """管理员 - 取消 VIP"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminCancelVipSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    user.is_vip = False
+    user.vip_level = 0
+    user.vip_expired_at = None
+    user.save(update_fields=['is_vip', 'vip_level', 'vip_expired_at', 'updated_at'])
+
+    return Response({'message': 'VIP 已取消', 'user_id': user.id})
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 实名认证
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_verify_user(request, user_id):
+    """管理员 - 实名认证 / 取消认证"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminVerifyUserSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    if data['is_verified']:
+        user.is_verified = True
+        user.verification_type = data['verification_type']
+        user.verified_at = timezone.now()
+    else:
+        user.is_verified = False
+        user.verification_type = ''
+        user.verified_at = None
+
+    user.save(update_fields=['is_verified', 'verification_type', 'verified_at', 'updated_at'])
+
+    return Response({
+        'message': '认证成功' if user.is_verified else '已取消认证',
+        'user_id': user.id,
+        'is_verified': user.is_verified,
+        'verification_type': user.verification_type,
+        'verified_at': user.verified_at,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 等级 / 经验值
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_change_level(request, user_id):
+    """管理员 - 调整用户等级 / 经验值"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminChangeLevelSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    updated_fields = []
+
+    if 'level' in data:
+        user.level = data['level']
+        updated_fields.append('level')
+
+    if 'exp' in data:
+        user.exp = data['exp']
+        updated_fields.append('exp')
+    elif 'exp_delta' in data:
+        user.exp = max(0, user.exp + data['exp_delta'])
+        updated_fields.append('exp')
+
+    if not updated_fields:
+        return Response({'error': '无字段变更'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.save(update_fields=updated_fields + ['updated_at'])
+    return Response({
+        'message': '调整成功',
+        'user_id': user.id,
+        'level': user.level,
+        'exp': user.exp,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 重置密码（高危 → 仅超管）
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsSuperAdmin])
+def admin_reset_password(request, user_id):
+    """管理员 - 重置用户密码（仅超管）"""
+    user = get_object_or_404(User, id=user_id)
+    serializer = AdminResetPasswordSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(serializer.validated_data['new_password'])
+    # 如果 User 有 token_version，重置密码后 +1 强制下线所有端
+    if hasattr(user, 'token_version'):
+        user.token_version = (user.token_version or 0) + 1
+        user.save(update_fields=['_password', 'token_version', 'updated_at'])
+    else:
+        user.save(update_fields=['_password', 'updated_at'])
+
+    return Response({
+        'message': '密码重置成功',
+        'user_id': user.id,
+        'operator_id': request.user.id,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 登录日志
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_user_login_logs(request, user_id):
+    """管理员 - 查看指定用户登录日志"""
+    user = get_object_or_404(User, id=user_id)
+    queryset = user.login_logs.all().order_by('-created_at')
+
+    paginator = LoginLogPagination()
+    page = paginator.paginate_queryset(queryset, request)
+    data = [
+        {
+            'id': l.id,
+            'login_method': l.login_method,
+            'login_method_display': l.get_login_method_display(),
+            'platform': l.platform,
+            'device_id': l.device_id,
+            'ip_address': l.ip_address,
+            'location': l.location,
+            'user_agent': l.user_agent,
+            'is_success': l.is_success,
+            'fail_reason': l.fail_reason,
+            'created_at': l.created_at,
+        }
+        for l in page
+    ]
+    return paginator.get_paginated_response(data)
+
+
+@api_view(['GET'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_login_logs(request):
+    """管理员 - 全站登录日志（含筛选）"""
+    queryset = UserLoginLog.objects.all().select_related('user').order_by('-created_at')
+    filtered = UserLoginLogFilter(request.GET, queryset=queryset).qs
+
+    paginator = LoginLogPagination()
+    page = paginator.paginate_queryset(filtered, request)
+    data = [
+        {
+            'id': l.id,
+            'user_id': l.user_id,
+            'username': l.user.display_name,
+            'phone': l.user.phone,
+            'login_method': l.get_login_method_display(),
+            'platform': l.platform,
+            'ip_address': l.ip_address,
+            'location': l.location,
+            'is_success': l.is_success,
+            'fail_reason': l.fail_reason,
+            'created_at': l.created_at,
+        }
+        for l in page
+    ]
+    return paginator.get_paginated_response(data)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 统计概览
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_user_stats(request):
+    """管理员 - 用户数据概览"""
+    now = timezone.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timezone.timedelta(days=7)
+    month_start = today_start.replace(day=1)
+
+    base = User.objects.all()
+
+    return Response({
+        'total': base.count(),
+        'new_users': {
+            'today': base.filter(created_at__gte=today_start).count(),
+            'week': base.filter(created_at__gte=week_start).count(),
+            'month': base.filter(created_at__gte=month_start).count(),
+        },
+        'active_users': {
+            'today': base.filter(last_active_at__gte=today_start).count(),
+            'week': base.filter(last_active_at__gte=week_start).count(),
+        },
+        'status': {
+            'vip': base.filter(is_vip=True, vip_expired_at__gte=now).count(),
+            'verified': base.filter(is_verified=True).count(),
+            'banned': base.filter(is_banned=True).count(),
+            'inactive': base.filter(is_active=False).count(),
+        },
+        'channel_distribution': list(
+            base.values('register_channel').annotate(count=Count('id')).order_by('-count')
+        ),
+        'gender_distribution': list(
+            base.values('gender').annotate(count=Count('id')).order_by('-count')
+        ),
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 邀请功能 - 常量 & 工具
+# ═══════════════════════════════════════════════════════════════
+INVITE_REWARD_GOLD = 100  # 每邀请 1 人奖励 100 金币(后续可改)
+
+INVITE_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'  # 去掉容易混淆的 I/O/0/1
+INVITE_CODE_LEN = 8
+
+
+def _generate_invite_code():
+    """生成全局唯一邀请码"""
+    for _ in range(10):
+        code = ''.join(secrets.choice(INVITE_CODE_ALPHABET) for _ in range(INVITE_CODE_LEN))
+        if not User.objects.filter(invite_code=code).exists():
+            return code
+    raise RuntimeError('邀请码生成失败,请重试')
+
+
+def _ensure_invite_code(user):
+    """确保用户有邀请码,无则生成"""
+    if user.invite_code:
+        return user.invite_code
+    code = _generate_invite_code()
+    User.objects.filter(pk=user.pk, invite_code='').update(invite_code=code)
+    user.refresh_from_db(fields=['invite_code'])
+    return user.invite_code
+
+
+def _mask_phone(phone):
+    """脱敏手机号:138****1234"""
+    if not phone or len(phone) < 7:
+        return phone or ''
+    return phone[:3] + '****' + phone[-4:]
+
+
+def _process_invite_reward(new_user, invite_code):
+    """
+    处理邀请奖励:
+      1. 找到邀请人 → 绑定 invited_by
+      2. 通过 UserWallet.change_gold() 给邀请人加 100 金币
+         (内部已带行锁/原子事务/自动写流水,幂等键防重复)
+      3. 写 InviteReward 记录
+
+    ⚠️ 必须在主注册事务【之外】调用,失败不阻断注册主流程
+    """
+    code = (invite_code or '').strip()
+    if not code:
+        return
+
+    try:
+        # 1. 查邀请人
+        inviter = (
+            User.objects
+            .filter(invite_code__iexact=code)
+            .exclude(pk=new_user.pk)
+            .first()
+        )
+        if not inviter:
+            return
+        if not inviter.is_active or inviter.is_banned:
+            return
+
+        # 2. 绑定 invited_by(只允许绑一次)
+        if new_user.invited_by_id is None:
+            new_user.invited_by = inviter
+            new_user.save(update_fields=['invited_by'])
+
+        # 3. 防重复发奖(快路径)
+        if InviteReward.objects.filter(inviter=inviter, invitee=new_user).exists():
+            return
+
+        # 4. 拿/创建邀请人钱包(你的 UserWallet 没有 default 工厂,这里兜底)
+        wallet, _ = UserWallet.objects.get_or_create(user=inviter)
+
+        # 5. 走标准入口加金币
+        #    ⚠️ 用 GOLD_GRANT 而非 INVITE_REWARD —— 你的钱包模型把 INVITE_REWARD 归类为积分 action
+        tx = wallet.change_gold(
+            amount=INVITE_REWARD_GOLD,
+            action=WalletTransaction.Action.GOLD_GRANT,
+            operator_id=new_user.id,         # 新用户触发的
+            operator_role='system',
+            related_type='invite',
+            related_id=new_user.id,
+            remark=f'邀请好友 {new_user.display_name} 注册',
+            idempotent_key=f'invite_reward_{inviter.id}_{new_user.id}',
+        )
+
+        # 6. 写邀请奖励记录(unique_together 兜底防重复)
+        InviteReward.objects.create(
+            inviter=inviter,
+            invitee=new_user,
+            reward_gold=INVITE_REWARD_GOLD,
+            status='issued',
+            business_no=str(tx.id),
+            issued_at=timezone.now(),
+            remark=f'邀请注册奖励 +{INVITE_REWARD_GOLD}',
+        )
+    except IntegrityError:
+        # 并发场景下 InviteReward 已存在,正常忽略
+        pass
+    except Exception:
+        # 任何其它异常都吞掉,打日志即可,不影响注册
+        import traceback
+        traceback.print_exc()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 用户端 - 邀请好友
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+@authentication_classes([UserAuthentication])
+def get_invite_summary_api(request):
+    """
+    GET /user/invite/summary/  —— 邀请页汇总
+    返回: {invite_code, invited_count, total_gold, reward_per_invite}
+    """
+    user = request.user
+    invite_code = _ensure_invite_code(user)
+    invited_count = User.objects.filter(invited_by=user).count()
+    total_gold = (
+        InviteReward.objects
+        .filter(inviter=user, status='issued')
+        .aggregate(s=Sum('reward_gold'))['s']
+    ) or 0
+
+    return Response({
+        'invite_code': invite_code,
+        'invited_count': invited_count,
+        'total_gold': total_gold,
+        'reward_per_invite': INVITE_REWARD_GOLD,
     }, status=status.HTTP_200_OK)
 
 
-class UserAddressViewSet(viewsets.ModelViewSet):
-    """用户地址管理ViewSet"""
-    serializer_class = UserAddressSerializer
-    authentication_classes = [UserAuthentication]
-    permission_classes = [IsUserOwner]
-    filter_backends = [filters.OrderingFilter]
-    ordering_fields = ['created_at', 'is_default']
-    ordering = ['-is_default', '-created_at']
+@api_view(['GET'])
+@authentication_classes([UserAuthentication])
+def get_invite_records(request):
+    """
+    GET /user/invite/records/  —— 邀请记录(分页)
+    返回被邀请人简略信息 + 获得金币数
+    """
+    queryset = (
+        InviteReward.objects
+        .filter(inviter=request.user)
+        .select_related('invitee')
+        .order_by('-created_at')
+    )
 
-    def get_queryset(self):
-        """只返回当前用户的地址"""
-        return UserAddress.objects.filter(user=self.request.user)
+    paginator = StandardPagination()
+    page = paginator.paginate_queryset(queryset, request)
 
-    def get_serializer_class(self):
-        """根据action选择序列化器"""
-        if self.action == 'create':
-            return UserAddressCreateSerializer
-        return UserAddressSerializer
-
-    def perform_create(self, serializer):
-        """创建地址时关联当前用户"""
-        user = self.request.user
-
-        # 如果用户没有地址，自动设为默认地址
-        if not UserAddress.objects.filter(user=user).exists():
-            serializer.validated_data['is_default'] = True
-
-        # 如果设置为默认地址，取消其他默认地址
-        if serializer.validated_data.get('is_default', False):
-            UserAddress.objects.filter(user=user, is_default=True).update(is_default=False)
-
-        serializer.save(user=user)
-
-    def perform_update(self, serializer):
-        """更新地址"""
-        # 如果设置为默认地址，取消其他默认地址
-        if serializer.validated_data.get('is_default', False):
-            UserAddress.objects.filter(
-                user=self.request.user,
-                is_default=True
-            ).exclude(id=serializer.instance.id).update(is_default=False)
-
-        serializer.save()
-
-    def perform_destroy(self, instance):
-        """删除地址时的处理"""
-        user = self.request.user
-        is_default = instance.is_default
-
-        # 删除地址
-        instance.delete()
-
-        # 如果删除的是默认地址，设置第一个地址为默认地址
-        if is_default:
-            first_address = UserAddress.objects.filter(user=user).first()
-            if first_address:
-                first_address.is_default = True
-                first_address.save()
-
-    @action(detail=True, methods=['post'])
-    def set_default(self, request, pk=None):
-        """设置为默认地址"""
-        try:
-            address = self.get_object()
-
-            # 取消当前用户的所有默认地址
-            UserAddress.objects.filter(
-                user=request.user,
-                is_default=True
-            ).update(is_default=False)
-
-            # 设置当前地址为默认
-            address.is_default = True
-            address.save()
-
-            return Response({
-                'message': '已设置为默认地址',
-                'address': UserAddressSerializer(address).data
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            return Response({
-                'error': f'设置默认地址失败: {str(e)}'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-    @action(detail=False, methods=['get'])
-    def default(self, request):
-        """获取默认地址"""
-        try:
-            default_address = UserAddress.objects.filter(
-                user=request.user,
-                is_default=True
-            ).first()
-
-            if default_address:
-                return Response({
-                    'address': UserAddressSerializer(default_address).data
-                }, status=status.HTTP_200_OK)
-            else:
-                return Response({
-                    'message': '暂无默认地址'
-                }, status=status.HTTP_404_NOT_FOUND)
-
-        except Exception as e:
-            return Response({
-                'error': f'获取默认地址失败: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['get'])
-    def statistics(self, request):
-        """地址统计信息"""
-        user = request.user
-        queryset = self.get_queryset()
-
-        total = queryset.count()
-        has_default = queryset.filter(is_default=True).exists()
-
-        # 按省份统计
-        province_stats = {}
-        for address in queryset:
-            province = address.province or '未知'
-            province_stats[province] = province_stats.get(province, 0) + 1
-
-        return Response({
-            'total': total,
-            'has_default': has_default,
-            'province_stats': province_stats
-        }, status=status.HTTP_200_OK)
-
-    def list(self, request, *args, **kwargs):
-        """重写列表方法，添加额外信息"""
-        queryset = self.filter_queryset(self.get_queryset())
-
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = self.get_serializer(queryset, many=True)
-
-        return Response({
-            'count': queryset.count(),
-            'results': serializer.data
-        }, status=status.HTTP_200_OK)
+    data = [
+        {
+            'id': r.id,
+            'invitee_id': r.invitee_id,
+            'invitee_name': r.invitee.display_name,
+            'invitee_avatar': r.invitee.avatar or '',
+            'invitee_phone_masked': _mask_phone(r.invitee.phone),
+            'reward_gold': r.reward_gold,
+            'status': r.status,
+            'status_display': r.get_status_display(),
+            'issued_at': r.issued_at,
+            'created_at': r.created_at,
+        }
+        for r in page
+    ]
+    return paginator.get_paginated_response(data)
 
 
-# 如果需要单独的地址相关功能视图，可以添加以下函数式视图
+# ═══════════════════════════════════════════════════════════════
+# 用户端 - 转赠金币
+# ═══════════════════════════════════════════════════════════════
+MIN_TRANSFER_GOLD = 1
+MAX_TRANSFER_GOLD = 10000
+
 
 @api_view(['POST'])
 @authentication_classes([UserAuthentication])
-def quick_create_address(request):
-    """快速创建地址（用于下单时）"""
-    try:
-        user = request.user
+def transfer_lookup(request):
+    """
+    POST /user/transfer/lookup/
+    body: { phone: "138..." }
+    根据手机号查找收款人,返回脱敏信息
+    """
+    phone = (request.data.get('phone') or '').strip()
+    if not phone:
+        return Response({'error': '请输入手机号'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not user.is_authenticated:
-            return Response(
-                {'error': '用户未认证'},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
+    target = User.objects.filter(phone=phone).first()
+    if not target:
+        return Response({'error': '未找到该用户'}, status=status.HTTP_400_BAD_REQUEST)
+    if target.pk == request.user.pk:
+        return Response({'error': '不能转赠给自己'}, status=status.HTTP_400_BAD_REQUEST)
+    if not target.is_active or target.is_banned:
+        return Response({'error': '该用户当前不可接收转赠'}, status=status.HTTP_400_BAD_REQUEST)
 
-        serializer = UserAddressCreateSerializer(
-            data=request.data,
-            context={'request': request}
-        )
-
-        if serializer.is_valid():
-            # 如果用户没有地址，自动设为默认地址
-            if not UserAddress.objects.filter(user=user).exists():
-                serializer.validated_data['is_default'] = True
-
-            # 如果设置为默认地址，取消其他默认地址
-            if serializer.validated_data.get('is_default', False):
-                UserAddress.objects.filter(user=user, is_default=True).update(is_default=False)
-
-            address = serializer.save(user=user)
-
-            return Response({
-                'message': '地址创建成功',
-                'address': UserAddressSerializer(address).data
-            }, status=status.HTTP_201_CREATED)
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    except Exception as e:
-        return Response({
-            'error': f'创建地址失败: {str(e)}'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    return Response({
+        'user_id': target.id,
+        'avatar': target.avatar or '',
+        'display_name': target.display_name,
+        'phone_masked': _mask_phone(target.phone),
+    })
 
 
-@api_view(['GET'])
+@api_view(['POST'])
 @authentication_classes([UserAuthentication])
-def get_address_suggestions(request):
-    """获取地址建议（基于用户历史地址）"""
+def transfer_gold(request):
+    """
+    POST /user/transfer/
+    body: { recipient_id, amount, remark }
+    """
+    sender = request.user
+    recipient_id = request.data.get('recipient_id')
+    amount = request.data.get('amount')
+    remark = (request.data.get('remark') or '').strip()[:100]
+
+    # 1. 参数校验
+    if not recipient_id or amount is None:
+        return Response({'error': '参数不完整'}, status=status.HTTP_400_BAD_REQUEST)
     try:
-        user = request.user
+        recipient_id = int(recipient_id)
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return Response({'error': '参数格式错误'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not user.is_authenticated:
-            return Response(
-                {'error': '用户未认证'},
-                status=status.HTTP_401_UNAUTHORIZED
+    if amount < MIN_TRANSFER_GOLD:
+        return Response({'error': f'单笔最少 {MIN_TRANSFER_GOLD} 金币'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if amount > MAX_TRANSFER_GOLD:
+        return Response({'error': f'单笔最多 {MAX_TRANSFER_GOLD} 金币'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if sender.id == recipient_id:
+        return Response({'error': '不能转赠给自己'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # 2. 校验收款人
+    recipient = User.objects.filter(pk=recipient_id).first()
+    if not recipient:
+        return Response({'error': '收款人不存在'}, status=status.HTTP_400_BAD_REQUEST)
+    if not recipient.is_active or recipient.is_banned:
+        return Response({'error': '收款人状态异常'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # 3. 双方钱包(自动创建)
+    sender_wallet, _ = UserWallet.objects.get_or_create(user=sender)
+    recipient_wallet, _ = UserWallet.objects.get_or_create(user=recipient)
+
+    # 4. 幂等键(粒度到毫秒,粗略防止双击)
+    import time
+    idem = f'transfer_{sender.id}_{recipient.id}_{int(time.time() * 1000)}'
+
+    # 5. 转出 + 转入,外层 atomic 保证原子性(失败全回滚)
+    try:
+        with transaction.atomic():
+            out_tx = sender_wallet.change_gold(
+                amount=-amount,
+                action=WalletTransaction.Action.GOLD_DEDUCT,
+                operator_id=sender.id,
+                operator_role='user',
+                related_type='transfer',
+                related_id=recipient.id,
+                remark=remark or f'转赠给 {recipient.display_name}',
+                idempotent_key=f'{idem}_out',
             )
+            recipient_wallet.change_gold(
+                amount=amount,
+                action=WalletTransaction.Action.GOLD_GRANT,
+                operator_id=sender.id,
+                operator_role='user',
+                related_type='transfer',
+                related_id=sender.id,
+                remark=remark or f'来自 {sender.display_name} 的转赠',
+                idempotent_key=f'{idem}_in',
+            )
+    except ValueError as e:
+        # change_gold 内部抛的:余额不足 / 钱包冻结 / 校验失败
+        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 获取用户最近使用的省市区
-        recent_addresses = UserAddress.objects.filter(user=user).order_by('-updated_at')[:10]
-
-        suggestions = {
-            'provinces': [],
-            'cities': [],
-            'districts': [],
-            'recent_receivers': []
-        }
-
-        provinces_set = set()
-        cities_set = set()
-        districts_set = set()
-        receivers_set = set()
-
-        for addr in recent_addresses:
-            if addr.province:
-                provinces_set.add(addr.province)
-            if addr.city:
-                cities_set.add(addr.city)
-            if addr.district:
-                districts_set.add(addr.district)
-            if addr.receiver_name:
-                receivers_set.add(addr.receiver_name)
-
-        suggestions['provinces'] = list(provinces_set)
-        suggestions['cities'] = list(cities_set)
-        suggestions['districts'] = list(districts_set)
-        suggestions['recent_receivers'] = list(receivers_set)
-
-        return Response(suggestions, status=status.HTTP_200_OK)
-
-    except Exception as e:
-        return Response({
-            'error': f'获取地址建议失败: {str(e)}'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    return Response({
+        'transaction_id': out_tx.id,
+        'amount': amount,
+        'recipient': {
+            'user_id': recipient.id,
+            'display_name': recipient.display_name,
+            'avatar': recipient.avatar or '',
+        },
+        'sender_gold_available': sender_wallet.gold_available,
+    }, status=status.HTTP_201_CREATED)

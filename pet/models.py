@@ -1,7 +1,6 @@
 from django.db import models
 from django.utils import timezone
 from bill.models import ServiceOrder
-from price.models import Service
 from user.models import User
 
 

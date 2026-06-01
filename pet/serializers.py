@@ -119,10 +119,14 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def validate_pet(self, value):
-        """验证宠物是否属于当前用户"""
+        """验证宠物是否属于当前用户（只能给自己的宠物创建日记）
+
+        说明：旧版用 `user.type == 'admin'` 放行管理员，但新权限体系里管理员是
+        独立的 Manager 模型、走单独后台，普通 User 也没有 type 字段（会 AttributeError）。
+        故移除该判断，仅校验“宠物归属当前用户”。
+        """
         user = self.context['request'].user
-        # 检查是否是宠物主人或管理员
-        if value.owner != user and user.type != 'admin':
+        if value.owner_id != getattr(user, 'id', None):
             raise serializers.ValidationError("您没有权限为该宠物创建日记")
         return value
 

@@ -5,15 +5,16 @@
 from django.db import transaction
 from django.db.models import F, Q, Count, Sum
 from django.utils import timezone
+from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 
 from datetime import timedelta
 
-from rest_framework import status, permissions
+from rest_framework import status, permissions, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet, ViewSet
+from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet, ViewSet, GenericViewSet
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
+from rest_framework.permissions import IsAuthenticatedOrReadOnly
 
 from community.models import (
     Post, PostCategory, Comment, Topic, UserAction,
@@ -24,7 +25,7 @@ from community.serializers import (
     PostListSerializer, PostDetailSerializer, CreatePostSerializer, UpdatePostSerializer,
     CommentSerializer, CreateCommentSerializer, UserDetailSerializer, BasicUserSerializer,
     PostCategorySerializer, TopicSerializer, SimpleTopicSerializer, UserActionSerializer,
-    ReportSerializer, NotificationSerializer,
+    ReportSerializer, ReportAdminSerializer, NotificationSerializer,
     PostCollectionSerializer, UserFollowSerializer,
 )
 from community.filters import (
@@ -35,22 +36,60 @@ from community.pagination import (
     paginate_queryset, create_paginated_response
 )
 from user.models import User
-from utils.authentication import UserAuthentication, AdminAuthentication
-from utils.permission import IsUserOwner
+from utils.authentication import UserAuthentication, ManagerAuthentication
+from utils.permission import IsUser, IsManager
+
+
+# ===== 本地归属权限（替代旧的 IsUserOwner）=====
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    """
+    内容作者（本人）才能写；读操作放行。仅普通用户。
+
+    为什么不用 utils.permission.IsResourceOwner：
+    - IsResourceOwner 只认 user / owner / user_id / owner_id，不认本应用普遍使用的 author 字段；
+    - 它没有 has_permission，且对象级 fail-closed，无法直接用于点赞、看主页等场景。
+    本权限覆盖 author / user / owner 三种归属字段，写操作要求是本人。
+    如需复用，可整体挪到 utils/permission.py。
+    """
+
+    message = '您无权操作此资源'
+
+    def has_permission(self, request, view):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return isinstance(request.user, User) and request.user.is_active
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        if not isinstance(request.user, User):
+            return False
+
+        for id_attr in ('author_id', 'user_id', 'owner_id'):
+            owner_id = getattr(obj, id_attr, None)
+            if owner_id is not None:
+                return owner_id == request.user.id
+
+        for obj_attr in ('author', 'user', 'owner'):
+            owner = getattr(obj, obj_attr, None)
+            if owner is not None:
+                return getattr(owner, 'id', None) == request.user.id
+
+        return False
 
 
 # ===== 基础视图类 =====
 class BaseViewSet(ModelViewSet):
     """基础视图集，提供通用功能"""
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsUserOwner]
+    permission_classes = [IsUser]  # 子类各自用 get_permissions 覆盖
 
     def get_permissions(self):
         """根据动作动态设置权限"""
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
-            permission_classes = [IsAuthenticated]
+            permission_classes = [IsUser]
         else:
-            permission_classes = [IsUserOwner]
+            permission_classes = [IsAuthenticatedOrReadOnly]
         return [permission() for permission in permission_classes]
 
     def perform_create(self, serializer):
@@ -105,7 +144,9 @@ class UserViewSet(ReadOnlyModelViewSet):
     serializer_class = UserDetailSerializer
     filterset_class = UserFilter
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsUserOwner]
+    # ✅ 旧的 IsUserOwner 在这里相当于“公开可读”（看别人主页）。
+    #    如果用户主页必须登录才能看，把这里改成 IsAuthenticated。
+    permission_classes = [permissions.AllowAny]
     lookup_field = 'username'  # 默认使用 username
 
     def get_object(self):
@@ -167,7 +208,7 @@ class UserViewSet(ReadOnlyModelViewSet):
         )
         return create_paginated_response(serializer.data, paginator)
 
-    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['get'], permission_classes=[IsUser])
     def collections(self, request, username=None):
         """获取用户的收藏"""
         user = self.get_object()
@@ -187,7 +228,7 @@ class UserViewSet(ReadOnlyModelViewSet):
         )
         return create_paginated_response(serializer.data, paginator)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'], permission_classes=[IsUser])
     def follow(self, request, username=None):
         """关注/取消关注用户"""
         target_user = self.get_object()
@@ -218,7 +259,7 @@ class UserViewSet(ReadOnlyModelViewSet):
             )
             return Response({'detail': '关注成功', 'followed': True})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'], permission_classes=[IsUser])
     def block(self, request, username=None):
         """拉黑/取消拉黑用户"""
         target_user = self.get_object()
@@ -481,7 +522,7 @@ class TopicViewSet(ReadOnlyModelViewSet):
         )
         return create_paginated_response(serializer.data, paginator)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'], permission_classes=[IsUser])
     def follow(self, request, slug=None):
         """关注/取消关注话题"""
         topic = self.get_object()
@@ -519,13 +560,18 @@ class PostViewSet(BaseViewSet):
     permission_classes = [IsAuthenticatedOrReadOnly]
 
     def get_permissions(self):
-        """根据动作动态设置权限"""
-        if self.action in ['create', 'update', 'partial_update', 'destroy',
-                           'like', 'collect', 'share', 'report']:
-            # 需要登录的操作
-            permission_classes = [IsUserOwner]
+        """
+        根据动作动态设置权限
+        - 改/删：作者本人（IsAuthorOrReadOnly）
+        - 发帖/点赞/收藏/分享/举报/关注流/我的帖子：登录用户（IsUser）
+          （点赞、收藏、分享、举报都是针对“别人”的内容，不需要是作者本人）
+        - 其它（列表/详情/热门）：IsAuthenticatedOrReadOnly
+        """
+        if self.action in ['update', 'partial_update', 'destroy']:
+            permission_classes = [IsAuthorOrReadOnly]
+        elif self.action in ['create', 'like', 'collect', 'share', 'report', 'feed', 'my_posts']:
+            permission_classes = [IsUser]
         else:
-            # 查看类操作：允许未登录
             permission_classes = [IsAuthenticatedOrReadOnly]
         return [permission() for permission in permission_classes]
 
@@ -569,8 +615,6 @@ class PostViewSet(BaseViewSet):
 
     def perform_create(self, serializer):
         """创建帖子"""
-        from django.db.models import F
-
         post = serializer.save(author=self.request.user)
 
         # 发帖奖励 +10 积分
@@ -578,7 +622,7 @@ class PostViewSet(BaseViewSet):
         user.integral = F('integral') + 10
         user.save(update_fields=['integral'])
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def like(self, request, pk=None):
         """点赞/取消点赞帖子"""
         post = self.get_object()
@@ -622,7 +666,7 @@ class PostViewSet(BaseViewSet):
 
                 return Response({'detail': '点赞成功', 'liked': True})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def collect(self, request, pk=None):
         """收藏/取消收藏帖子"""
         post = self.get_object()
@@ -645,7 +689,7 @@ class PostViewSet(BaseViewSet):
                 Post.objects.filter(id=post.id).update(collect_count=F('collect_count') + 1)
                 return Response({'detail': '收藏成功', 'collected': True})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def share(self, request, pk=None):
         """分享帖子"""
         post = self.get_object()
@@ -672,7 +716,7 @@ class PostViewSet(BaseViewSet):
         serializer = PostListSerializer(posts, many=True, context={'request': request})
         return Response({'posts': serializer.data})
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'])
     def feed(self, request):
         """关注动态"""
         # 获取用户关注的人
@@ -694,7 +738,7 @@ class PostViewSet(BaseViewSet):
         )
         return create_paginated_response(serializer.data, paginator)
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    @action(detail=False, methods=['get'])
     def my_posts(self, request):
         """我的帖子"""
         # 获取当前用户的所有帖子
@@ -738,7 +782,7 @@ class PostViewSet(BaseViewSet):
 
         return response
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def report(self, request, pk=None):
         """举报帖子"""
         post = self.get_object()
@@ -805,12 +849,17 @@ class CommentViewSet(BaseViewSet):
     permission_classes = [IsAuthenticatedOrReadOnly]
 
     def get_permissions(self):
-        """根据动作动态设置权限"""
-        if self.action in ['create', 'update', 'partial_update', 'destroy', 'like']:
-            # 需要登录的操作
-            permission_classes = [IsUserOwner]
+        """
+        根据动作动态设置权限
+        - 改/删：作者本人（IsAuthorOrReadOnly）
+        - 评论/点赞：登录用户（IsUser）
+        - 其它：IsAuthenticatedOrReadOnly
+        """
+        if self.action in ['update', 'partial_update', 'destroy']:
+            permission_classes = [IsAuthorOrReadOnly]
+        elif self.action in ['create', 'like']:
+            permission_classes = [IsUser]
         else:
-            # 查看评论：允许未登录
             permission_classes = [IsAuthenticatedOrReadOnly]
         return [permission() for permission in permission_classes]
 
@@ -854,7 +903,7 @@ class CommentViewSet(BaseViewSet):
                     comment=comment
                 )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    @action(detail=True, methods=['post'])
     def like(self, request, pk=None):
         """点赞/取消点赞评论"""
         comment = self.get_object()
@@ -889,7 +938,7 @@ class UserActionViewSet(ReadOnlyModelViewSet):
     """用户行为记录视图集"""
     serializer_class = UserActionSerializer
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUser]
 
     def get_queryset(self):
         return UserAction.objects.filter(
@@ -903,7 +952,7 @@ class NotificationViewSet(ReadOnlyModelViewSet):
     serializer_class = NotificationSerializer
     filterset_class = NotificationFilter
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUser]
 
     def get_queryset(self):
         return Notification.objects.filter(
@@ -936,20 +985,32 @@ class NotificationViewSet(ReadOnlyModelViewSet):
         return Response({'unread_count': count})
 
 
-# ===== 举报视图 =====
+# ===== 举报视图（普通用户）=====
 class ReportViewSet(BaseViewSet):
-    """举报视图集"""
-    queryset = Report.objects.all()
+    """举报视图集（普通用户）
+
+    普通用户只能：提交举报（create）、查看自己提交过的举报（list/retrieve）。
+    举报一旦提交不允许再改/删（http_method_names 已禁用 PUT/PATCH/DELETE）。
+
+    平台侧的举报处理（改状态、指派处理人、看全部举报）在 AdminReportViewSet，
+    走 ManagerAuthentication + IsManager。这里不再用 request.user.is_staff 判断——
+    本视图走 UserAuthentication，request.user 永远是社区普通用户，is_staff 基本恒为
+    False，那段分支属于死代码，已删除。
+    """
+    queryset = Report.objects.select_related('reporter', 'handler').all()
     serializer_class = ReportSerializer
     filterset_class = ReportFilter
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def get_permissions(self):
+        # 查看/创建自己的举报都需要登录（匿名不能列举他人举报）
+        return [IsUser()]
 
     def get_queryset(self):
-        if self.request.user.is_staff:
-            return Report.objects.all()
-        return Report.objects.filter(reporter=self.request.user)
+        # 复用 BaseViewSet 的过滤逻辑后，再收敛到“本人提交的举报”
+        return super().get_queryset().filter(reporter=self.request.user)
 
-    def perform_create(self, serializer):
-        serializer.save(reporter=self.request.user)
+    # reporter / ip 由 ReportSerializer.create 负责写入，无需在此重复设置
 
 
 # ===== 搜索视图 =====
@@ -994,8 +1055,8 @@ class AdminPostViewSet(ModelViewSet):
     queryset = Post.objects.all()
     serializer_class = PostDetailSerializer
     filterset_class = AdminPostFilter
-    authentication_classes = [AdminAuthentication]
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [ManagerAuthentication]
+    permission_classes = [IsManager]
 
     def get_queryset(self):
         # 管理员可以看到所有状态的帖子
@@ -1071,6 +1132,162 @@ class AdminPostViewSet(ModelViewSet):
 
         return Response({'detail': '审核拒绝'})
 
+    @action(detail=True, methods=['post'])
+    def hide(self, request, pk=None):
+        """隐藏帖子（已发布但需下架，区别于拒绝/封禁）"""
+        post = self.get_object()
+        old_status = post.status
+        reason = request.data.get('reason', '')
+
+        with transaction.atomic():
+            post.status = 'hidden'
+            post.reviewer = request.user
+            post.reviewed_at = timezone.now()
+            post.save(update_fields=['status', 'reviewer', 'reviewed_at'])
+
+            ReviewLog.objects.create(
+                content_type='post',
+                content_id=post.id,
+                reviewer=request.user,
+                action='hide',
+                old_status=old_status,
+                new_status='hidden',
+                reason=reason,
+                note=request.data.get('note', '')
+            )
+
+        return Response({'detail': '已隐藏', 'status': 'hidden'})
+
+    @action(detail=True, methods=['post'])
+    def feature(self, request, pk=None):
+        """切换精选状态（设为精选会触发作者 +50 积分，与 Django Admin 行为一致）"""
+        post = self.get_object()
+        post.is_featured = not post.is_featured
+        post.save()  # 走 Post.save()，命中其中的精选积分逻辑
+        return Response({'detail': '精选状态已更新', 'is_featured': post.is_featured})
+
+    @action(detail=True, methods=['post'])
+    def top(self, request, pk=None):
+        """切换置顶状态（纯标记，不触发积分，直接 update 避免多余的 save 副作用）"""
+        post = self.get_object()
+        new_top = not post.is_top
+        Post.objects.filter(pk=post.pk).update(is_top=new_top)
+        return Response({'detail': '置顶状态已更新', 'is_top': new_top})
+
+
+# ===== 举报管理视图（平台后台 Manager）=====
+class AdminReportViewSet(mixins.ListModelMixin,
+                         mixins.RetrieveModelMixin,
+                         mixins.UpdateModelMixin,
+                         GenericViewSet):
+    """举报管理（平台后台）
+
+    走 ManagerAuthentication + IsManager，与 AdminPostViewSet 一致。提供：
+    - GET   admin/reports/                列表（支持 ReportFilter：status / report_type /
+                                           pending / urgent / 时间区间 等）
+    - GET   admin/reports/{id}/           详情
+    - PATCH admin/reports/{id}/           改 status / handle_note（ReportAdminSerializer）
+    - POST  admin/reports/{id}/process/   标记处理中
+    - POST  admin/reports/{id}/resolve/   处理完成
+    - POST  admin/reports/{id}/reject/    驳回
+    - POST  admin/reports/{id}/ignore/    忽略
+    - GET   admin/reports/statistics/     举报统计看板
+
+    说明：Report.handler 指向 User。这里把 request.user（Manager）写入 handler，
+    与现有 AdminPostViewSet.approve/reject 把 request.user 写入 reviewer 是同一套前提——
+    要求 Manager 能被赋给指向 User 的外键。若 Manager 与 User 是两个独立模型，
+    这两处都需要同样的调整（见对话说明）。
+    """
+    serializer_class = ReportAdminSerializer
+    filterset_class = ReportFilter
+    authentication_classes = [ManagerAuthentication]
+    permission_classes = [IsManager]
+
+    def get_queryset(self):
+        queryset = Report.objects.select_related('reporter', 'handler').order_by('-created_at')
+        return apply_filters(queryset, self.request, self.filterset_class)
+
+    def list(self, request, *args, **kwargs):
+        """列表统一走项目的后台分页（AdminPagination）"""
+        paginated_queryset, paginator = paginate_queryset(
+            self.get_queryset(), request, 'admin'
+        )
+        serializer = self.get_serializer(paginated_queryset, many=True)
+        return create_paginated_response(serializer.data, paginator)
+
+    def perform_update(self, serializer):
+        """直接 PATCH 改状态时，自动补处理人 / 处理时间"""
+        report = serializer.save()
+        if report.status in ('resolved', 'rejected', 'ignored'):
+            update_fields = []
+            if report.handler_id is None:
+                report.handler = self.request.user
+                update_fields.append('handler')
+            if report.handled_at is None:
+                report.handled_at = timezone.now()
+                update_fields.append('handled_at')
+            if update_fields:
+                report.save(update_fields=update_fields)
+
+    def _finish(self, request, new_status):
+        """resolve / reject / ignore 的公共处理逻辑"""
+        report = self.get_object()
+        report.status = new_status
+        report.handler = request.user
+        report.handled_at = timezone.now()
+        if 'handle_note' in request.data:
+            report.handle_note = request.data['handle_note']
+        report.save(update_fields=['status', 'handler', 'handled_at', 'handle_note'])
+        return Response({'detail': '操作成功', 'status': new_status})
+
+    @action(detail=True, methods=['post'])
+    def process(self, request, pk=None):
+        """标记为处理中（不写处理时间）"""
+        report = self.get_object()
+        report.status = 'processing'
+        report.handler = request.user
+        report.save(update_fields=['status', 'handler'])
+        return Response({'detail': '已标记为处理中', 'status': 'processing'})
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        """处理完成"""
+        return self._finish(request, 'resolved')
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """驳回举报"""
+        return self._finish(request, 'rejected')
+
+    @action(detail=True, methods=['post'])
+    def ignore(self, request, pk=None):
+        """忽略举报"""
+        return self._finish(request, 'ignored')
+
+    @action(detail=False, methods=['get'])
+    def statistics(self, request):
+        """举报统计看板"""
+        queryset = Report.objects.all()
+        status_counts = {
+            row['status']: row['count']
+            for row in queryset.values('status').annotate(count=Count('id'))
+        }
+        type_counts = {
+            row['report_type']: row['count']
+            for row in queryset.values('report_type').annotate(count=Count('id'))
+        }
+        return Response({
+            'total': queryset.count(),
+            'pending': status_counts.get('pending', 0),
+            'processing': status_counts.get('processing', 0),
+            'resolved': status_counts.get('resolved', 0),
+            'rejected': status_counts.get('rejected', 0),
+            'ignored': status_counts.get('ignored', 0),
+            'by_status': status_counts,
+            'by_report_type': type_counts,
+        })
+
+
 # ===== 宠物社区特色功能视图 =====
 class PetCommunityViewSet(ViewSet):
     """宠物社区特色功能ViewSet"""
@@ -1117,9 +1334,15 @@ class PetCommunityViewSet(ViewSet):
     @action(detail=False, methods=['get'])
     def home_posts(self, request):
         """获取首页推文列表 - 简单的时间序 + 热度混合排序"""
-        # 获取分页参数
-        page = int(request.GET.get('page', 1))
-        page_size = int(request.GET.get('page_size', 10))
+        # 获取分页参数（容错：非法入参回退默认值，避免 int() 直接 500）
+        try:
+            page = int(request.GET.get('page', 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.GET.get('page_size', 10))
+        except (TypeError, ValueError):
+            page_size = 10
 
         # 基础查询 - 已审核通过的帖子，按发布时间和热度混合排序
         posts_queryset = Post.objects.filter(
@@ -1139,13 +1362,12 @@ class PetCommunityViewSet(ViewSet):
             if blocked_users:
                 posts_queryset = posts_queryset.exclude(author__in=blocked_users)
 
-        # 分页处理
-        from django.core.paginator import Paginator
+        # 分页处理（Paginator 已在文件顶部导入）
         paginator = Paginator(posts_queryset, page_size)
 
         try:
             posts_page = paginator.page(page)
-        except:
+        except (EmptyPage, PageNotAnInteger):
             posts_page = paginator.page(1)
 
         # 序列化数据
@@ -1243,7 +1465,7 @@ class StatisticsView(APIView):
 class RealtimeView(APIView):
     """实时功能相关"""
     authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsUser]
 
     def get(self, request):
         """获取实时数据"""

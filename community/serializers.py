@@ -544,3 +544,36 @@ class BlockedUserSerializer(serializers.ModelSerializer):
         model = BlockedUser
         fields = ['id', 'blocked_user', 'reason', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+
+# ===== 举报管理序列化（平台后台 Manager 用）=====
+class ReportAdminSerializer(serializers.ModelSerializer):
+    """举报管理序列化器
+
+    与用户端 ReportSerializer 的区别：放开 status / handle_note 供后台修改，
+    其余（举报人、被举报内容、证据、IP）保持只读。
+    处理人 handler、处理时间 handled_at 由视图在处理动作里自动写入，
+    不开放给序列化器，避免被伪造。
+
+    注意：本序列化器不读取 request.user，可安全用于 ManagerAuthentication 下的接口
+    （普通 ReportSerializer/PostDetailSerializer 里有 request.user.is_authenticated 调用，
+    在 Manager 主体上可能不可用）。
+    """
+    reporter = BasicUserSerializer(read_only=True)
+    handler = BasicUserSerializer(read_only=True)
+    report_type_display = serializers.CharField(source='get_report_type_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    content_type_display = serializers.CharField(source='get_content_type_display', read_only=True)
+
+    class Meta:
+        model = Report
+        fields = [
+            'id', 'reporter', 'content_type', 'content_type_display', 'content_id',
+            'report_type', 'report_type_display', 'reason', 'evidence',
+            'status', 'status_display', 'handler', 'handle_note',
+            'ip_address', 'created_at', 'handled_at',
+        ]
+        read_only_fields = [
+            'id', 'reporter', 'content_type', 'content_id', 'report_type',
+            'reason', 'evidence', 'handler', 'ip_address', 'created_at', 'handled_at',
+        ]

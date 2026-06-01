@@ -23,6 +23,7 @@ router.register(r'community', views.PetCommunityViewSet, basename='community')
 # 管理员路由器
 admin_router = DefaultRouter()
 admin_router.register(r'posts', views.AdminPostViewSet, basename='admin-post')
+admin_router.register(r'reports', views.AdminReportViewSet, basename='admin-report')
 
 
 # ==================== URL配置 ====================

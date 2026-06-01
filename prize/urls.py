@@ -3,6 +3,7 @@
 # @Author  : Delock
 
 from django.urls import path
+
 from .views import (
     # 管理员接口
     AdminPrizeListCreateView,
@@ -15,6 +16,18 @@ from .views import (
     AdminUserPrizeRedeemView,
     AdminUserPrizeRejectView,
     AdminUserPrizeCancelView,
+
+    # 商户接口
+    MerchantPrizeListCreateView,
+    MerchantPrizeDetailView,
+    MerchantIssuePrizeView,
+    MerchantBatchIssuePrizeView,
+    MerchantUserPrizeListView,
+    MerchantUserPrizeDetailView,
+    MerchantUserPrizeProcessView,
+    MerchantUserPrizeRedeemView,
+    MerchantUserPrizeRejectView,
+    MerchantUserPrizeCancelView,
 
     # 用户接口
     UserPrizeListView,
@@ -40,6 +53,23 @@ urlpatterns = [
     path('admin/user-prizes/<int:pk>/redeem/', AdminUserPrizeRedeemView.as_view(), name='admin-user-prize-redeem'),
     path('admin/user-prizes/<int:pk>/reject/', AdminUserPrizeRejectView.as_view(), name='admin-user-prize-reject'),
     path('admin/user-prizes/<int:pk>/cancel/', AdminUserPrizeCancelView.as_view(), name='admin-user-prize-cancel'),
+
+    # =========================
+    # 商户接口
+    # =========================
+    path('merchant/prizes/', MerchantPrizeListCreateView.as_view(), name='merchant-prize-list-create'),
+    path('merchant/prizes/<int:pk>/', MerchantPrizeDetailView.as_view(), name='merchant-prize-detail'),
+
+    path('merchant/user-prizes/issue/', MerchantIssuePrizeView.as_view(), name='merchant-user-prize-issue'),
+    path('merchant/user-prizes/batch-issue/', MerchantBatchIssuePrizeView.as_view(), name='merchant-user-prize-batch-issue'),
+
+    path('merchant/user-prizes/', MerchantUserPrizeListView.as_view(), name='merchant-user-prize-list'),
+    path('merchant/user-prizes/<int:pk>/', MerchantUserPrizeDetailView.as_view(), name='merchant-user-prize-detail'),
+
+    path('merchant/user-prizes/<int:pk>/process/', MerchantUserPrizeProcessView.as_view(), name='merchant-user-prize-process'),
+    path('merchant/user-prizes/<int:pk>/redeem/', MerchantUserPrizeRedeemView.as_view(), name='merchant-user-prize-redeem'),
+    path('merchant/user-prizes/<int:pk>/reject/', MerchantUserPrizeRejectView.as_view(), name='merchant-user-prize-reject'),
+    path('merchant/user-prizes/<int:pk>/cancel/', MerchantUserPrizeCancelView.as_view(), name='merchant-user-prize-cancel'),
 
     # =========================
     # 用户接口

@@ -7,6 +7,17 @@ from .models import (
     IntegralProduct, IntegralOrder, IntegralRecord,
     UserIntegralProduct, User, UserAddress
 )
+from wallet.models import WalletTransaction
+
+
+def points_balance_of(user):
+    """读取用户钱包的积分余额（钱包不存在时按 0 处理）。
+
+    积分已迁移到 UserWallet(user.wallet).points_balance，
+    原先散落各处的 user.integral 统一改走这里。
+    """
+    wallet = getattr(user, 'wallet', None)
+    return wallet.points_balance if wallet is not None else 0
 
 
 class IntegralProductListSerializer(serializers.ModelSerializer):
@@ -60,8 +71,8 @@ class IntegralProductDetailSerializer(serializers.ModelSerializer):
         if not obj.is_available:
             return False
 
-        # 检查积分
-        if user.integral < obj.integral_price:
+        # 检查积分（改读钱包余额）
+        if points_balance_of(user) < obj.integral_price:
             return False
 
         # 检查限购
@@ -99,9 +110,9 @@ class IntegralOrderCreateSerializer(serializers.Serializer):
         if product.stock < quantity:
             raise serializers.ValidationError("库存不足")
 
-        # 验证积分
+        # 验证积分（改读钱包余额）
         total_integral = product.integral_price * quantity
-        if user.integral < total_integral:
+        if points_balance_of(user) < total_integral:
             raise serializers.ValidationError("积分不足")
 
         # 验证限购
@@ -162,7 +173,7 @@ class IntegralOrderSerializer(serializers.ModelSerializer):
 
 
 class IntegralRecordSerializer(serializers.ModelSerializer):
-    """积分记录序列化器"""
+    """积分记录序列化器（旧的 IntegralRecord 模型；积分迁入钱包后已不再使用，保留以兼容历史引用）"""
 
     record_type_display = serializers.CharField(source='get_record_type_display', read_only=True)
     source_display = serializers.CharField(source='get_source_display', read_only=True)
@@ -172,6 +183,25 @@ class IntegralRecordSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'record_type', 'record_type_display', 'source',
             'source_display', 'amount', 'balance', 'description', 'created_at'
+        ]
+
+
+class PointsTransactionSerializer(serializers.ModelSerializer):
+    """积分流水序列化器（基于钱包 WalletTransaction，仅积分币种）
+
+    替代原 IntegralRecordSerializer 作为“我的积分流水 / 后台积分流水”的输出。
+    """
+
+    action_display = serializers.CharField(source='get_action_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = WalletTransaction
+        fields = [
+            'id', 'user_id', 'action', 'action_display',
+            'amount', 'balance_after',
+            'status', 'status_display',
+            'related_type', 'related_id', 'remark', 'created_at',
         ]
 
 
@@ -187,3 +217,60 @@ class UserIntegralProductSerializer(serializers.ModelSerializer):
             'id', 'product_info', 'content', 'code',
             'is_used', 'used_at', 'expired_at', 'is_expired', 'created_at'
         ]
+
+
+# ==========================================================================
+# 平台后台（Manager）序列化器
+# ==========================================================================
+
+class IntegralProductAdminSerializer(serializers.ModelSerializer):
+    """积分商品管理序列化器（平台后台）
+
+    全字段可写，便于后台增删改商品；销量、时间戳保持只读。
+    不读取 request.user，可安全用于 ManagerAuthentication 下的接口。
+    """
+    product_type_display = serializers.CharField(source='get_product_type_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = IntegralProduct
+        fields = [
+            'id', 'name', 'description', 'cover_image', 'images',
+            'product_type', 'product_type_display', 'category',
+            'integral_price', 'original_price',
+            'stock', 'total_stock', 'sales_count',
+            'limit_per_user', 'status', 'status_display',
+            'sort_order', 'is_hot', 'is_new',
+            'virtual_content', 'validity_days',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'sales_count', 'created_at', 'updated_at']
+
+
+class IntegralOrderAdminSerializer(serializers.ModelSerializer):
+    """积分订单管理序列化器（平台后台）
+
+    在用户版基础上补充下单用户信息，便于后台识别；纯展示用，
+    状态流转（发货/完成/取消）走 AdminIntegralOrderViewSet 的动作接口。
+    """
+    user_info = serializers.SerializerMethodField()
+    product_info = IntegralProductListSerializer(source='product', read_only=True)
+    address_info = UserAddressSerializer(source='address', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = IntegralOrder
+        fields = [
+            'id', 'order_no', 'user_info', 'product_info', 'product_snapshot',
+            'quantity', 'integral_cost', 'status', 'status_display',
+            'address_info', 'receiver_name', 'receiver_phone', 'receiver_address',
+            'express_company', 'express_no', 'user_remark', 'admin_remark',
+            'created_at', 'shipped_at', 'completed_at', 'cancelled_at',
+        ]
+
+    def get_user_info(self, obj):
+        user = obj.user
+        return {
+            'id': user.id,
+            'display_name': getattr(user, 'display_name', None) or getattr(user, 'username', None),
+        }

@@ -1,26 +1,49 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2025/8/25 16:09
-# @Author  : Delock
-
+# bill/urls.py
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+from . import views
 
-from bill.views import (
-    ServiceOrderViewSet,
-    wechat_callback,
-    CreatePaymentView, QueryPaymentView
-)
+# ── 用户端 ──
+user_router = DefaultRouter()
+user_router.register('product-orders', views.UserProductOrderViewSet, basename='user-product-order')
+user_router.register('service-orders', views.UserServiceOrderViewSet, basename='user-service-order')
 
-# 创建路由器
-router = DefaultRouter()
-router.register(r'service-orders', ServiceOrderViewSet, basename='serviceorder')
+# ── 商家端 ──
+merchant_router = DefaultRouter()
+merchant_router.register('product-orders', views.MerchantProductOrderViewSet, basename='merchant-product-order')
+merchant_router.register('service-orders', views.MerchantServiceOrderViewSet, basename='merchant-service-order')
+
+# ── 员工端 ──
+staff_router = DefaultRouter()
+staff_router.register('service-orders', views.StaffServiceOrderViewSet, basename='staff-service-order')
+
+# ── 管理端 ──
+admin_router = DefaultRouter()
+admin_router.register('product-orders', views.AdminProductOrderViewSet, basename='admin-product-order')
+admin_router.register('service-orders', views.AdminServiceOrderViewSet, basename='admin-service-order')
+admin_router.register('order-logs', views.AdminOrderLogViewSet, basename='admin-order-log')
 
 urlpatterns = [
-    # API路由
-    path('', include(router.urls)),
+    # ── 用户端 ──
+    path('user/order-counts/', views.UserOrderCountsView.as_view(), name='user-order-counts'),
+    path('user/', include(user_router.urls)),
 
-    # 支付相关
-    path('wechat_callback/<str:callback_type>/', wechat_callback, name='wechat_callback'),
-    path('wechatpay/create_payment/', CreatePaymentView.as_view(), name='create_payment'),
-    path('wechatpay/query/', QueryPaymentView.as_view(), name='query_payment'),
+    # ── 商家端 ──
+    # ★ 商家首页统计(放在 merchant_router 前面,避免被 router 拦截)
+    path('merchant/dashboard-stats/',
+         views.MerchantDashboardStatsView.as_view(),
+         name='merchant-dashboard-stats'),
+
+    # ★ 统一核销接口(同样放在 router 前)
+    path('merchant/orders/verify-by-code/',
+         views.MerchantUnifiedVerifyView.as_view(),
+         name='merchant-unified-verify'),
+
+    path('merchant/', include(merchant_router.urls)),
+
+    # ── 员工端 ──
+    path('staff/', include(staff_router.urls)),
+
+    # ── 管理端 ──
+    path('admin/', include(admin_router.urls)),
 ]

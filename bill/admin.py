@@ -1,352 +1,227 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2025/11/04
-# @Author  : Modified for better order flow
+# orders/admin.py
 
 from django.contrib import admin
-from django.utils.html import format_html
-from django.utils.safestring import mark_safe
-from .models import ServiceOrder, Bill
+from .models import (
+    ProductOrder, ProductOrderItem,
+    ServiceOrder, ServiceOrderItem,
+    OrderTransfer, OrderLog,
+)
 
 
-class PetServiceRecordInline(admin.StackedInline):
-    """服务记录内联编辑"""
-    from pet.models import PetServiceRecord
-    model = PetServiceRecord
+# ── 内联 ──
+
+class ProductOrderItemInline(admin.TabularInline):
+    model = ProductOrderItem
     extra = 0
-    max_num = 1
-    can_delete = False
-
-    fieldsets = (
-        ('服务时间', {
-            'fields': ('actual_start_time', 'actual_end_time', 'actual_duration')
-        }),
-        ('宠物状况', {
-            'fields': ('pet_condition_before', 'pet_condition_after', 'pet_behavior_notes')
-        }),
-        ('服务结果', {
-            'fields': ('service_summary', 'professional_recommendations', 'next_service_suggestion')
-        }),
-        ('媒体记录', {
-            'fields': ('before_images', 'after_images', 'process_videos'),
-            'classes': ('collapse',)
-        }),
-        ('客户反馈', {
-            'fields': ('customer_feedback', 'rating')
-        }),
-        ('其他', {
-            'fields': ('special_notes', 'related_diary'),
-            'classes': ('collapse',)
-        }),
-    )
-
-    readonly_fields = ['actual_duration']
-    autocomplete_fields = ['related_diary']
-
-    verbose_name = '服务记录'
-    verbose_name_plural = '服务记录'
+    readonly_fields = ['item_amount']
+    fields = [
+        'product_id', 'sku_id', 'product_name', 'product_image',
+        'sku_text', 'unit_price', 'quantity', 'item_amount',
+    ]
 
 
-@admin.register(ServiceOrder)
-class ServiceOrderAdmin(admin.ModelAdmin):
-    """服务订单管理"""
+class ServiceOrderItemInline(admin.TabularInline):
+    model = ServiceOrderItem
+    extra = 0
+    readonly_fields = ['item_amount']
+    fields = [
+        'service_id', 'service_name', 'service_image',
+        'service_type', 'service_mode', 'spec_name',
+        'price_unit', 'duration_minutes',
+        'unit_price', 'quantity', 'item_amount',
+    ]
 
+
+class OrderTransferInline(admin.TabularInline):
+    model = OrderTransfer
+    extra = 0
+    readonly_fields = ['created_at', 'confirmed_at']
+    fields = [
+        'sequence', 'from_staff', 'to_staff',
+        'initiated_by', 'transfer_type', 'reason',
+        'status', 'confirm_deadline', 'confirmed_at', 'created_at',
+    ]
+
+
+# ══════ 商品订单 ══════
+
+@admin.register(ProductOrder)
+class ProductOrderAdmin(admin.ModelAdmin):
     list_display = [
-        'id', 'user_info', 'base_service_info', 'pets_count',
-        'scheduled_datetime', 'status_badge', 'price_info',
-        'has_service_record', 'created_at'
+        'order_no', 'user', 'merchant_name', 'pay_amount',
+        'status', 'delivery_type',
+        'receiver_name', 'receiver_community',
+        'paid_at', 'created_at',
     ]
-    list_filter = ['status', 'scheduled_date', 'created_at', 'province', 'city']
-    search_fields = ['user__username', 'contact_phone', 'contact_name', 'service_address']
-    readonly_fields = [
-        'base_price', 'additional_price', 'total_price', 'final_price',
-        'created_at', 'updated_at', 'paid_at', 'completed_at'
+    list_filter = ['status', 'delivery_type', 'created_at']
+    search_fields = [
+        'order_no', 'merchant_name',
+        'receiver_name', 'receiver_phone',
+        'receiver_community', 'shipping_no', 'verify_code',
     ]
+    list_per_page = 30
+    raw_id_fields = ['user', 'verified_by_staff']
+    inlines = [ProductOrderItemInline]
+    readonly_fields = ['order_no', 'created_at', 'updated_at']
 
     fieldsets = (
         ('基本信息', {
-            'fields': ('user', 'staff', 'status')
+            'fields': ('order_no', 'user', 'merchant_id', 'merchant_name', 'status')
         }),
-        ('服务内容', {
-            'fields': ('base_service', 'additional_services', 'pets')
-        }),
-        ('服务时间', {
-            'fields': ('scheduled_date', 'scheduled_time', 'duration_minutes')
-        }),
-        ('地址信息', {
+        ('金额', {
             'fields': (
-                'province', 'city', 'district',
-                'service_address', 'contact_phone', 'contact_name'
+                'total_amount', 'freight_amount', 'discount_amount',
+                'coin_deduct_amount', 'coins_deducted', 'pay_amount',
+                'points_earned', 'gold_earned',
             )
         }),
-        ('价格信息', {
+        ('配送方式', {
             'fields': (
-                'base_price', 'additional_price', 'total_price',
-                'discount_amount', 'final_price'
+                'delivery_type',
+                'pickup_address', 'pickup_contact', 'pickup_deadline',
             )
         }),
-        ('备注信息', {
-            'fields': ('customer_notes', 'staff_notes', 'cancel_reason'),
-            'classes': ('collapse',)
+        ('收货地址', {
+            'fields': (
+                'receiver_name', 'receiver_phone', 'receiver_address_type',
+                'receiver_province', 'receiver_city', 'receiver_district',
+                'receiver_community', 'receiver_building', 'receiver_unit', 'receiver_room',
+                'receiver_street', 'receiver_house_number',
+                'receiver_address', 'receiver_access',
+            )
         }),
-        ('时间信息', {
-            'fields': ('created_at', 'updated_at', 'paid_at', 'completed_at'),
-            'classes': ('collapse',)
+        ('物流', {
+            'fields': ('shipping_company', 'shipping_no', 'shipped_at')
+        }),
+        ('核销', {
+            'fields': (
+                'verify_code', 'verify_expire_at',
+                'verified_at', 'verified_by_staff',
+            )
+        }),
+        ('其他', {
+            'fields': ('remark', 'cancel_reason', 'is_reviewed', 'reviewed_at')
+        }),
+        ('时间', {
+            'fields': ('paid_at', 'completed_at', 'created_at', 'updated_at'),
+            'classes': ('collapse',),
         }),
     )
 
-    filter_horizontal = ['pets', 'additional_services']
 
-    # 添加服务记录内联
-    inlines = [PetServiceRecordInline]
+# ══════ 服务订单 ══════
 
-    def user_info(self, obj):
-        """用户信息"""
-        return format_html(
-            '<strong>{}</strong><br/><small>{}</small>',
-            obj.user.username,
-            obj.contact_phone
-        )
-
-    user_info.short_description = '用户信息'
-
-    def base_service_info(self, obj):
-        """基础服务信息"""
-        return format_html(
-            '{}<br/><small>¥{}</small>',
-            obj.base_service.name,
-            obj.base_price
-        )
-
-    base_service_info.short_description = '基础服务'
-
-    def pets_count(self, obj):
-        """宠物数量"""
-        count = obj.pets.count()
-        pets_names = ', '.join([pet.name or '未命名' for pet in obj.pets.all()[:3]])
-        if count > 3:
-            pets_names += '...'
-        return format_html(
-            '<span title="{}">{} 只</span>',
-            pets_names,
-            count
-        )
-
-    pets_count.short_description = '宠物'
-
-    def scheduled_datetime(self, obj):
-        """预约时间"""
-        return format_html(
-            '{}<br/><small>{}</small>',
-            obj.scheduled_date,
-            obj.scheduled_time
-        )
-
-    scheduled_datetime.short_description = '预约时间'
-
-    def status_badge(self, obj):
-        """状态徽章"""
-        status_colors = {
-            'draft': '#6c757d',  # 灰色
-            'paid': '#17a2b8',  # 青色
-            'confirmed': '#007bff',  # 蓝色
-            'assigned': '#ffc107',  # 黄色
-            'in_progress': '#fd7e14',  # 橙色
-            'completed': '#28a745',  # 绿色
-            'cancelled': '#dc3545',  # 红色
-            'refunded': '#6f42c1',  # 紫色
-        }
-        color = status_colors.get(obj.status, '#6c757d')
-        return format_html(
-            '<span style="background-color: {}; color: white; padding: 3px 8px; '
-            'border-radius: 3px; font-size: 12px;">{}</span>',
-            color,
-            obj.get_status_display()
-        )
-
-    status_badge.short_description = '状态'
-
-    def price_info(self, obj):
-        """价格信息"""
-        if obj.discount_amount > 0:
-            return format_html(
-                '<span style="text-decoration: line-through; color: #999;">¥{}</span><br/>'
-                '<strong style="color: #dc3545;">¥{}</strong>',
-                obj.total_price,
-                obj.final_price
-            )
-        else:
-            return format_html(
-                '<strong>¥{}</strong>',
-                obj.final_price
-            )
-
-    price_info.short_description = '价格'
-
-    def has_service_record(self, obj):
-        """是否有服务记录"""
-        has_record = hasattr(obj, 'service_record') and obj.service_record is not None
-        return format_html(
-            '<span style="color: {};">{}</span>',
-            '#52c41a' if has_record else '#d9d9d9',
-            '✓' if has_record else '✗'
-        )
-
-    has_service_record.short_description = '服务记录'
-
-    def get_queryset(self, request):
-        """优化查询"""
-        queryset = super().get_queryset(request)
-        return queryset.select_related(
-            'user', 'staff', 'base_service', 'service_record'
-        ).prefetch_related('pets', 'additional_services')
-
-
-@admin.register(Bill)
-class BillAdmin(admin.ModelAdmin):
-    """账单管理"""
-
+@admin.register(ServiceOrder)
+class ServiceOrderAdmin(admin.ModelAdmin):
     list_display = [
-        'out_trade_no', 'user_info', 'transaction_info',
-        'amount_display', 'payment_method_display',
-        'status_badge', 'created_at'
+        'order_no', 'user', 'merchant_name',
+        'service_type', 'service_mode',
+        'pay_amount', 'status',
+        'receiver_name', 'receiver_community',
+        'assigned_staff', 'is_urgent',
+        'appointment_date', 'created_at',
     ]
-    list_filter = [
-        'transaction_type', 'payment_method', 'payment_status',
-        'created_at', 'paid_at'
-    ]
+    list_filter = ['status', 'service_type', 'service_mode', 'is_urgent', 'created_at']
     search_fields = [
-        'out_trade_no', 'third_party_no',
-        'user__username', 'description'
+        'order_no', 'merchant_name',
+        'receiver_name', 'receiver_phone',
+        'receiver_community', 'verify_code',
     ]
-    readonly_fields = [
-        'out_trade_no', 'created_at', 'updated_at', 'paid_at'
-    ]
+    list_per_page = 30
+    raw_id_fields = ['user', 'assigned_staff', 'verified_by_staff']
+    inlines = [ServiceOrderItemInline, OrderTransferInline]
+    readonly_fields = ['order_no', 'verify_code', 'created_at', 'updated_at']
 
     fieldsets = (
-        ('订单信息', {
-            'fields': ('out_trade_no', 'third_party_no', 'service_order')
-        }),
-        ('用户信息', {
-            'fields': ('user',)
-        }),
-        ('交易信息', {
+        ('基本信息', {
             'fields': (
-                'transaction_type', 'amount', 'payment_method',
-                'payment_status', 'description'
+                'order_no', 'user', 'merchant_id', 'merchant_name',
+                'service_type', 'service_mode', 'schedule_type', 'status',
             )
         }),
-        ('退款信息', {
-            'fields': ('refund_amount', 'refund_reason', 'original_bill'),
-            'classes': ('collapse',)
+        ('金额', {
+            'fields': (
+                'total_amount', 'discount_amount',
+                'coin_deduct_amount', 'coins_deducted',
+                'deposit_amount', 'pay_amount',
+                'is_urgent', 'urgent_surcharge',
+                'points_earned', 'gold_earned',
+            )
         }),
-        ('失败信息', {
-            'fields': ('failure_reason',),
-            'classes': ('collapse',)
+        ('上门地址', {
+            'fields': (
+                'receiver_name', 'receiver_phone', 'receiver_address_type',
+                'receiver_province', 'receiver_city', 'receiver_district',
+                'receiver_community', 'receiver_building', 'receiver_unit', 'receiver_room',
+                'receiver_street', 'receiver_house_number',
+                'receiver_address', 'receiver_access',
+                'receiver_lng', 'receiver_lat',
+            )
         }),
-        ('时间信息', {
-            'fields': ('created_at', 'updated_at', 'paid_at', 'expired_at'),
-            'classes': ('collapse',)
+        ('预约', {
+            'fields': (
+                'appointment_date', 'appointment_start', 'appointment_end',
+                'time_slot_id',
+            )
+        }),
+        ('派单 & 转单', {
+            'fields': (
+                'assigned_staff', 'assigned_at',
+                'transfer_count', 'max_transfer_count',
+            )
+        }),
+        ('核销', {
+            'fields': (
+                'verify_code', 'verify_expire_at',
+                'verified_at', 'verified_by_staff',
+            )
+        }),
+        ('其他', {
+            'fields': ('extra_info', 'remark', 'cancel_reason', 'is_reviewed', 'reviewed_at')
+        }),
+        ('时间', {
+            'fields': (
+                'paid_at', 'service_start_at', 'service_end_at',
+                'completed_at', 'created_at', 'updated_at',
+            ),
+            'classes': ('collapse',),
         }),
     )
 
-    def user_info(self, obj):
-        """用户信息"""
-        return format_html(
-            '<strong>{}</strong>',
-            obj.user.username
-        )
 
-    user_info.short_description = '用户'
+# ══════ 转单记录 ══════
 
-    def transaction_info(self, obj):
-        """交易信息"""
-        if obj.service_order:
-            return format_html(
-                '{}<br/><small>订单#{}</small>',
-                obj.get_transaction_type_display(),
-                obj.service_order.id
-            )
-        else:
-            return obj.get_transaction_type_display()
+@admin.register(OrderTransfer)
+class OrderTransferAdmin(admin.ModelAdmin):
+    list_display = [
+        'order', 'sequence', 'from_staff', 'to_staff',
+        'initiated_by', 'transfer_type', 'status', 'created_at',
+    ]
+    list_filter = ['status', 'initiated_by', 'transfer_type']
+    search_fields = ['order__order_no']
+    list_per_page = 30
+    raw_id_fields = ['order', 'from_staff', 'to_staff']
+    readonly_fields = ['created_at', 'confirmed_at']
 
-    transaction_info.short_description = '交易类型'
 
-    def amount_display(self, obj):
-        """金额显示"""
-        if obj.transaction_type == 'refund':
-            return format_html(
-                '<strong style="color: #dc3545;">-¥{}</strong>',
-                obj.amount
-            )
-        else:
-            return format_html(
-                '<strong style="color: #28a745;">¥{}</strong>',
-                obj.amount
-            )
+# ══════ 订单日志 ══════
 
-    amount_display.short_description = '金额'
+@admin.register(OrderLog)
+class OrderLogAdmin(admin.ModelAdmin):
+    list_display = [
+        'order_no', 'order_type', 'action',
+        'operator_type', 'operator_name', 'description',
+        'created_at',
+    ]
+    list_filter = ['order_type', 'action', 'operator_type', 'created_at']
+    search_fields = ['order_no', 'operator_name', 'description']
+    list_per_page = 50
 
-    def payment_method_display(self, obj):
-        """支付方式"""
-        icons = {
-            'wechat': '💚',
-            'alipay': '💙',
-            'balance': '💰',
-            'cash': '💵',
-            'other': '❓'
-        }
-        icon = icons.get(obj.payment_method, '❓')
-        return format_html(
-            '{} {}',
-            icon,
-            obj.get_payment_method_display()
-        )
+    def has_add_permission(self, request):
+        return False
 
-    payment_method_display.short_description = '支付方式'
+    def has_change_permission(self, request, obj=None):
+        return False
 
-    def status_badge(self, obj):
-        """状态徽章"""
-        status_colors = {
-            'pending': '#ffc107',  # 黄色
-            'processing': '#17a2b8',  # 青色
-            'success': '#28a745',  # 绿色
-            'failed': '#dc3545',  # 红色
-            'cancelled': '#6c757d',  # 灰色
-            'refunded': '#6f42c1',  # 紫色
-        }
-        color = status_colors.get(obj.payment_status, '#6c757d')
-        return format_html(
-            '<span style="background-color: {}; color: white; padding: 3px 8px; '
-            'border-radius: 3px; font-size: 12px;">{}</span>',
-            color,
-            obj.get_payment_status_display()
-        )
-
-    status_badge.short_description = '支付状态'
-
-    def get_queryset(self, request):
-        """优化查询"""
-        queryset = super().get_queryset(request)
-        return queryset.select_related('user', 'service_order', 'original_bill')
-
-    actions = ['mark_as_success', 'mark_as_failed']
-
-    def mark_as_success(self, request, queryset):
-        """批量标记为成功"""
-        count = 0
-        for bill in queryset.filter(payment_status='pending'):
-            bill.mark_as_paid()
-            count += 1
-        self.message_user(request, '成功标记 {} 条账单为已支付'.format(count))
-
-    mark_as_success.short_description = '标记为支付成功'
-
-    def mark_as_failed(self, request, queryset):
-        """批量标记为失败"""
-        count = queryset.filter(payment_status='pending').update(
-            payment_status='failed',
-            failure_reason='管理员手动标记为失败'
-        )
-        self.message_user(request, '成功标记 {} 条账单为支付失败'.format(count))
-
-    mark_as_failed.short_description = '标记为支付失败'
+    def has_delete_permission(self, request, obj=None):
+        return False

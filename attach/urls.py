@@ -11,10 +11,16 @@ from attach import views
 router = DefaultRouter()
 router.register(r'', views.BannerViewSet, basename='banner')
 
+# 管理员路由器（新增）
+admin_router = DefaultRouter()
+admin_router.register(r'', views.BannerAdminViewSet, basename='banner-admin')
+
 # URL配置
 urlpatterns = [
     # ViewSet自动生成的路由
     path('banners/', include(router.urls)),
+
+    path('admin/banners/', include(admin_router.urls)),
 
 ]
 

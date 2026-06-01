@@ -1,11 +1,11 @@
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q
+from django.db.models import Q, Count, Avg
 
 from utils.authentication import UserAuthentication
+from utils.permission import IsUser, IsResourceOwner, IsAuthorOrReadOnly, AllowAny, IsServiceProvider
 from .models import PetCategory, Pet, PetDiary, PetServiceRecord
 from .serializers import (
     PetCategorySerializer, PetListSerializer, PetDetailSerializer,
@@ -14,17 +14,18 @@ from .serializers import (
     PetServiceRecordCreateSerializer
 )
 from .filters import PetFilter, PetDiaryFilter, PetServiceRecordFilter
-from pet.permissions import IsOwnerOrReadOnly, IsPetOwner, IsServiceProvider
 
 
 class PetCategoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    宠物分类视图集（只读）
+    宠物分类视图集（只读，公开参考数据）
     list: 获取分类列表
     retrieve: 获取分类详情
     """
     queryset = PetCategory.objects.filter(is_active=True)
     serializer_class = PetCategorySerializer
+    authentication_classes = [UserAuthentication]
+    permission_classes = [AllowAny]
     filter_backends = [filters.OrderingFilter]
     ordering_fields = ['sort_order', 'created_at']
     ordering = ['sort_order']
@@ -32,15 +33,18 @@ class PetCategoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 class PetViewSet(viewsets.ModelViewSet):
     """
-    宠物信息视图集
+    宠物信息视图集（用户隐私数据，仅主人可见 / 可管理）
     list: 获取当前用户的宠物列表
     retrieve: 获取宠物详情
     create: 创建宠物
     update/partial_update: 更新宠物信息
     destroy: 删除宠物（软删除）
+
+    权限：IsUser（登录普通用户）+ IsResourceOwner（对象级，认 owner 字段）。
+    get_queryset 已限定到本人宠物，IsResourceOwner 在对象级再兜底一层。
     """
-    permission_classes = [IsAuthenticated, IsPetOwner]
     authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser, IsResourceOwner]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = PetFilter
     search_fields = ['name', 'breed']
@@ -49,8 +53,7 @@ class PetViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """只返回当前用户的宠物"""
-        user = self.request.user
-        return Pet.objects.filter(owner=user, is_deleted=False)
+        return Pet.objects.filter(owner=self.request.user, is_deleted=False)
 
     def get_serializer_class(self):
         """根据不同操作返回不同的序列化器"""
@@ -61,7 +64,7 @@ class PetViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """软删除"""
         instance.is_deleted = True
-        instance.save()
+        instance.save(update_fields=['is_deleted', 'updated_at'])
 
     @action(detail=True, methods=['get'])
     def diaries(self, request, pk=None):
@@ -101,40 +104,50 @@ class PetViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def statistics(self, request):
-        """获取宠物统计信息"""
-        user = request.user
-        pets = Pet.objects.filter(owner=user, is_deleted=False)
+        """获取宠物统计信息（用 values+annotate 聚合，避免逐个 pet 查 category 的 N+1）"""
+        pets = Pet.objects.filter(owner=request.user, is_deleted=False)
 
-        stats = {
-            'total_pets': pets.count(),
-            'category_distribution': {},
-            'gender_distribution': {
-                'M': pets.filter(gender='M').count(),
-                'F': pets.filter(gender='F').count(),
-                'U': pets.filter(gender='U').count(),
-            }
+        category_distribution = {
+            row['category__name']: row['count']
+            for row in pets.values('category__name').annotate(count=Count('id'))
+        }
+        gender_counts = {
+            row['gender']: row['count']
+            for row in pets.values('gender').annotate(count=Count('id'))
         }
 
-        # 按分类统计
-        for pet in pets:
-            category_name = pet.category.name
-            stats['category_distribution'][category_name] = \
-                stats['category_distribution'].get(category_name, 0) + 1
-
-        return Response(stats)
+        return Response({
+            'total_pets': pets.count(),
+            'category_distribution': category_distribution,
+            'gender_distribution': {
+                'M': gender_counts.get('M', 0),
+                'F': gender_counts.get('F', 0),
+                'U': gender_counts.get('U', 0),
+            }
+        })
 
 
 class PetDiaryViewSet(viewsets.ModelViewSet):
     """
-    宠物日记视图集
+    宠物日记视图集（仅主人可见；作者本人可写）
     list: 获取日记列表
     retrieve: 获取日记详情
     create: 创建日记
     update/partial_update: 更新日记
     destroy: 删除日记
+
+    权限：IsUser + IsAuthorOrReadOnly（对象级，认 author 字段，读放行）。
+    - 可见范围：get_queryset 限定为“自己宠物的日记”（含服务商为自己宠物写的服务日记）；
+    - 写权限：仅日记作者本人（IsAuthorOrReadOnly 在对象级强制）；
+    - “只能给自己的宠物建日记”：由 PetDiaryDetailSerializer.validate_pet 校验；
+    - author：由序列化器 create() 自动写入当前登录用户。
+
+    注意：原先 perform_create/update/destroy 里 `return Response(403...)` 是无效的
+    （DRF 会忽略这三个方法的返回值，403 从不真正生效，保存/删除照常发生），已移除，
+    改由权限类 + 序列化器校验来保证。
     """
-    permission_classes = [IsAuthenticated, IsOwnerOrReadOnly]
     authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser, IsAuthorOrReadOnly]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = PetDiaryFilter
     search_fields = ['title', 'content']
@@ -143,50 +156,16 @@ class PetDiaryViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """只返回用户自己宠物的日记"""
-        user = self.request.user
-        # 用户只能看到自己宠物的日记
-        return PetDiary.objects.filter(pet__owner=user)
+        return PetDiary.objects.filter(pet__owner=self.request.user)
 
     def get_serializer_class(self):
         if self.action == 'list':
             return PetDiaryListSerializer
         return PetDiaryDetailSerializer
 
-    def perform_create(self, serializer):
-        """创建日记时验证权限"""
-        pet = serializer.validated_data['pet']
-        user = self.request.user
-
-        # 确保只能为自己的宠物创建日记
-        if pet.owner != user:
-            return Response(
-                {'error': '您没有权限为该宠物创建日记'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        serializer.save(author=user)
-
-    def perform_update(self, serializer):
-        """只有作者可以更新日记"""
-        if serializer.instance.author != self.request.user:
-            return Response(
-                {'error': '您没有权限修改该日记'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        serializer.save()
-
-    def perform_destroy(self, instance):
-        """只有作者可以删除日记"""
-        if instance.author != self.request.user:
-            return Response(
-                {'error': '您没有权限删除该日记'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        instance.delete()
-
     @action(detail=False, methods=['get'])
     def my_diaries(self, request):
-        """获取当前用户创建的所有日记"""
+        """获取当前用户创建（author 为本人）的所有日记"""
         diaries = PetDiary.objects.filter(author=request.user)
 
         page = self.paginate_queryset(diaries)
@@ -203,10 +182,22 @@ class PetServiceRecordViewSet(viewsets.ModelViewSet):
     宠物服务记录视图集
     list: 获取服务记录列表
     retrieve: 获取服务记录详情
-    create: 创建服务记录（仅服务提供者）
-    update/partial_update: 更新服务记录
+    create: 创建服务记录（仅服务人员 Staff）
+    update/partial_update: 更新服务记录（仅服务人员）
+    add_feedback: 客户添加反馈/评分
+    my_records / statistics: 服务人员视角
+
+    权限：IsServiceProvider（对象级区分：主人只读+反馈、服务人员可读写）。
+
+    ⚠️ 认证说明：本视图同时服务“宠物主人(User)”和“服务人员(Staff)”两类主体。
+    下面只挂了 UserAuthentication —— 如果你的 Staff 走独立认证类（如 StaffAuthentication），
+    需要写成：
+        authentication_classes = [UserAuthentication, StaffAuthentication]
+    否则 Staff 端的 create / my_records / statistics 会因未认证而 401。
+    （若项目用的是能同时认证 User 和 Staff 的全局默认认证，则可改为删掉这一行、沿用默认。）
     """
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsServiceProvider]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = PetServiceRecordFilter
     ordering_fields = ['actual_start_time', 'created_at', 'rating']
@@ -215,17 +206,13 @@ class PetServiceRecordViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         宠物主人：查看自己宠物的服务记录
-        服务提供者：查看自己创建的服务记录
-        管理员：查看所有记录
+        服务人员：查看自己负责订单的服务记录
         """
         user = self.request.user
-
-
-        # 宠物主人看自己宠物的记录 或 服务提供者看自己创建的记录
         return PetServiceRecord.objects.filter(
             Q(related_order__pets__owner=user) |
             Q(related_order__staff=user)
-        ).distinct()
+        ).select_related('related_order', 'related_diary').distinct()
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -234,47 +221,51 @@ class PetServiceRecordViewSet(viewsets.ModelViewSet):
             return PetServiceRecordListSerializer
         return PetServiceRecordDetailSerializer
 
-    def perform_create(self, serializer):
-        """创建服务记录"""
-        serializer.save()
-
     @action(detail=True, methods=['post'])
     def add_feedback(self, request, pk=None):
-        """客户添加反馈和评分"""
+        """客户添加反馈和评分（仅订单客户本人）"""
         record = self.get_object()
 
-        # 验证是否是宠物主人
-        if record.related_order.customer != request.user:
+        # 仅订单客户（User）本人可反馈；用 isinstance 防止跨模型主键数值碰撞
+        customer = record.related_order.customer
+        if not (isinstance(request.user, type(customer))
+                and record.related_order.customer_id == getattr(request.user, 'id', None)):
             return Response(
                 {'error': '只有客户可以添加反馈'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        feedback = request.data.get('customer_feedback')
         rating = request.data.get('rating')
+        if rating is not None:
+            try:
+                rating = int(rating)
+            except (TypeError, ValueError):
+                return Response(
+                    {'error': '评分必须是 1-5 的整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if rating < 1 or rating > 5:
+                return Response(
+                    {'error': '评分必须在 1-5 之间'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            record.rating = rating
 
-        if rating and (rating < 1 or rating > 5):
-            return Response(
-                {'error': '评分必须在1-5之间'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
+        feedback = request.data.get('customer_feedback')
         if feedback:
             record.customer_feedback = feedback
-        if rating:
-            record.rating = rating
 
         record.save()
 
-        serializer = self.get_serializer(record)
+        serializer = PetServiceRecordDetailSerializer(record)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def my_records(self, request):
-        """获取当前用户作为服务提供者创建的服务记录"""
+        """服务人员：我负责（related_order.staff 为本人）的服务记录"""
         records = PetServiceRecord.objects.filter(
             related_order__staff=request.user
-        )
+        ).select_related('related_order', 'related_diary')
 
         page = self.paginate_queryset(records)
         if page is not None:
@@ -286,26 +277,24 @@ class PetServiceRecordViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def statistics(self, request):
-        """获取服务记录统计（服务提供者）"""
-        user = request.user
-        records = PetServiceRecord.objects.filter(related_order__staff=user)
+        """服务人员：服务统计（评分分布 / 平均分用数据库聚合，避免把全部记录拉进内存）"""
+        records = PetServiceRecord.objects.filter(related_order__staff=request.user)
 
-        stats = {
-            'total_records': records.count(),
-            'average_rating': 0,
-            'rating_distribution': {
-                '5': records.filter(rating=5).count(),
-                '4': records.filter(rating=4).count(),
-                '3': records.filter(rating=3).count(),
-                '2': records.filter(rating=2).count(),
-                '1': records.filter(rating=1).count(),
-            }
+        rated = records.exclude(rating__isnull=True)
+        rating_counts = {
+            str(row['rating']): row['count']
+            for row in rated.values('rating').annotate(count=Count('id'))
         }
+        avg = rated.aggregate(avg=Avg('rating'))['avg']
 
-        # 计算平均评分
-        rated_records = records.exclude(rating__isnull=True)
-        if rated_records.exists():
-            total_rating = sum([r.rating for r in rated_records])
-            stats['average_rating'] = round(total_rating / rated_records.count(), 2)
-
-        return Response(stats)
+        return Response({
+            'total_records': records.count(),
+            'average_rating': round(avg, 2) if avg is not None else 0,
+            'rating_distribution': {
+                '5': rating_counts.get('5', 0),
+                '4': rating_counts.get('4', 0),
+                '3': rating_counts.get('3', 0),
+                '2': rating_counts.get('2', 0),
+                '1': rating_counts.get('1', 0),
+            }
+        })

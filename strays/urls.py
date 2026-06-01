@@ -4,11 +4,14 @@
 
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+
 from .views import (
     StrayAnimalViewSet,
     StrayAnimalInteractionViewSet,
     StrayAnimalFavoriteViewSet,
-    StrayAnimalReportViewSet
+    StrayAnimalReportViewSet,
+    StrayAnimalAdminViewSet,
+    StrayAnimalReportAdminViewSet,
 )
 
 app_name = 'stray_animals'
@@ -19,6 +22,11 @@ router.register(r'interactions', StrayAnimalInteractionViewSet, basename='intera
 router.register(r'favorites', StrayAnimalFavoriteViewSet, basename='favorite')
 router.register(r'reports', StrayAnimalReportViewSet, basename='report')
 
+manager_router = DefaultRouter()
+manager_router.register(r'animals', StrayAnimalAdminViewSet, basename='manager-animal')
+manager_router.register(r'reports', StrayAnimalReportAdminViewSet, basename='manager-report')
+
 urlpatterns = [
     path('strays/', include(router.urls)),
+    path('manager/strays/', include(manager_router.urls)),
 ]
