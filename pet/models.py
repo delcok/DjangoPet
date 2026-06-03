@@ -1,13 +1,22 @@
 from django.db import models
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 from bill.models import ServiceOrder
 from user.models import User
 
 
 class PetCategory(models.Model):
-    """宠物分类"""
-    name = models.CharField(max_length=50, verbose_name="分类名称", unique=True)
+    """
+    宠物大类（一级分类）：狗 / 猫 / 兔 / 爬宠 / 鸟类 / 其他 ……
+    作为全生态平台的顶层物种分类，下面挂具体品种 PetBreed。
+    """
+    name = models.CharField(max_length=50, verbose_name="大类名称", unique=True)
+    code = models.SlugField(
+        max_length=30, unique=True, verbose_name="大类标识",
+        help_text="稳定英文标识，前端按它匹配身份入口：dog/cat/rabbit/reptile/bird/other"
+    )
     icon = models.URLField(verbose_name="分类图标", blank=True, null=True)
+    description = models.CharField(max_length=200, blank=True, default="", verbose_name="简介")
     sort_order = models.IntegerField(default=0, verbose_name="排序", db_index=True)
     is_active = models.BooleanField(default=True, verbose_name="是否启用")
     created_at = models.DateTimeField(default=timezone.now, verbose_name="创建时间")
@@ -15,12 +24,62 @@ class PetCategory(models.Model):
 
     class Meta:
         db_table = 'pet_category'
-        verbose_name = "宠物分类"
+        verbose_name = "宠物大类"
         verbose_name_plural = verbose_name
         ordering = ['sort_order', 'id']
 
     def __str__(self):
         return self.name
+
+
+class PetBreed(models.Model):
+    """
+    宠物品种（二级分类）：雪纳瑞 / 泰迪 属于「狗」；布偶 / 英短 属于「猫」。
+    属公开参考数据。
+    """
+    SIZE_CHOICES = [
+        ('mini', '迷你'),
+        ('small', '小型'),
+        ('medium', '中型'),
+        ('large', '大型'),
+        ('giant', '巨型'),
+    ]
+
+    category = models.ForeignKey(
+        PetCategory,
+        on_delete=models.CASCADE,
+        related_name='breeds',
+        verbose_name="所属大类"
+    )
+    name = models.CharField(max_length=80, verbose_name="品种名称")
+    alias = models.CharField(
+        max_length=200, blank=True, default="", verbose_name="别名/搜索词",
+        help_text="逗号分隔，用于搜索，如：贵宾,VIP,泰迪"
+    )
+    size = models.CharField(
+        max_length=10, choices=SIZE_CHOICES, blank=True, null=True, verbose_name="体型"
+    )
+    icon = models.URLField(blank=True, null=True, verbose_name="品种图标")
+    is_common = models.BooleanField(default=False, db_index=True, verbose_name="是否热门")
+    sort_order = models.IntegerField(default=0, db_index=True, verbose_name="排序")
+    is_active = models.BooleanField(default=True, verbose_name="是否启用")
+    created_at = models.DateTimeField(default=timezone.now, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        db_table = 'pet_breed'
+        verbose_name = "宠物品种"
+        verbose_name_plural = verbose_name
+        ordering = ['-is_common', 'sort_order', 'id']
+        constraints = [
+            models.UniqueConstraint(fields=['category', 'name'], name='uniq_breed_per_category')
+        ]
+        indexes = [
+            models.Index(fields=['category', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.category.name} / {self.name}"
 
 
 class Pet(models.Model):
@@ -30,6 +89,11 @@ class Pet(models.Model):
         ('F', '雌性'),
         ('U', '未知')
     ]
+    ADOPTION_PERIOD_CHOICES = [
+        ('under_3m', '不到3个月'),
+        ('over_3m', '3个月以上'),
+        ('unknown', '记不清了'),
+    ]
 
     owner = models.ForeignKey(
         User,
@@ -37,15 +101,32 @@ class Pet(models.Model):
         related_name='pets',
         verbose_name="主人"
     )
+    # 大类（必填）：快速建档只需选大类
     category = models.ForeignKey(
         PetCategory,
         on_delete=models.PROTECT,
         related_name='pets',
-        verbose_name="宠物分类"
+        verbose_name="大类"
     )
+    # 品种（选填，后续完善）：优先从品种库选；选不到时用 breed_name 自填
+    breed = models.ForeignKey(
+        PetBreed,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='pets',
+        verbose_name="品种"
+    )
+    breed_name = models.CharField(
+        max_length=80, blank=True, null=True, verbose_name="品种名称(快照/自定义)",
+        help_text="选了品种库会自动回填其名称；串串/未知/库里没有时可手填"
+    )
+
     name = models.CharField(max_length=50, verbose_name="宠物名称", blank=True, null=True)
-    breed = models.CharField(max_length=100, verbose_name="品种", blank=True, null=True)
     birth_date = models.DateField(verbose_name="出生日期", blank=True, null=True)
+    adoption_period = models.CharField(
+        max_length=10, choices=ADOPTION_PERIOD_CHOICES,
+        blank=True, null=True, verbose_name="到家时长"
+    )
     gender = models.CharField(
         max_length=1,
         choices=GENDER_CHOICES,
@@ -78,10 +159,29 @@ class Pet(models.Model):
         indexes = [
             models.Index(fields=['owner', '-created_at']),
             models.Index(fields=['category', 'is_deleted']),
+            models.Index(fields=['breed']),
         ]
 
     def __str__(self):
         return f"{self.name or '未命名'} ({self.owner.username})"
+
+    def clean(self):
+        # 品种必须属于所选大类（用于 admin / form 校验；API 侧由序列化器再校验一次）
+        if self.breed_id and self.category_id and self.breed.category_id != self.category_id:
+            raise ValidationError({'breed': '所选品种不属于该大类'})
+
+    def save(self, *args, **kwargs):
+        # 选了品种库 -> 回填名称快照（即便将来该品种被下架/删除，名称也不丢）
+        if self.breed_id:
+            self.breed_name = self.breed.name
+        super().save(*args, **kwargs)
+
+    @property
+    def breed_display(self):
+        """统一的品种展示：优先品种库名称，回退到自定义文本"""
+        if self.breed_id:
+            return self.breed.name
+        return self.breed_name or ''
 
     @property
     def age_months(self):
@@ -105,12 +205,27 @@ class Pet(models.Model):
 
 class PetDiary(models.Model):
     """
-    宠物日记 - 用户隐私数据，仅主人可见
-    包括用户日常记录 + 服务商服务记录
+    宠物日记 - 用户隐私数据，仅主人可见。
+    统一时间线：日常 / 记账 / 病历 / 服务记录（成长打卡可选），用 diary_type 区分。
+    类型相关的结构化字段按需填（amount 用于记账，next_visit_date 用于病历），
+    其余非通用字段塞进 extra(JSON)，避免后续频繁加列。
     """
     DIARY_TYPE_CHOICES = [
-        ('daily', '日常记录'),
+        ('daily', '日常'),
+        ('bill', '记账'),
+        ('medical', '病历'),
         ('service', '服务记录'),
+        ('growth', '成长'),   # 前端 tab 暂无，按需启用
+    ]
+
+    EXPENSE_TYPE_CHOICES = [
+        ('food', '食品零食'),
+        ('medical', '医疗'),
+        ('grooming', '洗护美容'),
+        ('supplies', '日用品'),
+        ('toy', '玩具'),
+        ('boarding', '寄养'),
+        ('other', '其他'),
     ]
 
     pet = models.ForeignKey(
@@ -132,6 +247,7 @@ class PetDiary(models.Model):
         max_length=10,
         choices=DIARY_TYPE_CHOICES,
         default='daily',
+        db_index=True,
         verbose_name="日记类型"
     )
 
@@ -141,8 +257,23 @@ class PetDiary(models.Model):
     videos = models.JSONField(default=list, blank=True, verbose_name="视频列表")
     cover_image = models.URLField(max_length=500, blank=True, default="", verbose_name="封面图片")
 
+    # ---- 记账(bill)专用，选填 ----
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="金额(元)"
+    )
+    expense_type = models.CharField(
+        max_length=20, choices=EXPENSE_TYPE_CHOICES, null=True, blank=True, verbose_name="消费类型"
+    )
+
+    # ---- 病历(medical)专用，选填 ----
+    hospital = models.CharField(max_length=100, blank=True, null=True, verbose_name="就诊机构")
+    next_visit_date = models.DateField(null=True, blank=True, verbose_name="复诊日期")
+
+    # ---- 类型相关的其它结构化数据（如成长记录的身高/体重），避免频繁加列 ----
+    extra = models.JSONField(default=dict, blank=True, verbose_name="附加数据")
+
     # 时间记录
-    diary_date = models.DateField(default=timezone.now, verbose_name="日记日期")
+    diary_date = models.DateField(default=timezone.now, db_index=True, verbose_name="日记日期")
     created_at = models.DateTimeField(default=timezone.now, verbose_name="创建时间")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
 
@@ -154,13 +285,20 @@ class PetDiary(models.Model):
         indexes = [
             models.Index(fields=['pet', '-diary_date']),
             models.Index(fields=['author', '-created_at']),
-            models.Index(fields=['diary_type', '-created_at']),
+            models.Index(fields=['pet', 'diary_type', '-diary_date']),  # tab 筛选高频路径
         ]
 
     def __str__(self):
         pet_name = self.pet.name or '未命名宠物'
         title = self.title or '无标题'
         return f"{pet_name}的日记 - {title}"
+
+    def save(self, *args, **kwargs):
+        # 没设封面时，自动用第一张图片（兼容 images 为字符串数组或 {url,...} 对象数组）
+        if not self.cover_image and isinstance(self.images, list) and self.images:
+            first = self.images[0]
+            self.cover_image = first.get('url', '') if isinstance(first, dict) else (first or '')
+        super().save(*args, **kwargs)
 
 
 class PetServiceRecord(models.Model):

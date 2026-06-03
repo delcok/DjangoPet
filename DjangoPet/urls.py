@@ -33,18 +33,18 @@ urlpatterns = [
 
 
     # 新加的
-    path('api/v1', include('address.urls')),
-    path('api/v1', include('attract.urls')),
-    path('api/v1', include('wallet.urls')),
-    path('api/v1', include('campaigns.urls')),
-    path('api/v1', include('comments.urls')),
-    path('api/v1', include('managers.urls')),
-    path('api/v1', include('merchants.urls')),
-    path('api/v1', include('pay.urls')),
-    path('api/v1', include('product.urls')),
-    path('api/v1', include('promotions.urls')),
-    path('api/v1', include('services.urls')),
-    path('api/v1', include('staffs.urls')),
-    path('api/v1', include('wallet.urls')),
-    path('api/v1', include('prize.urls'))
+    path('api/v1/', include('address.urls')),
+    path('api/v1/', include('attract.urls')),
+    path('api/v1/', include('wallet.urls')),
+    path('api/v1/', include('campaigns.urls')),
+    path('api/v1/', include('comments.urls')),
+    path('api/v1/', include('managers.urls')),
+    path('api/v1/', include('merchants.urls')),
+    path('api/v1/', include('pay.urls')),
+    path('api/v1/', include('product.urls')),
+    path('api/v1/', include('promotions.urls')),
+    path('api/v1/', include('services.urls')),
+    path('api/v1/', include('staffs.urls')),
+    path('api/v1/', include('wallet.urls')),
+    path('api/v1/', include('prize.urls'))
 ]

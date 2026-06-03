@@ -3,17 +3,32 @@
 # @Author  : Delock
 
 from rest_framework import serializers
-from .models import PetCategory, Pet, PetDiary, PetServiceRecord
+from .models import PetCategory, PetBreed, Pet, PetDiary, PetServiceRecord
+
+
+class PetBreedSerializer(serializers.ModelSerializer):
+    """宠物品种序列化器（公开参考数据）"""
+    size_display = serializers.CharField(source='get_size_display', read_only=True, allow_null=True)
+    category_name = serializers.CharField(source='category.name', read_only=True)
+
+    class Meta:
+        model = PetBreed
+        fields = [
+            'id', 'category', 'category_name', 'name', 'alias',
+            'size', 'size_display', 'icon', 'is_common', 'sort_order'
+        ]
 
 
 class PetCategorySerializer(serializers.ModelSerializer):
-    """宠物分类序列化器"""
+    """宠物大类序列化器"""
+    # breed_count 由视图集 annotate 注入，避免逐个分类查询品种数（N+1）
+    breed_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = PetCategory
         fields = [
-            'id', 'name', 'icon', 'sort_order',
-            'is_active', 'created_at', 'updated_at'
+            'id', 'name', 'code', 'icon', 'description', 'sort_order',
+            'is_active', 'breed_count', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
 
@@ -21,13 +36,15 @@ class PetCategorySerializer(serializers.ModelSerializer):
 class PetListSerializer(serializers.ModelSerializer):
     """宠物列表序列化器（简化版）"""
     category_name = serializers.CharField(source='category.name', read_only=True)
+    breed_display = serializers.CharField(read_only=True)
     age_display = serializers.SerializerMethodField()
     gender_display = serializers.CharField(source='get_gender_display', read_only=True)
 
     class Meta:
         model = Pet
         fields = [
-            'id', 'name', 'category', 'category_name', 'breed',
+            'id', 'name', 'category', 'category_name',
+            'breed', 'breed_display',
             'avatar', 'gender', 'gender_display', 'age_display',
             'created_at'
         ]
@@ -46,19 +63,25 @@ class PetListSerializer(serializers.ModelSerializer):
 class PetDetailSerializer(serializers.ModelSerializer):
     """宠物详情序列化器"""
     category_name = serializers.CharField(source='category.name', read_only=True)
+    breed_detail = PetBreedSerializer(source='breed', read_only=True)
+    breed_display = serializers.CharField(read_only=True)
     owner_name = serializers.CharField(source='owner.username', read_only=True)
     age_years = serializers.IntegerField(read_only=True)
     age_months = serializers.IntegerField(read_only=True)
     gender_display = serializers.CharField(source='get_gender_display', read_only=True)
+    adoption_period_display = serializers.CharField(
+        source='get_adoption_period_display', read_only=True, allow_null=True
+    )
 
     class Meta:
         model = Pet
         fields = [
             'id', 'owner', 'owner_name', 'category', 'category_name',
-            'name', 'breed', 'birth_date', 'gender', 'gender_display',
-            'weight', 'color', 'avatar', 'personality', 'health_status',
-            'vaccination_record', 'special_notes', 'age_years', 'age_months',
-            'created_at', 'updated_at'
+            'breed', 'breed_detail', 'breed_name', 'breed_display',
+            'name', 'birth_date', 'adoption_period', 'adoption_period_display',
+            'gender', 'gender_display', 'weight', 'color', 'avatar',
+            'personality', 'health_status', 'vaccination_record', 'special_notes',
+            'age_years', 'age_months', 'created_at', 'updated_at'
         ]
         read_only_fields = ['owner', 'created_at', 'updated_at', 'age_years', 'age_months']
 
@@ -73,12 +96,24 @@ class PetDetailSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("体重必须大于0")
         return value
 
+    def validate(self, data):
+        """品种必须属于所选大类（兼容创建/部分更新两种场景）"""
+        category = data.get('category') or getattr(self.instance, 'category', None)
+        # partial update 时 breed 可能没传，用实例已有值
+        breed = data['breed'] if 'breed' in data else getattr(self.instance, 'breed', None)
+        if breed and category and breed.category_id != category.id:
+            raise serializers.ValidationError({'breed': '所选品种不属于该大类'})
+        return data
+
 
 class PetDiaryListSerializer(serializers.ModelSerializer):
     """宠物日记列表序列化器"""
     pet_name = serializers.CharField(source='pet.name', read_only=True)
     author_name = serializers.CharField(source='author.username', read_only=True, allow_null=True)
     diary_type_display = serializers.CharField(source='get_diary_type_display', read_only=True)
+    expense_type_display = serializers.CharField(
+        source='get_expense_type_display', read_only=True, allow_null=True
+    )
     image_count = serializers.SerializerMethodField()
     video_count = serializers.SerializerMethodField()
 
@@ -87,6 +122,7 @@ class PetDiaryListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'pet', 'pet_name', 'author', 'author_name',
             'diary_type', 'diary_type_display', 'title', 'cover_image',
+            'amount', 'expense_type', 'expense_type_display',
             'diary_date', 'image_count', 'video_count', 'created_at'
         ]
 
@@ -102,14 +138,19 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
     pet_name = serializers.CharField(source='pet.name', read_only=True)
     author_name = serializers.CharField(source='author.username', read_only=True, allow_null=True)
     diary_type_display = serializers.CharField(source='get_diary_type_display', read_only=True)
+    expense_type_display = serializers.CharField(
+        source='get_expense_type_display', read_only=True, allow_null=True
+    )
 
     class Meta:
         model = PetDiary
         fields = [
             'id', 'pet', 'pet_name', 'author', 'author_name',
             'diary_type', 'diary_type_display', 'title', 'content',
-            'images', 'videos', 'cover_image', 'diary_date',
-            'created_at', 'updated_at'
+            'images', 'videos', 'cover_image',
+            'amount', 'expense_type', 'expense_type_display',
+            'hospital', 'next_visit_date', 'extra',
+            'diary_date', 'created_at', 'updated_at'
         ]
         read_only_fields = ['author', 'created_at', 'updated_at']
 
@@ -119,12 +160,7 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def validate_pet(self, value):
-        """验证宠物是否属于当前用户（只能给自己的宠物创建日记）
-
-        说明：旧版用 `user.type == 'admin'` 放行管理员，但新权限体系里管理员是
-        独立的 Manager 模型、走单独后台，普通 User 也没有 type 字段（会 AttributeError）。
-        故移除该判断，仅校验“宠物归属当前用户”。
-        """
+        """验证宠物是否属于当前用户（只能给自己的宠物创建日记）"""
         user = self.context['request'].user
         if value.owner_id != getattr(user, 'id', None):
             raise serializers.ValidationError("您没有权限为该宠物创建日记")
@@ -132,14 +168,20 @@ class PetDiaryDetailSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         """验证数据完整性"""
-        # 如果设置了封面图，确保它在图片列表中
+        # 如果设置了封面图，确保它在图片列表中（兼容字符串/对象数组）
         images = data.get('images')
         cover_image = data.get('cover_image')
-        if cover_image and images and len(images) > 0:
-            if cover_image not in images:
+        if cover_image and isinstance(images, list) and images:
+            urls = [(img.get('url') if isinstance(img, dict) else img) for img in images]
+            if cover_image not in urls:
                 raise serializers.ValidationError("封面图片必须在图片列表中")
 
+        # 记账类型建议带金额（仅提示性校验，按需可放开/收紧）
+        if data.get('diary_type') == 'bill' and data.get('amount') is None and not self.instance:
+            raise serializers.ValidationError({'amount': '记账请填写金额'})
+
         return data
+
 
 class PetServiceRecordListSerializer(serializers.ModelSerializer):
     """宠物服务记录列表序列化器"""
@@ -211,7 +253,7 @@ class PetServiceRecordDetailSerializer(serializers.ModelSerializer):
             return {
                 'id': pet.id,
                 'name': pet.name,
-                'breed': pet.breed,
+                'breed': pet.breed_display,
                 'avatar': pet.avatar,
                 'gender': pet.gender,
                 'gender_display': pet.get_gender_display()

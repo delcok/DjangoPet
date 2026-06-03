@@ -4,21 +4,45 @@
 
 import django_filters
 from django.db.models import Q
-from .models import Pet, PetDiary, PetServiceRecord
+from .models import Pet, PetBreed, PetDiary, PetServiceRecord
+
+
+class PetBreedFilter(django_filters.FilterSet):
+    """宠物品种过滤器"""
+    category = django_filters.NumberFilter(field_name='category__id')
+    category_code = django_filters.CharFilter(field_name='category__code')
+    size = django_filters.ChoiceFilter(choices=PetBreed.SIZE_CHOICES)
+    is_common = django_filters.BooleanFilter()
+    search = django_filters.CharFilter(method='filter_search')
+
+    class Meta:
+        model = PetBreed
+        fields = ['category', 'size', 'is_common']
+
+    def filter_search(self, queryset, name, value):
+        return queryset.filter(Q(name__icontains=value) | Q(alias__icontains=value))
 
 
 class PetFilter(django_filters.FilterSet):
     """宠物过滤器"""
 
-    # 分类过滤
+    # 大类过滤
     category = django_filters.NumberFilter(field_name='category__id')
+    category_code = django_filters.CharFilter(field_name='category__code')
     category_name = django_filters.CharFilter(
         field_name='category__name',
         lookup_expr='icontains'
     )
 
+    # 品种过滤（已改为外键）
+    breed = django_filters.NumberFilter(field_name='breed__id')
+    breed_name = django_filters.CharFilter(method='filter_breed_name')
+
     # 性别过滤
     gender = django_filters.ChoiceFilter(choices=Pet.GENDER_CHOICES)
+
+    # 到家时长
+    adoption_period = django_filters.ChoiceFilter(choices=Pet.ADOPTION_PERIOD_CHOICES)
 
     # 年龄范围过滤（按出生日期计算）
     min_age_months = django_filters.NumberFilter(method='filter_min_age')
@@ -27,9 +51,6 @@ class PetFilter(django_filters.FilterSet):
     # 体重范围过滤
     min_weight = django_filters.NumberFilter(field_name='weight', lookup_expr='gte')
     max_weight = django_filters.NumberFilter(field_name='weight', lookup_expr='lte')
-
-    # 品种过滤
-    breed = django_filters.CharFilter(lookup_expr='icontains')
 
     # 日期范围过滤
     created_after = django_filters.DateTimeFilter(
@@ -57,16 +78,21 @@ class PetFilter(django_filters.FilterSet):
     class Meta:
         model = Pet
         fields = [
-            'category', 'gender', 'breed',
+            'category', 'breed', 'gender',
             'min_weight', 'max_weight'
         ]
+
+    def filter_breed_name(self, queryset, name, value):
+        """品种名称模糊匹配：同时匹配品种库名称与自定义品种文本"""
+        return queryset.filter(
+            Q(breed__name__icontains=value) | Q(breed_name__icontains=value)
+        )
 
     def filter_min_age(self, queryset, name, value):
         """过滤最小年龄（月）"""
         from datetime import date
         from dateutil.relativedelta import relativedelta
 
-        # 计算对应的出生日期
         max_birth_date = date.today() - relativedelta(months=int(value))
         return queryset.filter(birth_date__lte=max_birth_date)
 
@@ -75,15 +101,15 @@ class PetFilter(django_filters.FilterSet):
         from datetime import date
         from dateutil.relativedelta import relativedelta
 
-        # 计算对应的出生日期
         min_birth_date = date.today() - relativedelta(months=int(value))
         return queryset.filter(birth_date__gte=min_birth_date)
 
     def filter_search(self, queryset, name, value):
-        """综合搜索：名称、品种、颜色"""
+        """综合搜索：名称、品种（库/自定义）、颜色"""
         return queryset.filter(
             Q(name__icontains=value) |
-            Q(breed__icontains=value) |
+            Q(breed__name__icontains=value) |
+            Q(breed_name__icontains=value) |
             Q(color__icontains=value)
         )
 
@@ -105,10 +131,18 @@ class PetDiaryFilter(django_filters.FilterSet):
         lookup_expr='icontains'
     )
 
-    # 日记类型
+    # 日记类型（daily/bill/medical/service/growth）
     diary_type = django_filters.ChoiceFilter(
         choices=PetDiary.DIARY_TYPE_CHOICES
     )
+
+    # 记账：消费类型 + 金额范围
+    expense_type = django_filters.ChoiceFilter(choices=PetDiary.EXPENSE_TYPE_CHOICES)
+    min_amount = django_filters.NumberFilter(field_name='amount', lookup_expr='gte')
+    max_amount = django_filters.NumberFilter(field_name='amount', lookup_expr='lte')
+
+    # 病历：是否有待复诊
+    has_next_visit = django_filters.BooleanFilter(method='filter_has_next_visit')
 
     # 日期范围过滤
     diary_date_after = django_filters.DateFilter(
@@ -144,7 +178,7 @@ class PetDiaryFilter(django_filters.FilterSet):
     class Meta:
         model = PetDiary
         fields = [
-            'pet', 'author', 'diary_type',
+            'pet', 'author', 'diary_type', 'expense_type',
             'year', 'month'
         ]
 
@@ -159,6 +193,12 @@ class PetDiaryFilter(django_filters.FilterSet):
         if value:
             return queryset.exclude(videos__isnull=True).exclude(videos=[])
         return queryset.filter(Q(videos__isnull=True) | Q(videos=[]))
+
+    def filter_has_next_visit(self, queryset, name, value):
+        """过滤是否设置了复诊日期"""
+        if value:
+            return queryset.exclude(next_visit_date__isnull=True)
+        return queryset.filter(next_visit_date__isnull=True)
 
     def filter_search(self, queryset, name, value):
         """综合搜索：标题、内容"""

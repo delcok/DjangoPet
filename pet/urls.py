@@ -6,6 +6,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     PetCategoryViewSet,
+    PetBreedViewSet,
     PetViewSet,
     PetDiaryViewSet,
     PetServiceRecordViewSet
@@ -16,6 +17,7 @@ router = DefaultRouter()
 
 # 注册视图集
 router.register(r'categories', PetCategoryViewSet, basename='pet-category')
+router.register(r'breeds', PetBreedViewSet, basename='pet-breed')
 router.register(r'pets', PetViewSet, basename='pet')
 router.register(r'diaries', PetDiaryViewSet, basename='pet-diary')
 router.register(r'service-records', PetServiceRecordViewSet, basename='pet-service-record')

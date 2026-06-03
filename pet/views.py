@@ -6,23 +6,24 @@ from django.db.models import Q, Count, Avg
 
 from utils.authentication import UserAuthentication
 from utils.permission import IsUser, IsResourceOwner, IsAuthorOrReadOnly, AllowAny, IsServiceProvider
-from .models import PetCategory, Pet, PetDiary, PetServiceRecord
+from .models import PetCategory, PetBreed, Pet, PetDiary, PetServiceRecord
 from .serializers import (
-    PetCategorySerializer, PetListSerializer, PetDetailSerializer,
+    PetCategorySerializer, PetBreedSerializer,
+    PetListSerializer, PetDetailSerializer,
     PetDiaryListSerializer, PetDiaryDetailSerializer,
     PetServiceRecordListSerializer, PetServiceRecordDetailSerializer,
     PetServiceRecordCreateSerializer
 )
-from .filters import PetFilter, PetDiaryFilter, PetServiceRecordFilter
+from .filters import PetFilter, PetBreedFilter, PetDiaryFilter, PetServiceRecordFilter
 
 
 class PetCategoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    宠物分类视图集（只读，公开参考数据）
-    list: 获取分类列表
-    retrieve: 获取分类详情
+    宠物大类视图集（只读，公开参考数据）
+    list: 获取大类列表（含各大类的品种数 breed_count）
+    retrieve: 获取大类详情
+    breeds: 获取该大类下的品种列表（/pet/categories/{id}/breeds/）
     """
-    queryset = PetCategory.objects.filter(is_active=True)
     serializer_class = PetCategorySerializer
     authentication_classes = [UserAuthentication]
     permission_classes = [AllowAny]
@@ -30,13 +31,56 @@ class PetCategoryViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ['sort_order', 'created_at']
     ordering = ['sort_order']
 
+    def get_queryset(self):
+        # annotate 注入 breed_count，避免序列化器逐个分类 count 品种（N+1）
+        return PetCategory.objects.filter(is_active=True).annotate(
+            breed_count=Count('breeds', filter=Q(breeds__is_active=True))
+        )
+
+    @action(detail=True, methods=['get'])
+    def breeds(self, request, pk=None):
+        """获取指定大类下的品种（支持 search 关键词，按热门+排序返回）"""
+        category = self.get_object()
+        qs = category.breeds.filter(is_active=True)
+
+        keyword = request.query_params.get('search')
+        if keyword:
+            qs = qs.filter(Q(name__icontains=keyword) | Q(alias__icontains=keyword))
+
+        qs = qs.order_by('-is_common', 'sort_order', 'id')
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = PetBreedSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = PetBreedSerializer(qs, many=True)
+        return Response(serializer.data)
+
+
+class PetBreedViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    宠物品种视图集（只读，公开参考数据）
+    list: 品种列表（可按 category 过滤、name/alias 搜索）
+    retrieve: 品种详情
+    """
+    queryset = PetBreed.objects.filter(is_active=True).select_related('category')
+    serializer_class = PetBreedSerializer
+    authentication_classes = [UserAuthentication]
+    permission_classes = [AllowAny]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = PetBreedFilter
+    search_fields = ['name', 'alias']
+    ordering_fields = ['sort_order', 'name', 'is_common']
+    ordering = ['-is_common', 'sort_order']
+
 
 class PetViewSet(viewsets.ModelViewSet):
     """
     宠物信息视图集（用户隐私数据，仅主人可见 / 可管理）
     list: 获取当前用户的宠物列表
     retrieve: 获取宠物详情
-    create: 创建宠物
+    create: 创建宠物（快速建档只需 category；品种等可后续完善）
     update/partial_update: 更新宠物信息
     destroy: 删除宠物（软删除）
 
@@ -47,13 +91,16 @@ class PetViewSet(viewsets.ModelViewSet):
     permission_classes = [IsUser, IsResourceOwner]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = PetFilter
-    search_fields = ['name', 'breed']
+    # breed 已改为外键：搜品种走 breed__name + 自定义 breed_name
+    search_fields = ['name', 'breed__name', 'breed_name']
     ordering_fields = ['created_at', 'name', 'birth_date']
     ordering = ['-created_at']
 
     def get_queryset(self):
         """只返回当前用户的宠物"""
-        return Pet.objects.filter(owner=self.request.user, is_deleted=False)
+        return Pet.objects.filter(
+            owner=self.request.user, is_deleted=False
+        ).select_related('category', 'breed')
 
     def get_serializer_class(self):
         """根据不同操作返回不同的序列化器"""
@@ -141,10 +188,6 @@ class PetDiaryViewSet(viewsets.ModelViewSet):
     - 写权限：仅日记作者本人（IsAuthorOrReadOnly 在对象级强制）；
     - “只能给自己的宠物建日记”：由 PetDiaryDetailSerializer.validate_pet 校验；
     - author：由序列化器 create() 自动写入当前登录用户。
-
-    注意：原先 perform_create/update/destroy 里 `return Response(403...)` 是无效的
-    （DRF 会忽略这三个方法的返回值，403 从不真正生效，保存/删除照常发生），已移除，
-    改由权限类 + 序列化器校验来保证。
     """
     authentication_classes = [UserAuthentication]
     permission_classes = [IsUser, IsAuthorOrReadOnly]
@@ -156,7 +199,7 @@ class PetDiaryViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """只返回用户自己宠物的日记"""
-        return PetDiary.objects.filter(pet__owner=self.request.user)
+        return PetDiary.objects.filter(pet__owner=self.request.user).select_related('pet', 'author')
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -194,7 +237,6 @@ class PetServiceRecordViewSet(viewsets.ModelViewSet):
     需要写成：
         authentication_classes = [UserAuthentication, StaffAuthentication]
     否则 Staff 端的 create / my_records / statistics 会因未认证而 401。
-    （若项目用的是能同时认证 User 和 Staff 的全局默认认证，则可改为删掉这一行、沿用默认。）
     """
     authentication_classes = [UserAuthentication]
     permission_classes = [IsServiceProvider]

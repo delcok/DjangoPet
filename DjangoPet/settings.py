@@ -42,12 +42,20 @@ MINI_PROGRAM_SETTINGS = {
     }
 }
 
+# 调试信息模式（True = 不真正发送短信，只打印日志）
+SMS_DEBUG_MODE = False
+
+# 阿里云配置
+ALIYUN_SMS_SIGN_NAME = env('ALIYUN_SMS_SIGN_NAME')
+
 # 配置阿里云
 ALIYUN_ACCESS_KEY_ID = env('ALIYUN_ACCESS_KEY_ID')
 ALIYUN_ACCESS_KEY_SECRET = env('ALIYUN_ACCESS_KEY_SECRET')
 
 CSRF_TRUSTED_ORIGINS = ['https://delock.top:8080', 'https://pet.yimengzhiyuan.com:8080','http://localhost:5173']
 
+# redis配置
+REDIS_PASSWORD = env('REDIS_PASSWORD')
 # Application definition
 
 INSTALLED_APPS = [
