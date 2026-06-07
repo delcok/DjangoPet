@@ -15,9 +15,17 @@ admin_router.register(
     basename='admin-homepage-position',
 )
 
+admin_router.register(
+    r'sections',
+    views.AdminHomepageSectionViewSet,
+    basename='admin-homepage-section',
+)
+
+
 urlpatterns = [
     # ══════ 用户端（公开，无需认证） ══════
     path('homepage/positions/', views.HomepagePositionListView.as_view(), name='homepage-position-list'),
+    path('homepage/sections/', views.HomepageSectionListView.as_view(), name='homepage-section-list'),  # 新增
 
     # ══════ 管理端 ══════
     path('admin/homepage/', include(admin_router.urls)),

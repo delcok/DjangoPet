@@ -13,7 +13,7 @@ from rest_framework.response import Response
 
 from wechatpy.crypto import WeChatWxaCrypto
 
-from user.models import User, UserAuthProvider, UserLoginLog, InviteReward
+from user.models import User, UserAuthProvider, UserLoginLog, InviteReward, UserProfileAudit
 from user.serializers import (
     UserSerializer,
     AdminUserListSerializer,
@@ -48,6 +48,27 @@ def _parse_wx_gender(v):
     注: 2021-04 后 getUserProfile 的 gender 基本都是 0（隐私政策收紧）
     """
     return {1: 'M', 2: 'F'}.get(v, 'U')
+
+def _submit_profile_audit(user, field, new_value):
+    """
+    提交一条资料审核（头像/昵称）。
+    已存在该字段的 pending 记录则覆盖 new_value，保证每字段仅一条待审核。
+    返回 (audit, changed)；changed=False 表示值跟线上一致、无需审核。
+    """
+    new_value = (new_value or '').strip()
+    current = getattr(user, field) or ''
+    if new_value == current:
+        return None, False
+
+    with transaction.atomic():
+        # 锁住该用户行，串行化「同一用户」的并发提交
+        # MySQL 不支持条件唯一索引，靠这把行锁防止双击产生两条 pending
+        User.objects.select_for_update().get(pk=user.pk)
+        audit, _ = UserProfileAudit.objects.update_or_create(
+            user=user, field=field, status=UserProfileAudit.Status.PENDING,
+            defaults={'old_value': current, 'new_value': new_value},
+        )
+    return audit, True
 
 
 def _build_login_response(user, openid=None):
@@ -199,14 +220,11 @@ def wechat_login(request):
 @authentication_classes([UserAuthentication])
 def update_user_info(request):
     """
-    更新用户信息(用户端)
+    更新用户信息（用户端）
 
-    修复点(对比旧版):
-    1. gender:统一映射 M/F/O/U 与旧的 male/female/other,前后兼容。
-    2. avatar:'avatar' 和 'avatar_url' 两个字段名都接受。
-    3. email:补上处理。
-    4. username 长度上限对齐 serializer 的 30 个字符。
-    注：社交统计（followers_count 等）系统维护，用户端不可改。
+    ★ 头像(avatar) / 昵称(username) 改为「先提交审核，通过后才生效」：
+      这两个字段不直接写库，而是写入 UserProfileAudit 等待人工审核；
+      其余字段(bio/gender/birth_date/email/隐私)维持即时生效。
     """
     try:
         user = request.user
@@ -220,23 +238,27 @@ def update_user_info(request):
         is_public     = request.data.get('is_public')
         allow_message = request.data.get('allow_message')
 
-        updated_fields = []
+        updated_fields = []   # 即时生效
+        pending_fields = []   # ★ 进审核队列
 
-        # ── 昵称 ──
+        # ── 昵称（★ 进审核，不直接写库）──
         if username is not None:
             username = username.strip()
             if len(username) < 2 or len(username) > 30:
                 return Response({'error': '用户名长度为 2-30 个字符'},
                                 status=status.HTTP_400_BAD_REQUEST)
-            user.username = username
-            updated_fields.append('username')
+            _, changed = _submit_profile_audit(user, 'username', username)
+            if changed:
+                pending_fields.append('username')
 
-        # ── 头像 ──
+        # ── 头像（★ 进审核，不直接写库）──
         if avatar:
-            user.avatar = avatar.strip()
-            updated_fields.append('avatar')
+            avatar = avatar.strip()
+            _, changed = _submit_profile_audit(user, 'avatar', avatar)
+            if changed:
+                pending_fields.append('avatar')
 
-        # ── 简介 ──
+        # ── 简介（即时生效；如也要审核，照昵称的写法走 _submit_profile_audit）──
         if bio is not None:
             bio = bio.strip()
             if len(bio) > 200:
@@ -245,12 +267,11 @@ def update_user_info(request):
             user.bio = bio
             updated_fields.append('bio')
 
-        # ── 性别(兼容 M/F/O/U 和旧的 male/female/other) ──
+        # ── 性别 ──
         if gender is not None:
             GENDER_MAP = {
                 'M': 'M', 'F': 'F', 'O': 'O', 'U': 'U',
-                'male': 'M', 'female': 'F', 'other': 'O',
-                '': 'U',
+                'male': 'M', 'female': 'F', 'other': 'O', '': 'U',
             }
             key = gender.strip() if isinstance(gender, str) else ''
             db_gender = GENDER_MAP.get(key) or GENDER_MAP.get(key.lower())
@@ -293,20 +314,22 @@ def update_user_info(request):
         if is_public is not None:
             user.is_public = bool(is_public)
             updated_fields.append('is_public')
-
         if allow_message is not None:
             user.allow_message = bool(allow_message)
             updated_fields.append('allow_message')
 
-        if not updated_fields:
+        if not updated_fields and not pending_fields:
             return Response({'error': '没有提供需要更新的字段'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        user.save(update_fields=updated_fields + ['updated_at'])
+        if updated_fields:
+            user.save(update_fields=updated_fields + ['updated_at'])
+
         return Response({
-            'message': '更新成功',
-            'user': UserSerializer(user).data,
-            'updated_fields': updated_fields,
+            'message': '已提交，等待审核' if pending_fields else '更新成功',
+            'user': UserSerializer(user).data,   # 含 pending_profile
+            'updated_fields': updated_fields,     # 即时生效的
+            'pending_fields': pending_fields,     # ★ 待审核的
         }, status=status.HTTP_200_OK)
 
     except Exception as e:
@@ -691,6 +714,99 @@ def admin_user_stats(request):
         'gender_distribution': list(
             base.values('gender').annotate(count=Count('id')).order_by('-count')
         ),
+    })
+
+# ═══════════════════════════════════════════════════════════════
+# 管理员端 - 资料审核（头像 / 昵称）
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_profile_audit_list(request):
+    """
+    管理员 - 资料审核列表（默认只看待审核）
+    query: status=pending(默认)/approved/rejected/all, field=username|avatar
+    分页返回里的 count 即为待审核总数，可用于菜单红点。
+    """
+    status_param = request.GET.get('status', 'pending')
+    field_param  = request.GET.get('field')
+
+    qs = UserProfileAudit.objects.select_related('user').order_by('-created_at')
+    if status_param and status_param != 'all':
+        qs = qs.filter(status=status_param)
+    if field_param:
+        qs = qs.filter(field=field_param)
+
+    paginator = StandardPagination()
+    page = paginator.paginate_queryset(qs, request)
+    data = [
+        {
+            'id': a.id,
+            'user_id': a.user_id,
+            'current_username': a.user.display_name,  # 当前线上昵称
+            'phone': a.user.phone,
+            'field': a.field,
+            'field_display': a.get_field_display(),
+            'old_value': a.old_value,
+            'new_value': a.new_value,                 # 头像就是 URL，前端直接 <img>
+            'status': a.status,
+            'status_display': a.get_status_display(),
+            'reject_reason': a.reject_reason,
+            'reviewer_id': a.reviewer_id,
+            'reviewed_at': a.reviewed_at,
+            'created_at': a.created_at,
+        }
+        for a in page
+    ]
+    return paginator.get_paginated_response(data)
+
+
+@api_view(['POST'])
+@authentication_classes([ManagerAuthentication])
+@permission_classes([IsManager])
+def admin_review_profile_audit(request, audit_id):
+    """
+    管理员 - 审核资料修改
+    body: { action: 'approve' | 'reject', reject_reason?: str }
+      approve → 把 new_value 写回 User 对应字段
+      reject  → 仅标记并记录原因，不改用户资料
+    """
+    action = request.data.get('action')
+    if action not in ('approve', 'reject'):
+        return Response({'error': "action 必须是 approve 或 reject"},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    audit = get_object_or_404(UserProfileAudit, id=audit_id)
+    if audit.status != UserProfileAudit.Status.PENDING:
+        return Response({'error': '该记录已审核，请勿重复操作'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        # 行锁，防并发重复审核
+        audit = (UserProfileAudit.objects
+                 .select_for_update().select_related('user').get(id=audit_id))
+        if audit.status != UserProfileAudit.Status.PENDING:
+            return Response({'error': '该记录已审核，请勿重复操作'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        user = audit.user
+        if action == 'approve':
+            setattr(user, audit.field, audit.new_value)        # 写回真实字段
+            user.save(update_fields=[audit.field, 'updated_at'])
+            audit.status = UserProfileAudit.Status.APPROVED
+        else:
+            audit.reject_reason = (request.data.get('reject_reason') or '').strip()[:200]
+            audit.status = UserProfileAudit.Status.REJECTED
+
+        audit.reviewer_id = request.user.id
+        audit.reviewed_at = timezone.now()
+        audit.save(update_fields=['status', 'reject_reason', 'reviewer_id', 'reviewed_at', 'updated_at'])
+
+    return Response({
+        'message': '已通过' if action == 'approve' else '已驳回',
+        'audit_id': audit.id, 'user_id': audit.user_id,
+        'field': audit.field, 'status': audit.status,
     })
 
 

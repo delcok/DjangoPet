@@ -746,6 +746,9 @@ class UserServiceOrderCreateSerializer(serializers.ModelSerializer):
         attrs['_user_coupon'] = coupon
         attrs['coupon_deduct_amount'] = coupon_deduct
 
+        # ─ ★ 5.5 金币抵扣规则校验(规格/服务级) ─
+        self._validate_coin_deduction(attrs, service, spec)
+
         # ─ 6. ★ 提前应用服务快照(让 _validate_amounts 拿到 delivery_fee/urgent_surcharge) ─
         self._apply_service_snapshots(attrs, service, spec)
 
@@ -927,6 +930,32 @@ class UserServiceOrderCreateSerializer(serializers.ModelSerializer):
             extra['distance_km'] = check['distance_km']
             extra['service_radius_meters'] = check['radius_meters']
             attrs['extra_info'] = extra
+
+    def _validate_coin_deduction(self, attrs, service, spec):
+        """
+        ★ 按「服务 / 规格」级规则校验金币抵扣。
+        规则来源 service.get_spec_coin_rule(spec_key):
+            - 多规格:spec 上 allow/max 非 null 时覆盖,否则沿用 service 级
+            - 单规格 / 无 spec:直接用 service 级
+            - allow=False 时 max 恒为 0
+        """
+        coins = int(attrs.get('coins_deducted', 0) or 0)
+        if coins <= 0:
+            return  # 没用金币,跳过规则校验
+
+        spec_key = spec.get('key') if spec else None
+        rule = service.get_spec_coin_rule(spec_key)
+
+        if not rule['allow_coin_deduction']:
+            raise serializers.ValidationError({
+                'coins_deducted': '该服务/规格不支持金币抵扣',
+            })
+
+        max_ded = rule['max_coin_deduction']
+        if max_ded > 0 and coins > max_ded:
+            raise serializers.ValidationError({
+                'coins_deducted': f'该服务/规格单笔最多抵扣 {max_ded} 金币',
+            })
 
     def _validate_amounts(self, attrs):
         """
@@ -1271,7 +1300,7 @@ class MerchantProductOrderDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductOrder
         fields = [
-            'id', 'order_no', 'user_id',
+            'id', 'order_no','merchant_name', 'user_id',
             'total_amount', 'freight_amount', 'discount_amount', 'user_coupon_id', 'coupon_deduct_amount',
         ] + _COIN_FIELDS + [
             'pay_amount',

@@ -21,6 +21,11 @@ urlpatterns = [
     path('admin/users/stats/', views.admin_user_stats, name='admin-user-stats'),
     path('admin/users/<int:user_id>/', views.admin_user_detail, name='admin-user-detail'),
     path('admin/users/<int:user_id>/update/', views.admin_update_user, name='admin-user-update'),
+
+# 资料审核（头像/昵称）
+    path('admin/profile-audits/', views.admin_profile_audit_list, name='admin-profile-audit-list'),
+    path('admin/profile-audits/<int:audit_id>/review/', views.admin_review_profile_audit, name='admin-profile-audit-review'),
+
     # 状态管理
     path('admin/users/<int:user_id>/ban/', views.admin_ban_user, name='admin-user-ban'),
     path('admin/users/<int:user_id>/toggle-active/', views.admin_toggle_active, name='admin-user-toggle-active'),

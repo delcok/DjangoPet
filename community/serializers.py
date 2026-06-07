@@ -1,22 +1,50 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2025/8/23 15:31
-# @Author  : Delock
+"""
+community/serializers.py
+社区模块序列化器 — 用户端 + 管理员端
+"""
 
 from rest_framework import serializers
-
 from django.db import transaction
+from django.utils import timezone
 
 from user.models import User
+from managers.models import Manager
 from .models import (
     PostCategory, Post, PostMedia, Comment, Topic, UserAction,
-    Report, Notification,
-    UserFollow, PostCollection, BlockedUser
+    Report, Notification, UserFollow, PostCollection, BlockedUser,
+    PostTopic, Mention,
 )
 
 
-# ===== 基础用户信息序列化 =====
+# ======================================================================
+# 工具函数
+# ======================================================================
+
+def _get_user(context):
+    """
+    从序列化器 context 安全获取 User 实例。
+    request.user 不是 User（如 Manager / AnonymousUser）时返回 None，
+    避免把非 User 主体传进 UserAction / PostCollection 等 FK 查询导致类型报错。
+    """
+    request = context.get('request')
+    if request and isinstance(getattr(request, 'user', None), User):
+        return request.user
+    return None
+
+
+def _get_client_ip(request):
+    """从 request 提取客户端 IP"""
+    xff = request.META.get('HTTP_X_FORWARDED_FOR')
+    return xff.split(',')[0].strip() if xff else request.META.get('REMOTE_ADDR')
+
+
+# ======================================================================
+# 基础用户 / 管理员 序列化器（用于嵌套）
+# ======================================================================
+
 class BasicUserSerializer(serializers.ModelSerializer):
-    """基础用户信息（用于嵌套）"""
+    """用户基础信息（头像、昵称）"""
     avatar = serializers.SerializerMethodField()
 
     class Meta:
@@ -24,11 +52,18 @@ class BasicUserSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'avatar']
 
     def get_avatar(self, obj):
-        return f"{obj.avatar}"
+        return str(obj.avatar) if obj.avatar else ''
+
+
+class BasicManagerSerializer(serializers.ModelSerializer):
+    """管理员基础信息（审核人 / 处理人嵌套用）"""
+    class Meta:
+        model = Manager
+        fields = ['id', 'username', 'name']
 
 
 class UserDetailSerializer(serializers.ModelSerializer):
-    """用户详细信息"""
+    """用户详细信息（个人主页等场景）"""
     avatar = serializers.SerializerMethodField()
     followers_count = serializers.SerializerMethodField()
     following_count = serializers.SerializerMethodField()
@@ -39,13 +74,14 @@ class UserDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'username', 'email', 'avatar', 'followers_count', 'following_count',
-            'posts_count', 'is_followed', 'is_blocked'
+            'id', 'username', 'email', 'avatar',
+            'followers_count', 'following_count', 'posts_count',
+            'is_followed', 'is_blocked',
         ]
         read_only_fields = ['id', 'email']
 
     def get_avatar(self, obj):
-        return f"{obj.avatar}"
+        return str(obj.avatar) if obj.avatar else ''
 
     def get_followers_count(self, obj):
         return obj.followers.count()
@@ -54,54 +90,62 @@ class UserDetailSerializer(serializers.ModelSerializer):
         return obj.following.count()
 
     def get_posts_count(self, obj):
-        return obj.posts.filter(status='approved').count()
+        return obj.posts.filter(status='approved', is_deleted=False).count()
 
     def get_is_followed(self, obj):
-        request = self.context.get('request')
-        if request and request.user.is_authenticated:
-            return UserFollow.objects.filter(
-                follower=request.user, following=obj
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return UserFollow.objects.filter(follower=user, following=obj).exists()
 
     def get_is_blocked(self, obj):
-        request = self.context.get('request')
-        if request and request.user.is_authenticated:
-            return BlockedUser.objects.filter(
-                user=request.user, blocked_user=obj
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return BlockedUser.objects.filter(user=user, blocked_user=obj).exists()
 
 
-# ===== 分类相关序列化 =====
+# ======================================================================
+# 分类
+# ======================================================================
+
 class PostCategorySerializer(serializers.ModelSerializer):
-    """帖子分类"""
-
     class Meta:
         model = PostCategory
         fields = [
             'id', 'name', 'slug', 'icon', 'color', 'sort_order',
-            'is_active', 'post_count', 'created_at', 'updated_at'
+            'is_active', 'post_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'post_count', 'created_at', 'updated_at']
 
 
-# ===== 媒体文件序列化 =====
-class PostMediaSerializer(serializers.ModelSerializer):
-    """帖子媒体文件"""
+# ======================================================================
+# 媒体
+# ======================================================================
 
+class PostMediaSerializer(serializers.ModelSerializer):
     class Meta:
         model = PostMedia
         fields = [
             'id', 'media_type', 'url', 'thumbnail_url', 'sort_order',
-            'width', 'height', 'duration', 'file_size'
+            'width', 'height', 'duration', 'file_size',
         ]
         read_only_fields = ['id']
 
 
-# ===== 话题相关序列化 =====
+# ======================================================================
+# 话题
+# ======================================================================
+
+class SimpleTopicSerializer(serializers.ModelSerializer):
+    """简化话题（嵌套用）"""
+    class Meta:
+        model = Topic
+        fields = ['id', 'name', 'slug', 'is_official', 'post_count']
+
+
 class TopicSerializer(serializers.ModelSerializer):
-    """话题"""
+    """话题完整信息"""
     creator = BasicUserSerializer(read_only=True)
     is_followed = serializers.SerializerMethodField()
 
@@ -111,33 +155,38 @@ class TopicSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug', 'description', 'cover_image', 'creator',
             'is_official', 'is_trending', 'is_featured', 'status',
             'post_count', 'participant_count', 'follow_count', 'view_count',
-            'hot_score', 'is_followed', 'created_at', 'updated_at'
+            'hot_score', 'is_followed', 'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'slug', 'creator', 'post_count', 'participant_count',
-            'follow_count', 'view_count', 'hot_score', 'created_at', 'updated_at'
+            'follow_count', 'view_count', 'hot_score', 'created_at', 'updated_at',
         ]
 
     def get_is_followed(self, obj):
-        request = self.context.get('request')
-        if request and request.user.is_authenticated:
-            return UserAction.objects.filter(
-                user=request.user, topic=obj, action_type='follow_topic'
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return UserAction.objects.filter(
+            user=user, topic=obj, action_type='follow_topic'
+        ).exists()
 
 
-class SimpleTopicSerializer(serializers.ModelSerializer):
-    """简化的话题信息（用于嵌套）"""
+class PostTopicSerializer(serializers.ModelSerializer):
+    """帖子-话题关联（嵌套展示）"""
+    topic = SimpleTopicSerializer(read_only=True)
 
     class Meta:
-        model = Topic
-        fields = ['id', 'name', 'slug', 'is_official', 'post_count']
+        model = PostTopic
+        fields = ['id', 'topic', 'created_at']
+        read_only_fields = ['id', 'created_at']
 
 
-# ===== 评论相关序列化 =====
+# ======================================================================
+# 评论（用户端）
+# ======================================================================
+
 class CommentSerializer(serializers.ModelSerializer):
-    """评论"""
+    """评论（用户端，含 is_liked / can_delete）"""
     author = BasicUserSerializer(read_only=True)
     replies = serializers.SerializerMethodField()
     is_liked = serializers.SerializerMethodField()
@@ -146,44 +195,41 @@ class CommentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Comment
         fields = [
-            'id', 'author', 'parent', 'content', 'like_count', 'reply_count',
-            'is_author_reply', 'is_featured', 'location', 'created_at',
-            'replies', 'is_liked', 'can_delete'
+            'id', 'author', 'parent', 'content',
+            'like_count', 'reply_count',
+            'is_author_reply', 'is_featured', 'is_edited', 'edited_at',
+            'location', 'created_at',
+            'replies', 'is_liked', 'can_delete',
         ]
         read_only_fields = [
-            'id', 'author', 'like_count', 'reply_count', 'is_author_reply',
-            'is_featured', 'created_at'
+            'id', 'author', 'like_count', 'reply_count',
+            'is_author_reply', 'is_featured', 'is_edited', 'edited_at', 'created_at',
         ]
 
     def get_replies(self, obj):
-        if obj.replies.exists():
-            return CommentSerializer(
-                obj.replies.filter(is_deleted=False)[:3],
-                many=True,
-                context=self.context
-            ).data
-        return []
+        """前 3 条子回复；依赖视图 prefetch 避免 N+1"""
+        qs = obj.replies.filter(is_deleted=False)[:3]
+        if not qs:
+            return []
+        return CommentSerializer(qs, many=True, context=self.context).data
 
     def get_is_liked(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return UserAction.objects.filter(
-                user=request.user, comment=obj, action_type='like_comment'
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return UserAction.objects.filter(
+            user=user, comment=obj, action_type='like_comment'
+        ).exists()
 
     def get_can_delete(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return obj.author == request.user
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return obj.author_id == user.id
 
 
 class CreateCommentSerializer(serializers.ModelSerializer):
     """创建评论"""
-
     class Meta:
         model = Comment
         fields = ['post', 'parent', 'content']
@@ -192,79 +238,76 @@ class CreateCommentSerializer(serializers.ModelSerializer):
         post = attrs.get('post')
         parent = attrs.get('parent')
 
-        # 验证帖子状态
         if post.status != 'approved':
             raise serializers.ValidationError("无法对此帖子进行评论")
-
-        # 验证父评论
-        if parent and parent.post != post:
+        if parent and parent.post_id != post.id:
             raise serializers.ValidationError("父评论与帖子不匹配")
 
         return attrs
 
     def create(self, validated_data):
-        validated_data['author'] = self.context['request'].user
-
-        # 获取IP地址
         request = self.context['request']
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            validated_data['ip_address'] = x_forwarded_for.split(',')[0]
-        else:
-            validated_data['ip_address'] = request.META.get('REMOTE_ADDR')
-
+        validated_data['author'] = request.user
+        validated_data['ip_address'] = _get_client_ip(request)
         return super().create(validated_data)
 
 
-# ===== 帖子相关序列化 =====
+# ======================================================================
+# 帖子（用户端）
+# ======================================================================
+
 class PostListSerializer(serializers.ModelSerializer):
-    """帖子列表"""
+    """帖子列表（用户端）"""
     author = BasicUserSerializer(read_only=True)
     category = PostCategorySerializer(read_only=True)
     cover_media = serializers.SerializerMethodField()
+    topics = serializers.SerializerMethodField()
     is_liked = serializers.SerializerMethodField()
     is_collected = serializers.SerializerMethodField()
 
     class Meta:
         model = Post
         fields = [
-            'id', 'author', 'category', 'post_type', 'status', 'title', 'content',
-            'cover_image', 'cover_media', 'location', 'view_count',
-            'like_count', 'comment_count', 'collect_count', 'share_count',
-            'hot_score', 'is_featured', 'is_top', 'published_at',
-            'is_liked', 'is_collected', 'engagement_rate'
+            'id', 'author', 'category', 'post_type', 'status',
+            'title', 'content', 'cover_image', 'cover_media', 'topics',
+            'location', 'view_count', 'like_count', 'comment_count',
+            'collect_count', 'share_count', 'hot_score',
+            'is_featured', 'is_top', 'published_at',
+            'is_liked', 'is_collected', 'engagement_rate',
         ]
 
     def get_cover_media(self, obj):
-        first_media = obj.medias.first()
-        if first_media:
-            return PostMediaSerializer(first_media).data
-        return None
+        # 依赖视图 prefetch_related('medias')
+        first = obj.medias.first()
+        return PostMediaSerializer(first).data if first else None
+
+    def get_topics(self, obj):
+        # 依赖视图 prefetch_related('post_topics__topic')
+        return SimpleTopicSerializer(
+            [pt.topic for pt in obj.post_topics.all()], many=True
+        ).data
 
     def get_is_liked(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return UserAction.objects.filter(
-                user=request.user, post=obj, action_type='like_post'
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return UserAction.objects.filter(
+            user=user, post=obj, action_type='like_post'
+        ).exists()
 
     def get_is_collected(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return PostCollection.objects.filter(
-                user=request.user, post=obj
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return PostCollection.objects.filter(user=user, post=obj).exists()
 
 
 class PostDetailSerializer(serializers.ModelSerializer):
-    """帖子详情"""
+    """帖子详情（用户端）"""
     author = BasicUserSerializer(read_only=True)
     category = PostCategorySerializer(read_only=True)
     medias = PostMediaSerializer(many=True, read_only=True)
+    topics = serializers.SerializerMethodField()
     recent_comments = serializers.SerializerMethodField()
     is_liked = serializers.SerializerMethodField()
     is_collected = serializers.SerializerMethodField()
@@ -277,148 +320,242 @@ class PostDetailSerializer(serializers.ModelSerializer):
         model = Post
         fields = [
             'id', 'author', 'category', 'post_type', 'title', 'content',
-            'cover_image', 'medias', 'location', 'latitude', 'longitude',
-            'view_count', 'like_count', 'comment_count', 'collect_count',
-            'share_count', 'hot_score', 'quality_score', 'is_featured',
-            'is_top', 'published_at', 'created_at', 'updated_at',
-            'recent_comments', 'is_liked', 'is_collected', 'is_following',
-            'is_mine', 'can_edit', 'can_delete', 'engagement_rate', 'status'
+            'cover_image', 'medias', 'topics',
+            'location', 'latitude', 'longitude',
+            'view_count', 'like_count', 'comment_count',
+            'collect_count', 'share_count',
+            'hot_score', 'quality_score',
+            'is_featured', 'is_top', 'is_edited', 'edited_at',
+            'published_at', 'created_at', 'updated_at',
+            'recent_comments',
+            'is_liked', 'is_collected', 'is_following',
+            'is_mine', 'can_edit', 'can_delete',
+            'engagement_rate', 'status',
         ]
 
+    def get_topics(self, obj):
+        return SimpleTopicSerializer(
+            [pt.topic for pt in obj.post_topics.all()], many=True
+        ).data
+
     def get_recent_comments(self, obj):
-        comments = obj.comments.filter(is_deleted=False, parent__isnull=True)[:5]
-        return CommentSerializer(comments, many=True, context=self.context).data
+        qs = obj.comments.filter(is_deleted=False, parent__isnull=True)[:5]
+        return CommentSerializer(qs, many=True, context=self.context).data
 
     def get_is_liked(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return UserAction.objects.filter(
-                user=request.user, post=obj, action_type='like_post'
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return UserAction.objects.filter(
+            user=user, post=obj, action_type='like_post'
+        ).exists()
 
     def get_is_collected(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return PostCollection.objects.filter(
-                user=request.user, post=obj
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return PostCollection.objects.filter(user=user, post=obj).exists()
 
     def get_is_following(self, obj):
         """当前用户是否关注了帖子作者"""
-        request = self.context.get('request')
-        if request and request.user.is_authenticated:
-            # 自己的帖子不需要判断关注
-            if obj.author == request.user:
-                return False
-            return UserFollow.objects.filter(
-                follower=request.user, following=obj.author
-            ).exists()
-        return False
+        user = _get_user(self.context)
+        if not user or obj.author_id == user.id:
+            return False
+        return UserFollow.objects.filter(follower=user, following=obj.author).exists()
 
     def get_is_mine(self, obj):
-        """是否是当前用户自己的帖子"""
-        request = self.context.get('request')
-        if request and request.user.is_authenticated:
-            return obj.author == request.user
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return obj.author_id == user.id
 
     def get_can_edit(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return obj.author == request.user and obj.status in ['draft', 'pending']
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return obj.author_id == user.id and obj.status in ('draft', 'pending')
 
     def get_can_delete(self, obj):
-        request = self.context.get('request')
-        # 🔥 未登录返回 False
-        if request and request.user.is_authenticated:
-            return obj.author == request.user
-        return False
+        user = _get_user(self.context)
+        if not user:
+            return False
+        return obj.author_id == user.id
 
 
 class CreatePostSerializer(serializers.ModelSerializer):
     """创建帖子"""
     medias = PostMediaSerializer(many=True, required=False)
+    topic_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, write_only=True
+    )
 
     class Meta:
         model = Post
         fields = [
             'category', 'post_type', 'title', 'content', 'cover_image',
-            'location', 'latitude', 'longitude', 'medias'
+            'location', 'latitude', 'longitude', 'medias', 'topic_ids',
         ]
 
     def validate_title(self, value):
-        if len(value.strip()) < 2:
+        value = value.strip()
+        if len(value) < 2:
             raise serializers.ValidationError("标题至少需要2个字符")
-        return value.strip()
+        return value
 
     def validate_content(self, value):
-        if len(value.strip()) < 5:
+        value = value.strip()
+        if len(value) < 5:
             raise serializers.ValidationError("内容至少需要5个字符")
-        return value.strip()
+        return value
+
+    def validate_topic_ids(self, value):
+        if not value:
+            return value
+        valid_ids = set(
+            Topic.objects.filter(id__in=value, status='approved')
+            .values_list('id', flat=True)
+        )
+        invalid = [tid for tid in value if tid not in valid_ids]
+        if invalid:
+            raise serializers.ValidationError(f"话题不存在或不可用: {invalid}")
+        return value
 
     @transaction.atomic
     def create(self, validated_data):
         medias_data = validated_data.pop('medias', [])
+        topic_ids = validated_data.pop('topic_ids', [])
         validated_data['author'] = self.context['request'].user
-        validated_data['status'] = 'pending'  # 默认待审核
+        validated_data['status'] = 'pending'
 
         post = Post.objects.create(**validated_data)
 
-        # 创建媒体文件
         for media_data in medias_data:
             PostMedia.objects.create(post=post, **media_data)
+
+        for tid in set(topic_ids):
+            PostTopic.objects.create(post=post, topic_id=tid)
 
         return post
 
 
 class UpdatePostSerializer(serializers.ModelSerializer):
     """更新帖子"""
-
     class Meta:
         model = Post
         fields = ['category', 'title', 'content', 'location', 'latitude', 'longitude']
 
     def validate(self, attrs):
-        # 只有作者才能编辑，且只能编辑草稿和待审核状态
-        if self.instance.status not in ['draft', 'pending']:
+        if self.instance.status not in ('draft', 'pending'):
             raise serializers.ValidationError("当前状态下无法编辑")
         return attrs
 
+    def update(self, instance, validated_data):
+        instance = super().update(instance, validated_data)
+        instance.is_edited = True
+        instance.edited_at = timezone.now()
+        instance.save(update_fields=['is_edited', 'edited_at', 'updated_at'])
+        return instance
 
-# ===== 用户行为相关序列化 =====
+
+# ======================================================================
+# 帖子（管理员端）— 不查 request.user 的 UserAction / PostCollection
+# ======================================================================
+
+class AdminCommentSerializer(serializers.ModelSerializer):
+    """管理员评论（不含 is_liked / can_delete）"""
+    author = BasicUserSerializer(read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = [
+            'id', 'author', 'parent', 'content',
+            'like_count', 'reply_count',
+            'is_author_reply', 'is_featured', 'is_deleted',
+            'is_edited', 'edited_at', 'ip_address', 'location', 'created_at',
+        ]
+
+
+class AdminPostListSerializer(serializers.ModelSerializer):
+    """管理员帖子列表"""
+    author = BasicUserSerializer(read_only=True)
+    category = PostCategorySerializer(read_only=True)
+    reviewer = BasicManagerSerializer(read_only=True)
+    cover_media = serializers.SerializerMethodField()
+    topics = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Post
+        fields = [
+            'id', 'author', 'category', 'post_type', 'status',
+            'title', 'content', 'cover_image', 'cover_media', 'topics',
+            'location',
+            # 互动统计
+            'view_count', 'like_count', 'comment_count',
+            'collect_count', 'share_count',
+            # 分数
+            'hot_score', 'quality_score', 'auto_review_score', 'review_priority',
+            # 标记
+            'is_featured', 'is_top', 'is_deleted', 'is_edited',
+            # 违规 & 举报
+            'violation_type', 'violation_count', 'report_count',
+            # 审核
+            'reviewer', 'reject_reason', 'reviewed_at',
+            # 时间
+            'published_at', 'created_at', 'updated_at',
+        ]
+
+    def get_cover_media(self, obj):
+        first = obj.medias.first()
+        return PostMediaSerializer(first).data if first else None
+
+    def get_topics(self, obj):
+        return SimpleTopicSerializer(
+            [pt.topic for pt in obj.post_topics.all()], many=True
+        ).data
+
+
+class AdminPostDetailSerializer(AdminPostListSerializer):
+    """管理员帖子详情（继承列表，补充完整字段）"""
+    medias = PostMediaSerializer(many=True, read_only=True)
+    recent_comments = serializers.SerializerMethodField()
+
+    class Meta(AdminPostListSerializer.Meta):
+        fields = AdminPostListSerializer.Meta.fields + [
+            'medias', 'latitude', 'longitude',
+            'review_note',
+            'edited_at', 'deleted_at', 'last_active_at',
+            'recent_comments', 'engagement_rate',
+        ]
+
+    def get_recent_comments(self, obj):
+        qs = obj.comments.filter(is_deleted=False, parent__isnull=True)[:5]
+        return AdminCommentSerializer(qs, many=True).data
+
+
+# ======================================================================
+# 用户行为
+# ======================================================================
+
 class UserActionSerializer(serializers.ModelSerializer):
-    """用户行为"""
-
     class Meta:
         model = UserAction
         fields = ['action_type', 'post', 'comment', 'target_user', 'topic']
         read_only_fields = ['user', 'created_at']
 
     def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
-
-        # 获取IP地址
         request = self.context['request']
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            validated_data['ip_address'] = x_forwarded_for.split(',')[0]
-        else:
-            validated_data['ip_address'] = request.META.get('REMOTE_ADDR')
-
+        validated_data['user'] = request.user
+        validated_data['ip_address'] = _get_client_ip(request)
         validated_data['user_agent'] = request.META.get('HTTP_USER_AGENT', '')
-
         return super().create(validated_data)
 
 
-# ===== 收藏相关序列化 =====
+# ======================================================================
+# 收藏
+# ======================================================================
+
 class PostCollectionSerializer(serializers.ModelSerializer):
-    """帖子收藏"""
+    """收藏列表（含帖子摘要）"""
     post = PostListSerializer(read_only=True)
 
     class Meta:
@@ -429,7 +566,6 @@ class PostCollectionSerializer(serializers.ModelSerializer):
 
 class CreateCollectionSerializer(serializers.ModelSerializer):
     """创建收藏"""
-
     class Meta:
         model = PostCollection
         fields = ['post', 'folder', 'note']
@@ -439,9 +575,12 @@ class CreateCollectionSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# ===== 关注相关序列化 =====
+# ======================================================================
+# 关注
+# ======================================================================
+
 class UserFollowSerializer(serializers.ModelSerializer):
-    """用户关注关系序列化器"""
+    """关注 / 粉丝关系"""
     user = serializers.SerializerMethodField()
 
     class Meta:
@@ -450,117 +589,66 @@ class UserFollowSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
     def get_user(self, obj):
-        """根据context中的type返回对应的用户信息"""
-        request = self.context.get('request')
+        """根据 context['type'] 返回关注者或被关注者"""
         follow_type = self.context.get('type', 'following')
+        target = obj.following if follow_type == 'following' else obj.follower
 
-        if follow_type == 'following':
-            # 显示被关注的用户
-            user = obj.following
-        else:
-            # 显示关注者
-            user = obj.follower
-
-        # 返回用户详细信息
         data = {
-            'id': user.id,
-            'username': user.username,
-            'avatar': f"{user.avatar}",
+            'id': target.id,
+            'username': target.username,
+            'avatar': str(target.avatar) if target.avatar else '',
             'is_mutual': obj.is_mutual,
         }
 
-        # 如果有请求上下文，添加当前用户是否关注该用户
-        if request and request.user.is_authenticated:
+        user = _get_user(self.context)
+        if user:
             data['is_followed'] = UserFollow.objects.filter(
-                follower=request.user,
-                following=user
+                follower=user, following=target
             ).exists()
 
         return data
 
 
-# ===== 举报相关序列化 =====
+# ======================================================================
+# 举报（用户端）
+# ======================================================================
+
 class ReportSerializer(serializers.ModelSerializer):
-    """举报"""
+    """举报（用户提交 + 查看自己的举报）"""
     reporter = BasicUserSerializer(read_only=True)
-    handler = BasicUserSerializer(read_only=True)
+    handler = BasicManagerSerializer(read_only=True)
 
     class Meta:
         model = Report
         fields = [
             'id', 'reporter', 'content_type', 'content_id', 'report_type',
-            'reason', 'evidence', 'status', 'handler', 'handle_note',
-            'created_at', 'handled_at'
+            'reason', 'evidence', 'status',
+            'handler', 'handle_note', 'created_at', 'handled_at',
         ]
         read_only_fields = [
             'id', 'reporter', 'status', 'handler', 'handle_note',
-            'created_at', 'handled_at'
+            'created_at', 'handled_at',
         ]
 
     def create(self, validated_data):
-        validated_data['reporter'] = self.context['request'].user
-
-        # 获取IP地址
         request = self.context['request']
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            validated_data['ip_address'] = x_forwarded_for.split(',')[0]
-        else:
-            validated_data['ip_address'] = request.META.get('REMOTE_ADDR')
-
+        validated_data['reporter'] = request.user
+        validated_data['ip_address'] = _get_client_ip(request)
         return super().create(validated_data)
 
 
-# ===== 通知相关序列化 =====
-class NotificationSerializer(serializers.ModelSerializer):
-    """通知消息"""
-    sender = BasicUserSerializer(read_only=True)
-    post = serializers.SerializerMethodField()
+# ======================================================================
+# 举报（管理员端）
+# ======================================================================
 
-    class Meta:
-        model = Notification
-        fields = [
-            'id', 'sender', 'notification_type', 'title', 'content',
-            'post', 'extra_data', 'is_read', 'created_at', 'read_at'
-        ]
-        read_only_fields = ['id', 'sender', 'created_at', 'read_at']
-
-    def get_post(self, obj):
-        if obj.post:
-            return {
-                'id': obj.post.id,
-                'title': obj.post.title,
-                'cover_image': obj.post.cover_image
-            }
-        return None
-
-
-# ===== 黑名单相关序列化 =====
-class BlockedUserSerializer(serializers.ModelSerializer):
-    """用户黑名单"""
-    blocked_user = BasicUserSerializer(read_only=True)
-
-    class Meta:
-        model = BlockedUser
-        fields = ['id', 'blocked_user', 'reason', 'created_at']
-        read_only_fields = ['id', 'created_at']
-
-
-# ===== 举报管理序列化（平台后台 Manager 用）=====
 class ReportAdminSerializer(serializers.ModelSerializer):
-    """举报管理序列化器
-
-    与用户端 ReportSerializer 的区别：放开 status / handle_note 供后台修改，
-    其余（举报人、被举报内容、证据、IP）保持只读。
-    处理人 handler、处理时间 handled_at 由视图在处理动作里自动写入，
-    不开放给序列化器，避免被伪造。
-
-    注意：本序列化器不读取 request.user，可安全用于 ManagerAuthentication 下的接口
-    （普通 ReportSerializer/PostDetailSerializer 里有 request.user.is_authenticated 调用，
-    在 Manager 主体上可能不可用）。
+    """
+    举报管理（平台后台）
+    handler 指向 Manager，可直接赋值 request.user。
+    reporter 指向 User，只读展示。
     """
     reporter = BasicUserSerializer(read_only=True)
-    handler = BasicUserSerializer(read_only=True)
+    handler = BasicManagerSerializer(read_only=True)
     report_type_display = serializers.CharField(source='get_report_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     content_type_display = serializers.CharField(source='get_content_type_display', read_only=True)
@@ -568,12 +656,72 @@ class ReportAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = Report
         fields = [
-            'id', 'reporter', 'content_type', 'content_type_display', 'content_id',
-            'report_type', 'report_type_display', 'reason', 'evidence',
-            'status', 'status_display', 'handler', 'handle_note',
+            'id', 'reporter',
+            'content_type', 'content_type_display', 'content_id',
+            'report_type', 'report_type_display',
+            'reason', 'evidence',
+            'status', 'status_display',
+            'handler', 'handle_note',
             'ip_address', 'created_at', 'handled_at',
         ]
         read_only_fields = [
             'id', 'reporter', 'content_type', 'content_id', 'report_type',
-            'reason', 'evidence', 'handler', 'ip_address', 'created_at', 'handled_at',
+            'reason', 'evidence', 'handler',
+            'ip_address', 'created_at', 'handled_at',
         ]
+
+
+# ======================================================================
+# 通知
+# ======================================================================
+
+class NotificationSerializer(serializers.ModelSerializer):
+    sender = BasicUserSerializer(read_only=True)
+    post = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'sender', 'notification_type', 'title', 'content',
+            'post', 'extra_data', 'is_read', 'created_at', 'read_at',
+        ]
+        read_only_fields = ['id', 'sender', 'created_at', 'read_at']
+
+    def get_post(self, obj):
+        if not obj.post:
+            return None
+        return {
+            'id': obj.post.id,
+            'title': obj.post.title,
+            'cover_image': obj.post.cover_image,
+        }
+
+
+# ======================================================================
+# 提及
+# ======================================================================
+
+class MentionSerializer(serializers.ModelSerializer):
+    mention_by = BasicUserSerializer(read_only=True)
+    mentioned_user = BasicUserSerializer(read_only=True)
+
+    class Meta:
+        model = Mention
+        fields = [
+            'id', 'mentioned_user', 'mention_by',
+            'source_type', 'source_id', 'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
+
+
+# ======================================================================
+# 黑名单
+# ======================================================================
+
+class BlockedUserSerializer(serializers.ModelSerializer):
+    blocked_user = BasicUserSerializer(read_only=True)
+
+    class Meta:
+        model = BlockedUser
+        fields = ['id', 'blocked_user', 'reason', 'created_at']
+        read_only_fields = ['id', 'created_at']

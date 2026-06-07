@@ -3,7 +3,7 @@
 # @Author  : Delock
 
 from rest_framework import serializers
-from .models import HomepagePosition
+from .models import HomepagePosition, HomepageSection
 
 
 class HomepagePositionItemSerializer(serializers.Serializer):
@@ -99,3 +99,20 @@ class AdminHomepagePositionSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'target_id': '服务不存在'})
 
         return attrs
+
+
+class HomepageSectionSerializer(serializers.ModelSerializer):
+    """用户端读取板块标题"""
+    class Meta:
+        model = HomepageSection
+        fields = ['position', 'title', 'subtitle']
+
+
+class AdminHomepageSectionSerializer(serializers.ModelSerializer):
+    """管理端编辑(只允许改 title / subtitle,position 锁死)"""
+    position_display = serializers.CharField(source='get_position_display', read_only=True)
+
+    class Meta:
+        model = HomepageSection
+        fields = ['id', 'position', 'position_display', 'title', 'subtitle', 'updated_at']
+        read_only_fields = ['id', 'position', 'position_display', 'updated_at']

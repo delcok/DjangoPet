@@ -3,7 +3,7 @@
 # @Author  : Delock
 
 from rest_framework import serializers
-from .models import PetCategory, PetBreed, Pet, PetDiary, PetServiceRecord
+from .models import PetCategory, PetBreed, Pet, PetHealthRecord, PetDiary, PetServiceRecord
 
 
 class PetBreedSerializer(serializers.ModelSerializer):
@@ -33,9 +33,93 @@ class PetCategorySerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at', 'updated_at']
 
 
+class PetHealthRecordSerializer(serializers.ModelSerializer):
+    """
+    宠物健康记录序列化器（CRUD 通用）
+    按 record_type 校验 data 结构；校验宠物归属。
+    """
+    pet_name = serializers.CharField(source='pet.name', read_only=True)
+    record_type_display = serializers.CharField(source='get_record_type_display', read_only=True)
+    summary = serializers.SerializerMethodField()  # 给时间线列表一行展示用
+
+    class Meta:
+        model = PetHealthRecord
+        fields = [
+            'id', 'pet', 'pet_name', 'record_type', 'record_type_display',
+            'record_date', 'remind_date', 'data', 'note', 'images',
+            'summary', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def get_summary(self, obj):
+        d = obj.data or {}
+        t = obj.record_type
+        if t == 'weight':
+            w = d.get('weight')
+            return f"{w}kg" if w not in (None, '') else ''
+        if t == 'bcs':
+            return dict(Pet.BCS_CHOICES).get(d.get('score'), '')
+        if t == 'deworming':
+            kind = dict(PetHealthRecord.DEWORMING_KIND_CHOICES).get(d.get('kind'), '')
+            return ' '.join(x for x in [kind, d.get('drug') or ''] if x)
+        if t == 'vaccine':
+            return d.get('name') or ''
+        if t == 'medical':
+            return d.get('diagnosis') or ''
+        return ''
+
+    def validate_pet(self, value):
+        """只能给自己的宠物记录"""
+        user = self.context['request'].user
+        if value.owner_id != getattr(user, 'id', None):
+            raise serializers.ValidationError("您没有权限为该宠物添加健康记录")
+        return value
+
+    def validate(self, attrs):
+        # 合并 instance 已有值，兼容 partial update
+        rt = attrs.get('record_type') or getattr(self.instance, 'record_type', None)
+        data = attrs.get('data') if 'data' in attrs else (getattr(self.instance, 'data', {}) or {})
+        rec_date = attrs.get('record_date') or getattr(self.instance, 'record_date', None)
+        rem_date = attrs.get('remind_date') if 'remind_date' in attrs \
+            else getattr(self.instance, 'remind_date', None)
+
+        data = data or {}
+        errors = {}
+
+        if rt == 'weight':
+            try:
+                if float(data.get('weight')) <= 0:
+                    errors['data'] = "体重(data.weight)必须大于 0"
+            except (TypeError, ValueError):
+                errors['data'] = "体重(data.weight)必须是数字"
+        elif rt == 'bcs':
+            try:
+                if int(data.get('score')) not in (1, 2, 3, 4, 5):
+                    errors['data'] = "体况评分(data.score)必须是 1-5"
+            except (TypeError, ValueError):
+                errors['data'] = "体况评分(data.score)必须是 1-5 的整数"
+        elif rt == 'deworming':
+            if data.get('kind') and data['kind'] not in dict(PetHealthRecord.DEWORMING_KIND_CHOICES):
+                errors['data'] = "驱虫类型(data.kind)非法"
+        elif rt == 'vaccine':
+            if not data.get('name'):
+                errors['data'] = "疫苗名称(data.name)必填"
+        elif rt == 'medical':
+            if not data.get('diagnosis'):
+                errors['data'] = "症状/诊断(data.diagnosis)必填"
+
+        if rem_date and rec_date and rem_date < rec_date:
+            errors['remind_date'] = "提醒日期不能早于发生日期"
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
 class PetListSerializer(serializers.ModelSerializer):
     """宠物列表序列化器（简化版）"""
     category_name = serializers.CharField(source='category.name', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
     breed_display = serializers.CharField(read_only=True)
     age_display = serializers.SerializerMethodField()
     gender_display = serializers.CharField(source='get_gender_display', read_only=True)
@@ -43,9 +127,10 @@ class PetListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Pet
         fields = [
-            'id', 'name', 'category', 'category_name',
+            'id', 'name', 'category', 'category_name', 'category_code',
             'breed', 'breed_display',
             'avatar', 'gender', 'gender_display', 'age_display',
+            'weight', 'special_phase',
             'created_at'
         ]
 
@@ -63,6 +148,7 @@ class PetListSerializer(serializers.ModelSerializer):
 class PetDetailSerializer(serializers.ModelSerializer):
     """宠物详情序列化器"""
     category_name = serializers.CharField(source='category.name', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
     breed_detail = PetBreedSerializer(source='breed', read_only=True)
     breed_display = serializers.CharField(read_only=True)
     owner_name = serializers.CharField(source='owner.username', read_only=True)
@@ -72,16 +158,29 @@ class PetDetailSerializer(serializers.ModelSerializer):
     adoption_period_display = serializers.CharField(
         source='get_adoption_period_display', read_only=True, allow_null=True
     )
+    bcs_display = serializers.CharField(
+        source='get_body_condition_score_display', read_only=True, allow_null=True
+    )
+    raising_mode_display = serializers.CharField(
+        source='get_raising_mode_display', read_only=True, allow_null=True
+    )
+    special_phase_display = serializers.CharField(
+        source='get_special_phase_display', read_only=True, allow_null=True
+    )
+    current_health = serializers.SerializerMethodField()
 
     class Meta:
         model = Pet
         fields = [
-            'id', 'owner', 'owner_name', 'category', 'category_name',
+            'id', 'owner', 'owner_name', 'category', 'category_name', 'category_code',
             'breed', 'breed_detail', 'breed_name', 'breed_display',
             'name', 'birth_date', 'adoption_period', 'adoption_period_display',
-            'gender', 'gender_display', 'weight', 'color', 'avatar',
+            'gender', 'gender_display', 'weight', 'weight_date', 'color', 'avatar',
+            'body_condition_score', 'bcs_display', 'bcs_date',
+            'raising_mode', 'raising_mode_display',
+            'special_phase', 'special_phase_display', 'special_phase_date',
             'personality', 'health_status', 'vaccination_record', 'special_notes',
-            'age_years', 'age_months', 'created_at', 'updated_at'
+            'current_health', 'age_years', 'age_months', 'created_at', 'updated_at'
         ]
         read_only_fields = ['owner', 'created_at', 'updated_at', 'age_years', 'age_months']
 
@@ -104,6 +203,29 @@ class PetDetailSerializer(serializers.ModelSerializer):
         if breed and category and breed.category_id != category.id:
             raise serializers.ValidationError({'breed': '所选品种不属于该大类'})
         return data
+
+    def get_current_health(self, obj):
+        """
+        各健康类型的最新一条汇总（单一数据源 = 流水表，永远新鲜）。
+        依赖视图 prefetch_related('health_records')，否则会 N+1。
+        """
+        latest = {}
+        for r in obj.health_records.all():   # 已按 -record_date 排序，首见即最新
+            latest.setdefault(r.record_type, r)
+        dw, vc, md = latest.get('deworming'), latest.get('vaccine'), latest.get('medical')
+        return {
+            'weight': obj.weight, 'weight_date': obj.weight_date,
+            'bcs': obj.body_condition_score, 'bcs_date': obj.bcs_date,
+            'last_deworming_date': dw.record_date if dw else None,
+            'deworming_kind': (dw.data or {}).get('kind') if dw else None,
+            'next_deworming_date': dw.remind_date if dw else None,
+            'last_vaccine_date': vc.record_date if vc else None,
+            'last_vaccine_name': (vc.data or {}).get('name') if vc else None,
+            'next_vaccine_date': vc.remind_date if vc else None,
+            'last_medical_date': md.record_date if md else None,
+            'last_medical_diagnosis': (md.data or {}).get('diagnosis') if md else None,
+            'next_visit_date': md.remind_date if md else None,
+        }
 
 
 class PetDiaryListSerializer(serializers.ModelSerializer):

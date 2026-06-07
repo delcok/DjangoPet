@@ -47,3 +47,44 @@ class HomepagePosition(models.Model):
 
     def __str__(self):
         return f'{self.get_position_display()} - {self.get_target_type_display()}#{self.target_id}'
+
+
+class HomepageSection(models.Model):
+    """
+    首页板块配置 —— 三块固定区域(社区优惠/超级推荐/特价)的可编辑标题。
+    每个 position 一条记录,固定 3 行。与 HomepagePosition 通过 position 值逻辑对齐,无外键。
+    """
+
+    DEFAULTS = {
+        HomepagePosition.Position.COMMUNITY_DISCOUNT: ('社区优惠', '低价好服务 限时抢'),
+        HomepagePosition.Position.SUPER_RECOMMEND:    ('超级推荐', '小二力荐 不容错过'),
+        HomepagePosition.Position.SPECIAL_GROUP:      ('特价团', '天天低价 抢到就赚'),
+    }
+
+    position = models.CharField(
+        max_length=30,
+        choices=HomepagePosition.Position.choices,
+        unique=True,
+        verbose_name='板块',
+    )
+    title = models.CharField(max_length=50, verbose_name='板块标题')
+    subtitle = models.CharField(max_length=100, blank=True, default='', verbose_name='副标题')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'homepage_section'
+        verbose_name = '首页板块配置'
+        verbose_name_plural = verbose_name
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.position} - {self.title}'
+
+    @classmethod
+    def ensure_defaults(cls):
+        """保证三块区域各有一条记录,缺了就按默认值补上(幂等)"""
+        for pos, (title, subtitle) in cls.DEFAULTS.items():
+            cls.objects.get_or_create(
+                position=pos,
+                defaults={'title': title, 'subtitle': subtitle},
+            )

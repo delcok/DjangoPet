@@ -1,3 +1,4 @@
+from decimal import Decimal, InvalidOperation
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
@@ -94,6 +95,27 @@ class Pet(models.Model):
         ('over_3m', '3个月以上'),
         ('unknown', '记不清了'),
     ]
+    BCS_CHOICES = [
+        (1, '严重偏瘦'),
+        (2, '偏瘦'),
+        (3, '理想体型'),
+        (4, '偏胖'),
+        (5, '肥胖'),
+    ]
+    RAISING_MODE_CHOICES = [
+        ('indoor', '室内饲养'),
+        ('outdoor', '室外饲养'),
+        ('mixed', '半室内半室外'),
+        ('free', '散养'),
+    ]
+    SPECIAL_PHASE_CHOICES = [
+        ('normal', '正常'),
+        ('pregnant', '怀孕中'),
+        ('lactating', '哺乳期'),
+        ('postop', '术后恢复'),
+        ('senior', '老年期'),
+        ('juvenile', '幼年期'),
+    ]
 
     owner = models.ForeignKey(
         User,
@@ -137,7 +159,7 @@ class Pet(models.Model):
         max_digits=5,
         decimal_places=2,
         verbose_name="体重(kg)",
-        help_text="单位：千克",
+        help_text="单位：千克（当前值缓存，最新一条体重记录回写）",
         blank=True,
         null=True
     )
@@ -147,6 +169,27 @@ class Pet(models.Model):
     health_status = models.TextField(blank=True, null=True, verbose_name="健康状况")
     vaccination_record = models.TextField(blank=True, null=True, verbose_name="疫苗记录")
     special_notes = models.TextField(blank=True, null=True, verbose_name="特殊说明")
+
+    # ===== 当前状态字段（profile 上展示的"一个值"，非流水）=====
+    raising_mode = models.CharField(
+        max_length=10, choices=RAISING_MODE_CHOICES,
+        blank=True, null=True, verbose_name="养育方式"
+    )
+    special_phase = models.CharField(
+        max_length=10, choices=SPECIAL_PHASE_CHOICES,
+        blank=True, null=True, default='normal', verbose_name="特殊时期"
+    )
+    special_phase_date = models.DateField(
+        blank=True, null=True, verbose_name="特殊时期开始日期"
+    )
+
+    # ===== 流水表的"当前值缓存"（由 PetHealthRecord 写时回写，profile 卡片直接读）=====
+    weight_date = models.DateField(null=True, blank=True, verbose_name="体重记录日期")
+    body_condition_score = models.IntegerField(
+        choices=BCS_CHOICES, null=True, blank=True, verbose_name="体况评分"
+    )
+    bcs_date = models.DateField(null=True, blank=True, verbose_name="体况评估日期")
+
     is_deleted = models.BooleanField(default=False, verbose_name="是否删除")
     created_at = models.DateTimeField(default=timezone.now, verbose_name="创建时间")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
@@ -201,6 +244,109 @@ class Pet(models.Model):
         if self.age_months is None:
             return None
         return self.age_months // 12
+
+
+class PetHealthRecord(models.Model):
+    """
+    宠物健康记录（流水表）—— 会反复发生、要看历史 / 做提醒的健康事件。
+    与 PetDiary 彻底分开：日记是用户主动写的图文记录；健康记录是结构化健康事件。
+    类型细节放 data(JSON)；所有"下次提醒"统一收敛到 remind_date，驱动一个提醒列表。
+
+    缓存策略：weight / bcs 的最新一条会回写到 Pet（当前值缓存），
+    由 PetHealthRecordViewSet 的 perform_create/update/destroy 显式调用 sync_pet_health_cache 维护，
+    不走信号机制。
+    """
+    RECORD_TYPE_CHOICES = [
+        ('weight', '体重'),
+        ('bcs', '体况评分'),
+        ('deworming', '驱虫'),
+        ('vaccine', '疫苗'),
+        ('medical', '病史'),
+    ]
+    DEWORMING_KIND_CHOICES = [
+        ('internal', '体内驱虫'),
+        ('external', '体外驱虫'),
+        ('both', '体内外联合'),
+    ]
+
+    pet = models.ForeignKey(
+        Pet, on_delete=models.CASCADE, related_name='health_records', verbose_name="宠物"
+    )
+    record_type = models.CharField(
+        max_length=20, choices=RECORD_TYPE_CHOICES, db_index=True, verbose_name="记录类型"
+    )
+    record_date = models.DateField(db_index=True, verbose_name="发生日期")
+    remind_date = models.DateField(
+        null=True, blank=True, db_index=True, verbose_name="下次提醒日期",
+        help_text="驱虫/疫苗的下次时间、病史的复诊日期，统一用它驱动提醒"
+    )
+    # 各类型结构化细节：
+    #   weight    -> {"weight": 5.5}
+    #   bcs       -> {"score": 3}
+    #   deworming -> {"kind": "internal", "drug": "大宠爱"}
+    #   vaccine   -> {"name": "狂犬疫苗"}
+    #   medical   -> {"diagnosis": "...", "hospital": "..."}
+    data = models.JSONField(default=dict, blank=True, verbose_name="结构化数据")
+    note = models.TextField(blank=True, default="", verbose_name="备注")
+    images = models.JSONField(default=list, blank=True, verbose_name="图片列表")
+
+    created_at = models.DateTimeField(default=timezone.now, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        db_table = 'pet_health_record'
+        verbose_name = "宠物健康记录"
+        verbose_name_plural = verbose_name
+        ordering = ['-record_date', '-created_at']
+        indexes = [
+            models.Index(fields=['pet', 'record_type', '-record_date']),  # 单类型时间线高频
+            models.Index(fields=['pet', '-record_date']),                 # 全类型时间线
+            models.Index(fields=['remind_date']),                         # 提醒列表
+        ]
+
+    def __str__(self):
+        return f"{self.pet.name or '未命名'} - {self.get_record_type_display()} @ {self.record_date}"
+
+
+def sync_pet_health_cache(pet, record_type):
+    """
+    把某类型的最新一条回写到 Pet 缓存字段（weight / bcs），供 profile 卡片直接读。
+    在 ViewSet 的 perform_create/update/destroy 里显式调用（不用信号）。
+    其它类型（驱虫/疫苗/病史）无缓存字段，直接跳过。
+    删光某类型所有记录时：故意不清空 Pet 上的旧值（可能是建档手填的初始体重）。
+    """
+    if record_type not in ('weight', 'bcs'):
+        return
+    latest = (pet.health_records
+              .filter(record_type=record_type)
+              .order_by('-record_date', '-created_at')
+              .first())
+    if not latest:
+        return
+
+    update_fields = []
+    if record_type == 'weight':
+        w = (latest.data or {}).get('weight')
+        if w not in (None, ''):
+            try:
+                pet.weight = Decimal(str(w))
+                pet.weight_date = latest.record_date
+                update_fields += ['weight', 'weight_date']
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+    elif record_type == 'bcs':
+        score = (latest.data or {}).get('score')
+        if score not in (None, ''):
+            try:
+                pet.body_condition_score = int(score)
+                pet.bcs_date = latest.record_date
+                update_fields += ['body_condition_score', 'bcs_date']
+            except (ValueError, TypeError):
+                pass
+
+    if update_fields:
+        update_fields.append('updated_at')
+        pet.save(update_fields=update_fields)
 
 
 class PetDiary(models.Model):

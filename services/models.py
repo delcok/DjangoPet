@@ -258,18 +258,20 @@ class Service(TimeStampedModel):
         default=list, blank=True,
         verbose_name='服务规格',
         help_text='''
-[
-    {
-        "key": "basic",                 // 规格唯一 key,订单关联用,改名不影响
-        "name": "基础护理",              // 展示名
-        "price": "88.00",                // 价格
-        "unit": "次",                    // 计价单位 label
-        "duration_minutes": 30,          // 时长(分钟),appointment 必填
-        "party_size": null,              // 容纳人数,如包房 6 人,null=单人
-        "stock": null                    // 该规格独立库存,null=共用 service.stock
-    }
-]
-        ''',
+    [
+        {
+            "key": "basic",                 // 规格唯一 key,订单关联用,改名不影响
+            "name": "基础护理",              // 展示名
+            "price": "88.00",                // 价格
+            "unit": "次",                    // 计价单位 label
+            "duration_minutes": 30,          // 时长(分钟),appointment 必填
+            "party_size": null,              // 容纳人数,如包房 6 人,null=单人
+            "stock": null,                   // 该规格独立库存,null=共用 service.stock
+            "allow_coin_deduction": null,    // 是否允许金币抵扣,null=沿用 service.allow_coin_deduction
+            "max_coin_deduction": null       // 单笔最大抵扣金币,null=沿用 service.max_coin_deduction
+        }
+    ]
+            ''',
     )
     default_duration_minutes = models.PositiveSmallIntegerField(
         null=True, blank=True,
@@ -536,6 +538,25 @@ class Service(TimeStampedModel):
                 raise ValueError('多规格服务下单必须指定 spec_key')
             return int(self.get_spec(spec_key).get('duration_minutes') or 60)
         return int(self.default_duration_minutes or 60)
+
+    def get_spec_coin_rule(self, spec_key: str = None) -> dict:
+        """
+        取某规格最终生效的金币抵扣规则(自动 fallback 到 service 级)
+        - 单规格 / 不传 spec_key:直接用 service 级
+        - 多规格:spec 上的字段不为 null 时覆盖 service 级,否则沿用
+        - allow=False 时 max 恒为 0
+        """
+        allow = self.allow_coin_deduction
+        max_ded = int(self.max_coin_deduction or 0)
+        if self.specifications and spec_key:
+            spec = self.get_spec(spec_key)
+            if spec.get('allow_coin_deduction') is not None:
+                allow = bool(spec['allow_coin_deduction'])
+            if spec.get('max_coin_deduction') is not None:
+                max_ded = int(spec['max_coin_deduction'])
+        if not allow:
+            max_ded = 0
+        return {'allow_coin_deduction': allow, 'max_coin_deduction': max_ded}
 
     # ═════════════════════════════════════════════════════════
     # 预约时段(appointment 类型专用)

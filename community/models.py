@@ -1,5 +1,7 @@
 from django.db import models
 from django.utils import timezone
+
+from managers.models import Manager
 from user.models import User
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
 
@@ -11,6 +13,25 @@ class BaseModel(models.Model):
 
     class Meta:
         abstract = True
+
+
+# ======================================================================
+# 软删除 Manager
+# - objects：默认查询，自动排除 is_deleted=True（业务代码无需手动 exclude）
+# - all_objects：全量（后台审计 / 对账 / 数据迁移用）
+# 注意：模型里需设 Meta.base_manager_name = 'all_objects'，
+#       否则关联查询（post.comments、级联、refresh_from_db）会用第一个 manager，
+#       导致已软删的关联对象"凭空消失"，引发难查的 bug。
+# ======================================================================
+class ActiveManager(models.Manager):
+    """默认排除软删除记录"""
+    def get_queryset(self):
+        return super().get_queryset().filter(is_deleted=False)
+
+
+class AllManager(models.Manager):
+    """不过滤，返回全部记录"""
+    pass
 
 
 class PostCategory(BaseModel):
@@ -100,7 +121,7 @@ class Post(BaseModel):
         max_digits=10, decimal_places=7, null=True, blank=True, verbose_name="经度"
     )
 
-    # 互动统计 - 使用PositiveIntegerField
+    # 互动统计 - 使用PositiveIntegerField（计数由 Celery 异步对账，业务侧 F() 原子增减）
     view_count = models.PositiveIntegerField(default=0, verbose_name="浏览量")
     like_count = models.PositiveIntegerField(default=0, db_index=True, verbose_name="点赞数")
     comment_count = models.PositiveIntegerField(default=0, verbose_name="评论数")
@@ -126,9 +147,19 @@ class Post(BaseModel):
     is_featured = models.BooleanField(default=False, db_index=True, verbose_name="是否精选")
     is_top = models.BooleanField(default=False, db_index=True, verbose_name="是否置顶")
 
+    # 软删除（用户主动删帖，与 status 的审核/封禁语义分离：
+    #   status  → 审核状态 / 管理动作（pending/approved/banned/hidden...）
+    #   is_deleted → 用户主动删除，由 ActiveManager 默认过滤）
+    is_deleted = models.BooleanField(default=False, db_index=True, verbose_name="是否删除")
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name="删除时间")
+
+    # 编辑标记
+    is_edited = models.BooleanField(default=False, verbose_name="是否编辑过")
+    edited_at = models.DateTimeField(null=True, blank=True, verbose_name="最后编辑时间")
+
     # 审核相关
     reviewer = models.ForeignKey(
-        User,
+        Manager,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -156,27 +187,36 @@ class Post(BaseModel):
     published_at = models.DateTimeField(null=True, blank=True, db_index=True, verbose_name="发布时间")
     last_active_at = models.DateTimeField(null=True, blank=True, db_index=True, verbose_name="最后活跃时间")
 
+    # Manager（objects 默认排除软删除；all_objects 全量）
+    objects = ActiveManager()
+    all_objects = AllManager()
+
     class Meta:
         db_table = 'posts'
         verbose_name = '帖子'
         verbose_name_plural = '帖子'
-        ordering = ['-is_top', '-hot_score', '-published_at']
+        # 默认排序用非空的 created_at 兜底；published_at 可空，其精确排序放到
+        # 发布列表查询里显式 F('published_at').desc(nulls_last=True)，避免跨库 NULL 顺序不一致
+        ordering = ['-is_top', '-hot_score', '-created_at']
+        # 关联查询/级联用全量 manager，防止已软删对象在 post.xxx 关联里凭空消失
+        base_manager_name = 'all_objects'
         indexes = [
             models.Index(fields=['author', 'status', '-published_at']),
             models.Index(fields=['category', 'status', '-hot_score']),
             models.Index(fields=['status', 'review_priority', '-created_at']),
             models.Index(fields=['-last_active_at']),
+            models.Index(fields=['is_deleted', 'status', '-published_at']),  # 列表高频路径
         ]
 
     def __str__(self):
         return f"{self.author.username} - {self.title}"
 
     def save(self, *args, **kwargs):
-        # 获取旧状态用于对比
+        # 获取旧状态用于对比（用 all_objects，避免软删记录读不到）
         old = None
         if self.pk:
             try:
-                old = Post.objects.get(pk=self.pk)
+                old = Post.all_objects.get(pk=self.pk)
             except Post.DoesNotExist:
                 old = None
 
@@ -197,6 +237,13 @@ class Post(BaseModel):
         # 设为精选 +50
         if old and not old.is_featured and self.is_featured:
             self._grant_post_reward(50, scene='featured')
+
+    def soft_delete(self):
+        """用户主动删帖：软删除"""
+        if not self.is_deleted:
+            self.is_deleted = True
+            self.deleted_at = timezone.now()
+            self.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
 
     def _grant_post_reward(self, points, scene):
         """
@@ -226,7 +273,7 @@ class Post(BaseModel):
     @property
     def is_published(self):
         """是否已发布"""
-        return self.status == 'approved'
+        return self.status == 'approved' and not self.is_deleted
 
     @property
     def engagement_rate(self):
@@ -274,6 +321,36 @@ class PostMedia(BaseModel):
         ]
 
 
+class PostTopic(BaseModel):
+    """
+    帖子-话题关联（多对多）
+    用显式中间表而非 ManyToManyField：BaseModel 提供 created_at，
+    话题详情页"最新加入的帖子"排序要用它（自动中间表没有时间字段）。
+    Topic.post_count 由 Celery 数本表对账。
+    """
+    post = models.ForeignKey(
+        Post, on_delete=models.CASCADE, related_name='post_topics', verbose_name="帖子"
+    )
+    topic = models.ForeignKey(
+        'Topic', on_delete=models.CASCADE, related_name='topic_posts', verbose_name="话题"
+    )
+
+    class Meta:
+        db_table = 'post_topics'
+        verbose_name = '帖子话题关联'
+        verbose_name_plural = '帖子话题关联'
+        constraints = [
+            models.UniqueConstraint(fields=['post', 'topic'], name='unique_post_topic')
+        ]
+        indexes = [
+            models.Index(fields=['topic', '-created_at']),   # 话题详情页拉帖子
+            models.Index(fields=['post']),                   # 帖子详情页拉话题
+        ]
+
+    def __str__(self):
+        return f"post#{self.post_id} - topic#{self.topic_id}"
+
+
 class Comment(BaseModel):
     """评论"""
     post = models.ForeignKey(
@@ -309,16 +386,26 @@ class Comment(BaseModel):
     is_author_reply = models.BooleanField(default=False, verbose_name="是否作者回复")
     is_featured = models.BooleanField(default=False, db_index=True, verbose_name="是否精选评论")
     is_deleted = models.BooleanField(default=False, db_index=True, verbose_name="是否删除")
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name="删除时间")
+
+    # 编辑标记
+    is_edited = models.BooleanField(default=False, verbose_name="是否编辑过")
+    edited_at = models.DateTimeField(null=True, blank=True, verbose_name="最后编辑时间")
 
     # IP地址记录
     ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name="IP地址")
     location = models.CharField(max_length=50, blank=True, default="", verbose_name="发布位置")
+
+    # Manager（评论原本就有 is_deleted，统一接入 ActiveManager）
+    objects = ActiveManager()
+    all_objects = AllManager()
 
     class Meta:
         db_table = 'comments'
         verbose_name = '评论'
         verbose_name_plural = '评论'
         ordering = ['-is_featured', '-like_count', '-created_at']
+        base_manager_name = 'all_objects'
         indexes = [
             models.Index(fields=['post', 'is_deleted', '-created_at']),
             models.Index(fields=['author', '-created_at']),
@@ -327,6 +414,13 @@ class Comment(BaseModel):
 
     def __str__(self):
         return f"{self.author.username}: {self.content[:30]}..."
+
+    def soft_delete(self):
+        """软删除评论"""
+        if not self.is_deleted:
+            self.is_deleted = True
+            self.deleted_at = timezone.now()
+            self.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
 
 
 class Topic(BaseModel):
@@ -370,9 +464,13 @@ class Topic(BaseModel):
         verbose_name="审核状态"
     )
 
+    # 软删除（原本完全没有删除语义，补上）
+    is_deleted = models.BooleanField(default=False, db_index=True, verbose_name="是否删除")
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name="删除时间")
+
     # 审核信息
     reviewer = models.ForeignKey(
-        User,
+        Manager,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -395,11 +493,16 @@ class Topic(BaseModel):
     # 举报相关
     report_count = models.PositiveSmallIntegerField(default=0, verbose_name="举报次数")
 
+    # Manager
+    objects = ActiveManager()
+    all_objects = AllManager()
+
     class Meta:
         db_table = 'topics'
         verbose_name = '话题'
         verbose_name_plural = '话题'
         ordering = ['-is_featured', '-hot_score', '-post_count']
+        base_manager_name = 'all_objects'
         indexes = [
             models.Index(fields=['status', '-hot_score']),
             models.Index(fields=['creator', 'status']),
@@ -409,10 +512,17 @@ class Topic(BaseModel):
     def __str__(self):
         return f"#{self.name}"
 
+    def soft_delete(self):
+        """软删除话题"""
+        if not self.is_deleted:
+            self.is_deleted = True
+            self.deleted_at = timezone.now()
+            self.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
+
     @property
     def can_be_used(self):
         """判断话题是否可以使用"""
-        return self.status == 'approved'
+        return self.status == 'approved' and not self.is_deleted
 
 
 class UserAction(BaseModel):
@@ -523,6 +633,41 @@ class UserAction(BaseModel):
         return f"{self.user.username} - {dict(self.ACTION_TYPE_CHOICES)[self.action_type]}"
 
 
+class Mention(BaseModel):
+    """
+    @提及记录：谁在哪条内容里提到了谁。
+    发帖/评论时解析 content 里的 @xxx 写入本表 → Celery 据此发 mention 通知，
+    给 Notification 的 mention 类型提供数据源。
+    """
+    SOURCE_TYPE_CHOICES = [
+        ('post', '帖子'),
+        ('comment', '评论'),
+    ]
+
+    mentioned_user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='mentions_received', verbose_name="被提及者"
+    )
+    mention_by = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='mentions_made', verbose_name="提及者"
+    )
+    source_type = models.CharField(
+        max_length=10, choices=SOURCE_TYPE_CHOICES, verbose_name="来源类型"
+    )
+    source_id = models.PositiveIntegerField(db_index=True, verbose_name="来源ID")
+
+    class Meta:
+        db_table = 'mentions'
+        verbose_name = '提及记录'
+        verbose_name_plural = '提及记录'
+        indexes = [
+            models.Index(fields=['mentioned_user', '-created_at']),
+            models.Index(fields=['source_type', 'source_id']),
+        ]
+
+    def __str__(self):
+        return f"{self.mention_by_id} @ {self.mentioned_user_id} in {self.source_type}#{self.source_id}"
+
+
 class ReviewLog(BaseModel):
     """统一的审核日志"""
 
@@ -552,7 +697,7 @@ class ReviewLog(BaseModel):
     content_id = models.PositiveIntegerField(db_index=True, verbose_name="内容ID")
 
     reviewer = models.ForeignKey(
-        User,
+        Manager,
         on_delete=models.CASCADE,
         verbose_name="审核人"
     )
@@ -696,7 +841,7 @@ class Report(BaseModel):
     )
 
     handler = models.ForeignKey(
-        User,
+        Manager,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

@@ -413,3 +413,52 @@ class InviteReward(models.Model):
 
     def __str__(self):
         return f'{self.inviter_id} 邀请 {self.invitee_id} +{self.reward_gold}'
+
+class UserProfileAudit(models.Model):
+    """
+    用户资料修改审核（头像 / 昵称）
+    - 用户提交的新头像/昵称先进这张表，status=pending
+    - 管理员审核通过(approve) → 写回 User 的真实字段
+    - 驳回(reject) → 不动用户资料，记录原因
+    - 约定：每个 (user, field) 同时最多一条 pending 记录
+    """
+
+    class Field(models.TextChoices):
+        USERNAME = 'username', '昵称'
+        AVATAR   = 'avatar',   '头像'
+
+    class Status(models.TextChoices):
+        PENDING  = 'pending',  '待审核'
+        APPROVED = 'approved', '已通过'
+        REJECTED = 'rejected', '已驳回'
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE,
+        related_name='profile_audits', verbose_name='用户'
+    )
+    field = models.CharField(max_length=20, choices=Field.choices, verbose_name='字段')
+    old_value = models.TextField(blank=True, default='', verbose_name='原值')
+    new_value = models.TextField(blank=True, default='', verbose_name='新值(待审核)')
+    status = models.CharField(
+        max_length=10, choices=Status.choices,
+        default=Status.PENDING, db_index=True, verbose_name='审核状态'
+    )
+
+    reviewer_id = models.IntegerField(null=True, blank=True, verbose_name='审核管理员ID')
+    reviewed_at = models.DateTimeField(null=True, blank=True, verbose_name='审核时间')
+    reject_reason = models.CharField(max_length=200, blank=True, default='', verbose_name='驳回原因')
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True, verbose_name='提交时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'user_profile_audits'
+        verbose_name = '资料审核'
+        verbose_name_plural = '资料审核'
+        indexes = [
+            models.Index(fields=['user', 'field', 'status']),
+            models.Index(fields=['status', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.user_id} {self.get_field_display()} {self.get_status_display()}'

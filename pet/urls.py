@@ -8,6 +8,7 @@ from .views import (
     PetCategoryViewSet,
     PetBreedViewSet,
     PetViewSet,
+    PetHealthRecordViewSet,
     PetDiaryViewSet,
     PetServiceRecordViewSet
 )
@@ -19,6 +20,7 @@ router = DefaultRouter()
 router.register(r'categories', PetCategoryViewSet, basename='pet-category')
 router.register(r'breeds', PetBreedViewSet, basename='pet-breed')
 router.register(r'pets', PetViewSet, basename='pet')
+router.register(r'health-records', PetHealthRecordViewSet, basename='pet-health-record')
 router.register(r'diaries', PetDiaryViewSet, basename='pet-diary')
 router.register(r'service-records', PetServiceRecordViewSet, basename='pet-service-record')
 

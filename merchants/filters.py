@@ -1,5 +1,5 @@
 import django_filters
-from django.db.models import Q, F, FloatField, ExpressionWrapper
+from django.db.models import Q, F, FloatField, ExpressionWrapper, Min
 from django.db.models.functions import Power, Sqrt, Cast
 from math import cos, radians
 
@@ -47,17 +47,26 @@ class MerchantUserFilter(django_filters.FilterSet):
     district_id = django_filters.NumberFilter(field_name='business_district_id')
     rating_min = django_filters.NumberFilter(field_name='rating', lookup_expr='gte')
     is_open = django_filters.BooleanFilter(field_name='is_open')
+    is_recommended = django_filters.BooleanFilter(field_name='is_recommended')      # ✅ 平台推荐
     has_delivery = django_filters.BooleanFilter(method='filter_has_delivery')
-    sort = django_filters.CharFilter(method='filter_sort')
+    service_mode = django_filters.CharFilter(method='filter_service_mode')          # ✅ 上门/到店
+    support_urgent = django_filters.BooleanFilter(method='filter_support_urgent')   # ✅ 支持紧急
+
+    # ⚠️ 分类过滤器必须声明在 sort 之前:sort=price_* 要用到分类约束去 annotate 价格
     service_category_id = django_filters.NumberFilter(method='filter_by_service_category')
     goods_category_id = django_filters.NumberFilter(method='filter_by_goods_category')
+    sort = django_filters.CharFilter(method='filter_sort')
+
+    # 说明:price_min / price_max / is_hot 不单独声明字段,而是在"分类关系"里和分类约束
+    #   写进【同一个 .filter()】,保证命中的是同一条 goods / service 行,
+    #   否则会对关系产生第二次 JOIN,把"该分类下 >=300 的商品"放宽成"有任意 >=300 的商品"。
 
     class Meta:
         model = Merchant
         fields = ['keyword', 'category_id', 'district_id', 'rating_min', 'is_open']
 
+    # ── 基础过滤 ──────────────────────────────────────────────
     def filter_keyword(self, queryset, name, value):
-        """✅ 修复 #4: LIKE 通配符转义"""
         if value:
             safe = escape_like(value)
             return queryset.filter(
@@ -66,50 +75,89 @@ class MerchantUserFilter(django_filters.FilterSet):
         return queryset
 
     def filter_has_delivery(self, queryset, name, value):
-        """
-        ✅ 修复 #8: 配送方式开关已经独立成 support_home_delivery 字段,
-        旧实现用 delivery_range > 0 判断已不准确。
-        """
         if value is True:
             return queryset.filter(support_home_delivery=True)
         if value is False:
             return queryset.filter(support_home_delivery=False)
         return queryset
 
-    def filter_sort(self, queryset, name, value):
-        """
-        ✅ 修复 #10: 只在显式传 sort 时排序,
-        否则保留 Model.Meta.ordering 默认值。
-        """
-        sort_mapping = {
-            'rating': '-rating',
-            'sales': '-monthly_sales',
-            'newest': '-created_at',
-        }
-        if value in sort_mapping:
-            return queryset.order_by(sort_mapping[value], '-id')
+    def filter_service_mode(self, queryset, name, value):
+        # 服务模式(传了 service_category_id)交给服务关系处理,scope 到所选分类内的服务行
+        if self.data.get('service_category_id'):
+            return queryset
+        # 商品模式/无服务分类:退化为按商家配送能力近似(上门=送货上门,到店=到店自提)
+        if value == 'home':
+            return queryset.filter(support_home_delivery=True)
+        if value == 'store':
+            return queryset.filter(support_self_pickup=True)
         return queryset
 
-    def filter_by_service_category(self, queryset, name, value):
-        ok, value = _coerce_positive_int(value)
-        if value is None:
+    def filter_support_urgent(self, queryset, name, value):
+        if value is not True:
             return queryset
-        if not ok:
-            return queryset.none()
-
-        from services.models import ServiceCategory, Service
-
-        try:
-            category = ServiceCategory.objects.get(id=value, is_active=True)
-        except ServiceCategory.DoesNotExist:
-            return queryset.none()
-
-        category_ids = _collect_descendant_ids(category, active_only=True)
-
+        # 服务模式交给服务关系(scope 到所选分类)
+        if self.data.get('service_category_id'):
+            return queryset
+        # 否则:商家是否有任意一个支持加急的在售服务
+        from services.models import Service
         return queryset.filter(
-            services__category_id__in=category_ids,
             services__status=Service.Status.ACTIVE,
+            services__urgent_config__isnull=False,
         ).distinct()
+
+    # ── 共享参数读取 ──────────────────────────────────────────
+    def _read_price_range(self):
+        def _num(key):
+            raw = self.data.get(key)
+            if raw in (None, ''):
+                return None
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+        return _num('price_min'), _num('price_max')
+
+    def _wants_hot(self):
+        return str(self.data.get('is_hot', '')).lower() in ('1', 'true')
+
+    def _wants_urgent(self):
+        return str(self.data.get('support_urgent', '')).lower() in ('1', 'true')
+
+    def _service_mode_value(self):
+        v = self.data.get('service_mode')
+        return v if v in ('home', 'store', 'pickup') else None
+
+    # ── 商品关系:分类 + 价格 + 热门(同一个 Q)──────────────────
+    def _apply_goods_relation(self, queryset, category_ids):
+        cond = Q(goods__category_id__in=category_ids, goods__status='on_sale')
+        pmin, pmax = self._read_price_range()
+        if pmin is not None:
+            cond &= Q(goods__price__gte=pmin)
+        if pmax is not None:
+            cond &= Q(goods__price__lte=pmax)
+        if self._wants_hot():
+            cond &= Q(goods__is_hot=True)
+        return queryset.filter(cond).distinct()
+
+    # ── 服务关系:分类 + 价格 + 热门 + 服务方式 + 加急(同一个 Q)──
+    def _apply_service_relation(self, queryset, category_ids):
+        from services.models import Service
+        cond = Q(services__category_id__in=category_ids,
+                 services__status=Service.Status.ACTIVE)
+        pmin, pmax = self._read_price_range()
+        if pmin is not None:
+            cond &= Q(services__price__gte=pmin)
+        if pmax is not None:
+            cond &= Q(services__price__lte=pmax)
+        if self._wants_hot():
+            cond &= Q(services__is_hot=True)
+        mode = self._service_mode_value()
+        if mode:
+            cond &= Q(services__service_mode=mode)
+        if self._wants_urgent():
+            # 支持加急 = urgent_config 非空(与 ServiceListSerializer.get_support_urgent 一致)
+            cond &= Q(services__urgent_config__isnull=False)
+        return queryset.filter(cond).distinct()
 
     def filter_by_goods_category(self, queryset, name, value):
         ok, value = _coerce_positive_int(value)
@@ -117,22 +165,87 @@ class MerchantUserFilter(django_filters.FilterSet):
             return queryset
         if not ok:
             return queryset.none()
-
         from product.models import GoodsCategory
-
         try:
             category = GoodsCategory.objects.get(id=value, is_active=True)
         except GoodsCategory.DoesNotExist:
             return queryset.none()
-
         category_ids = _collect_descendant_ids(category, active_only=True)
+        self._goods_category_ids = category_ids   # 供 sort=price_* 使用
+        return self._apply_goods_relation(queryset, category_ids)
 
-        return queryset.filter(
-            goods__category_id__in=category_ids,
-            goods__status='on_sale',
-        ).distinct()
+    def filter_by_service_category(self, queryset, name, value):
+        ok, value = _coerce_positive_int(value)
+        if value is None:
+            return queryset
+        if not ok:
+            return queryset.none()
+        from services.models import ServiceCategory
+        try:
+            category = ServiceCategory.objects.get(id=value, is_active=True)
+        except ServiceCategory.DoesNotExist:
+            return queryset.none()
+        category_ids = _collect_descendant_ids(category, active_only=True)
+        self._service_category_ids = category_ids
+        return self._apply_service_relation(queryset, category_ids)
 
+    # ── 排序 ──────────────────────────────────────────────────
+    def filter_sort(self, queryset, name, value):
+        if value == 'distance':
+            return self._sort_by_distance(queryset)
+        if value in ('price_asc', 'price_desc'):
+            return self._sort_by_price(queryset, descending=(value == 'price_desc'))
+        mapping = {
+            'rating': '-rating',
+            'sales': '-monthly_sales',
+            'newest': '-created_at',
+        }
+        if value in mapping:
+            return queryset.order_by(mapping[value], '-id')
+        return queryset
 
+    def _sort_by_distance(self, queryset):
+        lng_raw = self.data.get('longitude')
+        lat_raw = self.data.get('latitude')
+        if lng_raw in (None, '') or lat_raw in (None, ''):
+            return queryset
+        try:
+            lng, lat = float(lng_raw), float(lat_raw)
+        except (TypeError, ValueError):
+            return queryset
+        cos_lat = max(abs(cos(radians(lat))), 1e-6)   # 经度差按纬度修正,防高纬误差
+        lng_f = Cast('longitude', output_field=FloatField())
+        lat_f = Cast('latitude', output_field=FloatField())
+        return queryset.annotate(
+            _distance=ExpressionWrapper(
+                Sqrt(Power((lng_f - lng) * cos_lat, 2) + Power(lat_f - lat, 2)) * 111000,
+                output_field=FloatField(),
+            )
+        ).order_by(F('_distance').asc(nulls_last=True))   # 无坐标商家排最后
+
+    def _sort_by_price(self, queryset, descending):
+        goods_ids = getattr(self, '_goods_category_ids', None)
+        service_ids = getattr(self, '_service_category_ids', None)
+        if goods_ids is not None:
+            queryset = queryset.annotate(
+                _min_price=Min('goods__price', filter=Q(
+                    goods__category_id__in=goods_ids,
+                    goods__status='on_sale',
+                ))
+            )
+        elif service_ids is not None:
+            from services.models import Service
+            queryset = queryset.annotate(
+                _min_price=Min('services__price', filter=Q(
+                    services__category_id__in=service_ids,
+                    services__status=Service.Status.ACTIVE,
+                ))
+            )
+        else:
+            return queryset   # 没有分类上下文,无法按商品/服务价排序
+        order = (F('_min_price').desc(nulls_last=True) if descending
+                 else F('_min_price').asc(nulls_last=True))
+        return queryset.order_by(order)
 # ══════════════════════════════════════════════════════════════
 # C 端用户 - 附近商家过滤器
 # ══════════════════════════════════════════════════════════════

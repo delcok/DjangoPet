@@ -1,20 +1,27 @@
+from datetime import timedelta
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q, Count, Avg
+from django.utils import timezone
 
 from utils.authentication import UserAuthentication
 from utils.permission import IsUser, IsResourceOwner, IsAuthorOrReadOnly, AllowAny, IsServiceProvider
-from .models import PetCategory, PetBreed, Pet, PetDiary, PetServiceRecord
+from .models import PetCategory, PetBreed, Pet, PetHealthRecord, PetDiary, PetServiceRecord
+from .models import sync_pet_health_cache
 from .serializers import (
     PetCategorySerializer, PetBreedSerializer,
     PetListSerializer, PetDetailSerializer,
+    PetHealthRecordSerializer,
     PetDiaryListSerializer, PetDiaryDetailSerializer,
     PetServiceRecordListSerializer, PetServiceRecordDetailSerializer,
     PetServiceRecordCreateSerializer
 )
-from .filters import PetFilter, PetBreedFilter, PetDiaryFilter, PetServiceRecordFilter
+from .filters import (
+    PetFilter, PetBreedFilter, PetDiaryFilter,
+    PetServiceRecordFilter, PetHealthRecordFilter
+)
 
 
 class PetCategoryViewSet(viewsets.ReadOnlyModelViewSet):
@@ -79,7 +86,7 @@ class PetViewSet(viewsets.ModelViewSet):
     """
     宠物信息视图集（用户隐私数据，仅主人可见 / 可管理）
     list: 获取当前用户的宠物列表
-    retrieve: 获取宠物详情
+    retrieve: 获取宠物详情（含 current_health 健康汇总）
     create: 创建宠物（快速建档只需 category；品种等可后续完善）
     update/partial_update: 更新宠物信息
     destroy: 删除宠物（软删除）
@@ -98,9 +105,13 @@ class PetViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """只返回当前用户的宠物"""
-        return Pet.objects.filter(
+        qs = Pet.objects.filter(
             owner=self.request.user, is_deleted=False
         ).select_related('category', 'breed')
+        if self.action == 'retrieve':
+            # current_health 要遍历 health_records，prefetch 一次查完，避免 N+1
+            qs = qs.prefetch_related('health_records')
+        return qs
 
     def get_serializer_class(self):
         """根据不同操作返回不同的序列化器"""
@@ -130,6 +141,24 @@ class PetViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
 
         serializer = PetDiaryListSerializer(diaries, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def health_records(self, request, pk=None):
+        """获取指定宠物的健康记录（可选 ?record_type=weight/bcs/deworming/vaccine/medical）"""
+        pet = self.get_object()
+        qs = pet.health_records.all()
+        rt = request.query_params.get('record_type')
+        if rt:
+            qs = qs.filter(record_type=rt)
+
+        page = self.paginate_queryset(qs)
+        ser_ctx = {'request': request}
+        if page is not None:
+            serializer = PetHealthRecordSerializer(page, many=True, context=ser_ctx)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = PetHealthRecordSerializer(qs, many=True, context=ser_ctx)
         return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
@@ -172,6 +201,79 @@ class PetViewSet(viewsets.ModelViewSet):
                 'U': gender_counts.get('U', 0),
             }
         })
+
+
+class PetHealthRecordViewSet(viewsets.ModelViewSet):
+    """
+    宠物健康记录视图集（流水：体重/体况/驱虫/疫苗/病史）
+    list: 健康记录列表（按 pet / record_type / 日期 过滤）
+    retrieve: 详情
+    create: 新增（写后同步 weight/bcs 缓存到 Pet）
+    update/partial_update: 更新（同步缓存）
+    destroy: 删除（重算缓存，回退到上一条）
+    reminders: 我所有宠物即将到来的提醒（驱虫/疫苗/复诊）
+    weight_trend: 体重趋势点位（画曲线）
+
+    权限：IsUser。get_queryset 已按 pet__owner 限定，get_object 走它即可兜住对象级越权。
+    缓存维护：不走信号，在 perform_* 里显式调用 sync_pet_health_cache。
+    """
+    serializer_class = PetHealthRecordSerializer
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_class = PetHealthRecordFilter
+    ordering_fields = ['record_date', 'remind_date', 'created_at']
+    ordering = ['-record_date', '-created_at']
+
+    def get_queryset(self):
+        return (PetHealthRecord.objects
+                .filter(pet__owner=self.request.user)
+                .select_related('pet'))
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        sync_pet_health_cache(instance.pet, instance.record_type)
+
+    def perform_update(self, serializer):
+        old_type = serializer.instance.record_type
+        instance = serializer.save()
+        # 类型被改过：旧类型也要重算（极少见，但保证一致）
+        if old_type != instance.record_type:
+            sync_pet_health_cache(instance.pet, old_type)
+        sync_pet_health_cache(instance.pet, instance.record_type)
+
+    def perform_destroy(self, instance):
+        pet = instance.pet
+        record_type = instance.record_type
+        instance.delete()
+        sync_pet_health_cache(pet, record_type)
+
+    @action(detail=False, methods=['get'])
+    def reminders(self, request):
+        """我所有宠物即将到来的提醒（驱虫/疫苗/复诊），可选 ?within_days=30"""
+        today = timezone.localdate()
+        qs = self.get_queryset().filter(remind_date__gte=today).order_by('remind_date')
+        within = request.query_params.get('within_days')
+        if within:
+            try:
+                qs = qs.filter(remind_date__lte=today + timedelta(days=int(within)))
+            except ValueError:
+                pass
+        page = self.paginate_queryset(qs)
+        ser = self.get_serializer(page if page is not None else qs, many=True)
+        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
+
+    @action(detail=False, methods=['get'])
+    def weight_trend(self, request):
+        """体重趋势：?pet=<id>，按日期升序返回点位，给前端画曲线"""
+        pet_id = request.query_params.get('pet')
+        if not pet_id:
+            return Response({'error': '请提供 pet 参数'}, status=status.HTTP_400_BAD_REQUEST)
+        qs = (self.get_queryset()
+              .filter(pet_id=pet_id, record_type='weight')
+              .order_by('record_date'))
+        points = [{'date': r.record_date, 'weight': (r.data or {}).get('weight')} for r in qs]
+        return Response({'pet': int(pet_id), 'points': points})
 
 
 class PetDiaryViewSet(viewsets.ModelViewSet):

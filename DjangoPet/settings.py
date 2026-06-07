@@ -93,6 +93,7 @@ INSTALLED_APPS = [
     'services',
     'staffs',
     'wallet',
+    'adoption',
 
 
 

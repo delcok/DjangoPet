@@ -5,10 +5,10 @@ from rest_framework.response import Response
 from utils.authentication import ManagerAuthentication
 from utils.permission import IsManager
 
-from .models import HomepagePosition
+from .models import HomepagePosition, HomepageSection
 from .serializers import (
     HomepagePositionItemSerializer,
-    AdminHomepagePositionSerializer,
+    AdminHomepagePositionSerializer, HomepageSectionSerializer, AdminHomepageSectionSerializer,
 )
 
 
@@ -107,3 +107,36 @@ class AdminHomepagePositionViewSet(viewsets.ModelViewSet):
         elif is_active in ('false', '0'):
             qs = qs.filter(is_active=False)
         return qs
+
+# ══════════════════════════════════════════════════════════
+# 用户端：板块标题（公开）
+# ══════════════════════════════════════════════════════════
+class HomepageSectionListView(APIView):
+    """GET /api/homepage/sections/  返回三块区域的标题"""
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        HomepageSection.ensure_defaults()
+        qs = HomepageSection.objects.all()
+        return Response(HomepageSectionSerializer(qs, many=True).data)
+
+
+# ══════════════════════════════════════════════════════════
+# 管理端：板块标题编辑（只读列表 + 改，禁止增删）
+# ══════════════════════════════════════════════════════════
+class AdminHomepageSectionViewSet(viewsets.ModelViewSet):
+    """
+    - GET   /api/admin/homepage/sections/                列表(固定3条)
+    - PATCH /api/admin/homepage/sections/{position}/     改标题
+    """
+    authentication_classes = [ManagerAuthentication]
+    permission_classes = [IsManager]
+    serializer_class = AdminHomepageSectionSerializer
+    pagination_class = None
+    lookup_field = 'position'
+    http_method_names = ['get', 'put', 'patch', 'head', 'options']  # 不开放 post/delete
+
+    def get_queryset(self):
+        HomepageSection.ensure_defaults()
+        return HomepageSection.objects.all()

@@ -91,8 +91,8 @@ def _generate_campaign_qrcode(campaign: Campaign, force: bool = False) -> str:
         'scene': campaign.wx_scene,
         'page': campaign.wx_code_page,         # 例如 'pages/campaigns/campaigns'
         'width': 430,
-        'check_path': False,                   # 上线后页面已发布可改 True
-        'env_version': 'trial',              # release/trial/develop
+        'check_path': True,                   # 上线后页面已发布可改 True
+        'env_version': 'release',              # release/trial/develop
     }
 
     try:

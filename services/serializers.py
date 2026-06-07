@@ -176,6 +176,7 @@ class ServiceListSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', default='', read_only=True)
     category_full_name = serializers.SerializerMethodField()
     is_favorited = serializers.SerializerMethodField()
+    spec_coin_rules = serializers.SerializerMethodField()
 
     # 从 urgent_config 衍生的展示字段(列表卡片需要显示"支持加急"角标)
     support_urgent = serializers.SerializerMethodField()
@@ -187,13 +188,21 @@ class ServiceListSerializer(serializers.ModelSerializer):
             'service_type', 'service_type_display',
             'service_mode', 'service_mode_display',
             'price', 'original_price', 'price_unit',
-            'status',
+            'status', 'points_reward', 'spec_coin_rules',
             'total_sales', 'rating', 'review_count',
             'is_recommended', 'is_hot', 'support_urgent',
             'merchant', 'merchant_name',
             'category', 'category_name', 'category_full_name',
             'is_favorited', 'detail_images',
         ]
+
+    def get_spec_coin_rules(self, obj):
+        if not obj.specifications:
+            return {}
+        return {
+            sp['key']: obj.get_spec_coin_rule(sp['key'])
+            for sp in obj.specifications if sp.get('key')
+        }
 
     def get_is_favorited(self, obj):
         request = self.context.get('request')
@@ -693,6 +702,18 @@ class MerchantServiceCreateSerializer(serializers.ModelSerializer):
                     'specifications': f'规格「{key}」的 stock 必须是整数(-1 表示不限)',
                 })
 
+            # 规格级金币抵扣(可选,缺省=沿用 service 级)
+            allow_coin = sp.get('allow_coin_deduction')
+            if allow_coin is not None and not isinstance(allow_coin, bool):
+                raise serializers.ValidationError({
+                    'specifications': f'规格「{key}」的 allow_coin_deduction 必须是布尔值',
+                })
+            max_coin = sp.get('max_coin_deduction')
+            if max_coin is not None and (not isinstance(max_coin, int) or max_coin < 0):
+                raise serializers.ValidationError({
+                    'specifications': f'规格「{key}」的 max_coin_deduction 必须是非负整数',
+                })
+
             normalized.append({
                 'key': key,
                 'name': name,
@@ -701,6 +722,8 @@ class MerchantServiceCreateSerializer(serializers.ModelSerializer):
                 **({'duration_minutes': duration} if duration else {}),
                 **({'party_size': party_size} if party_size else {}),
                 **({'stock': stock} if stock is not None else {}),
+                **({'allow_coin_deduction': allow_coin} if allow_coin is not None else {}),
+                **({'max_coin_deduction': max_coin} if max_coin is not None else {}),
             })
 
         attrs['specifications'] = normalized

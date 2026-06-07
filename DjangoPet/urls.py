@@ -46,5 +46,6 @@ urlpatterns = [
     path('api/v1/', include('services.urls')),
     path('api/v1/', include('staffs.urls')),
     path('api/v1/', include('wallet.urls')),
-    path('api/v1/', include('prize.urls'))
+    path('api/v1/', include('prize.urls')),
+    path('api/v1/', include('adoption.urls'))
 ]

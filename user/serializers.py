@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from rest_framework import serializers
 from django.utils import timezone
-from .models import User, UserAuthProvider, UserDevice, UserLoginLog
+from .models import User, UserAuthProvider, UserDevice, UserLoginLog, UserProfileAudit
 
 
 # ═══════════════════════════════════════════════════════
@@ -14,6 +14,7 @@ class UserSerializer(serializers.ModelSerializer):
     display_name = serializers.ReadOnlyField()
     avatar_url = serializers.SerializerMethodField()
     vip_status = serializers.SerializerMethodField()
+    pending_profile = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -27,6 +28,7 @@ class UserSerializer(serializers.ModelSerializer):
             'is_public', 'allow_message',
             'is_active', 'display_name',
             'last_login', 'created_at', 'updated_at',
+            'pending_profile',
         ]
         read_only_fields = [
             'id', 'phone', 'is_vip', 'vip_level', 'vip_expired_at',
@@ -40,7 +42,7 @@ class UserSerializer(serializers.ModelSerializer):
             return obj.avatar
         elif obj.avatar:
             return f"https://cdn.yimengzhiyuan.com/{obj.avatar.lstrip('/')}"   # ★ 换成你的真实 CDN
-        return "https://cdn.yimengzhiyuan.com/avatar/default.png"
+        return "https://cdn.yimengzhiyuan.com/avatar/av-gen.png"
 
     def get_vip_status(self, obj):
         if not obj.is_vip:
@@ -48,6 +50,27 @@ class UserSerializer(serializers.ModelSerializer):
         if obj.vip_expired_at and obj.vip_expired_at < timezone.now():
             return 'VIP已过期'
         return f'VIP{obj.vip_level}级用户'
+
+    def get_pending_profile(self, obj):
+        """
+        返回用户自己「未通过」的头像/昵称（pending 或最近一次 rejected）。
+        前端用 status 决定显示「审核中」还是「已驳回」。
+        仅用于单对象场景（get_user_info / 登录返回），不要用在列表里。
+        """
+        out = {}
+        for f in (UserProfileAudit.Field.USERNAME, UserProfileAudit.Field.AVATAR):
+            a = (UserProfileAudit.objects
+                 .filter(user=obj, field=f)
+                 .order_by('-created_at')
+                 .first())
+            if a and a.status != UserProfileAudit.Status.APPROVED:
+                out[f] = {
+                    'value': a.new_value,
+                    'status': a.status,
+                    'reject_reason': a.reject_reason,
+                    'submitted_at': a.created_at,
+                }
+        return out
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):

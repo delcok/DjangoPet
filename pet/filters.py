@@ -4,7 +4,7 @@
 
 import django_filters
 from django.db.models import Q
-from .models import Pet, PetBreed, PetDiary, PetServiceRecord
+from .models import Pet, PetBreed, PetDiary, PetServiceRecord, PetHealthRecord
 
 
 class PetBreedFilter(django_filters.FilterSet):
@@ -318,3 +318,19 @@ class PetServiceRecordFilter(django_filters.FilterSet):
         if value:
             return queryset.exclude(related_diary__isnull=True)
         return queryset.filter(related_diary__isnull=True)
+
+
+class PetHealthRecordFilter(django_filters.FilterSet):
+    pet = django_filters.NumberFilter(field_name='pet_id')
+    record_type = django_filters.CharFilter(field_name='record_type')
+    date_after = django_filters.DateFilter(field_name='record_date', lookup_expr='gte')
+    date_before = django_filters.DateFilter(field_name='record_date', lookup_expr='lte')
+    remind_after = django_filters.DateFilter(field_name='remind_date', lookup_expr='gte')
+    remind_before = django_filters.DateFilter(field_name='remind_date', lookup_expr='lte')
+    has_remind = django_filters.BooleanFilter(
+        field_name='remind_date', lookup_expr='isnull', exclude=True
+    )
+
+    class Meta:
+        model = PetHealthRecord
+        fields = ['pet', 'record_type']
