@@ -155,6 +155,7 @@ class Pet(models.Model):
         default='U',
         verbose_name="性别"
     )
+    is_neutered = models.BooleanField(default=False, verbose_name="是否绝育")
     weight = models.DecimalField(
         max_digits=5,
         decimal_places=2,

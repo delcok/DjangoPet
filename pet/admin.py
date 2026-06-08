@@ -96,7 +96,7 @@ class PetAdmin(admin.ModelAdmin):
         'weight', 'is_deleted', 'created_at'
     ]
     list_filter = [
-        'category', 'breed', 'gender', 'adoption_period',
+        'category', 'breed', 'gender', 'is_neutered', 'adoption_period',
         'is_deleted', 'created_at', 'birth_date'
     ]
     search_fields = [
@@ -113,11 +113,11 @@ class PetAdmin(admin.ModelAdmin):
             'fields': (
                 'owner', 'category', 'breed', 'breed_name',
                 'name', 'birth_date', 'adoption_period',
-                'gender', 'weight', 'color'
+                'gender', 'is_neutered', 'weight', 'color'
             )
         }),
         ('头像', {
-            'fields': ('avatar', 'avatar_preview')
+            'fields': ('avatar',)
         }),
         ('详细信息', {
             'fields': (

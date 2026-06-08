@@ -41,6 +41,9 @@ class PetFilter(django_filters.FilterSet):
     # 性别过滤
     gender = django_filters.ChoiceFilter(choices=Pet.GENDER_CHOICES)
 
+    # 绝育状态过滤
+    is_neutered = django_filters.BooleanFilter()
+
     # 到家时长
     adoption_period = django_filters.ChoiceFilter(choices=Pet.ADOPTION_PERIOD_CHOICES)
 
@@ -78,7 +81,7 @@ class PetFilter(django_filters.FilterSet):
     class Meta:
         model = Pet
         fields = [
-            'category', 'breed', 'gender',
+            'category', 'breed', 'gender', 'is_neutered',
             'min_weight', 'max_weight'
         ]
 

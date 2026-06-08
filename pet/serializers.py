@@ -129,7 +129,7 @@ class PetListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'category', 'category_name', 'category_code',
             'breed', 'breed_display',
-            'avatar', 'gender', 'gender_display', 'age_display',
+            'avatar', 'gender', 'gender_display', 'is_neutered', 'age_display',
             'weight', 'special_phase',
             'created_at'
         ]
@@ -175,7 +175,8 @@ class PetDetailSerializer(serializers.ModelSerializer):
             'id', 'owner', 'owner_name', 'category', 'category_name', 'category_code',
             'breed', 'breed_detail', 'breed_name', 'breed_display',
             'name', 'birth_date', 'adoption_period', 'adoption_period_display',
-            'gender', 'gender_display', 'weight', 'weight_date', 'color', 'avatar',
+            'gender', 'gender_display', 'is_neutered',
+            'weight', 'weight_date', 'color', 'avatar',
             'body_condition_score', 'bcs_display', 'bcs_date',
             'raising_mode', 'raising_mode_display',
             'special_phase', 'special_phase_display', 'special_phase_date',
