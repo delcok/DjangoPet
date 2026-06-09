@@ -392,6 +392,11 @@ class InviteReward(models.Model):
         verbose_name='被邀请人',
     )
     reward_gold = models.PositiveIntegerField(default=100, verbose_name='奖励金币')
+    # ★ 新增：被邀请人(新用户)注册奖励
+    invitee_reward_gold = models.PositiveIntegerField(default=0, verbose_name='被邀请人奖励金币')
+    invitee_business_no = models.CharField(
+        max_length=64, blank=True, default='', verbose_name='被邀请人钱包流水号',
+    )
     status = models.CharField(
         max_length=10, choices=STATUS_CHOICES,
         default='issued', db_index=True, verbose_name='发放状态',

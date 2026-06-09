@@ -814,6 +814,7 @@ def admin_review_profile_audit(request, audit_id):
 # 邀请功能 - 常量 & 工具
 # ═══════════════════════════════════════════════════════════════
 INVITE_REWARD_GOLD = 100  # 每邀请 1 人奖励 100 金币(后续可改)
+INVITEE_REWARD_GOLD = 100  # ★ 被邀请人(新用户)注册奖励，可独立调整
 
 INVITE_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'  # 去掉容易混淆的 I/O/0/1
 INVITE_CODE_LEN = 8
@@ -849,11 +850,11 @@ def _process_invite_reward(new_user, invite_code):
     """
     处理邀请奖励:
       1. 找到邀请人 → 绑定 invited_by
-      2. 通过 UserWallet.change_gold() 给邀请人加 100 金币
-         (内部已带行锁/原子事务/自动写流水,幂等键防重复)
-      3. 写 InviteReward 记录
+      2. 给【邀请人】加 INVITE_REWARD_GOLD 金币
+      3. 写 InviteReward 记录(先建，保证邀请人侧总有记录)
+      4. ★ 给【被邀请人】(新用户)加 INVITEE_REWARD_GOLD 金币，并回填到同一条记录
 
-    ⚠️ 必须在主注册事务【之外】调用,失败不阻断注册主流程
+    ⚠️ 必须在主注册事务【之外】调用，失败不阻断注册主流程
     """
     code = (invite_code or '').strip()
     if not code:
@@ -881,15 +882,12 @@ def _process_invite_reward(new_user, invite_code):
         if InviteReward.objects.filter(inviter=inviter, invitee=new_user).exists():
             return
 
-        # 4. 拿/创建邀请人钱包(你的 UserWallet 没有 default 工厂,这里兜底)
-        wallet, _ = UserWallet.objects.get_or_create(user=inviter)
-
-        # 5. 走标准入口加金币
-        #    ⚠️ 用 GOLD_GRANT 而非 INVITE_REWARD —— 你的钱包模型把 INVITE_REWARD 归类为积分 action
-        tx = wallet.change_gold(
+        # 4. 邀请人钱包 + 加金币(GOLD_GRANT，因为钱包模型把 INVITE_REWARD 归类为积分 action)
+        inviter_wallet, _ = UserWallet.objects.get_or_create(user=inviter)
+        inviter_tx = inviter_wallet.change_gold(
             amount=INVITE_REWARD_GOLD,
             action=WalletTransaction.Action.GOLD_GRANT,
-            operator_id=new_user.id,         # 新用户触发的
+            operator_id=new_user.id,
             operator_role='system',
             related_type='invite',
             related_id=new_user.id,
@@ -897,25 +895,42 @@ def _process_invite_reward(new_user, invite_code):
             idempotent_key=f'invite_reward_{inviter.id}_{new_user.id}',
         )
 
-        # 6. 写邀请奖励记录(unique_together 兜底防重复)
-        InviteReward.objects.create(
+        # 5. 先写邀请奖励记录(unique_together 兜底防重复)
+        reward = InviteReward.objects.create(
             inviter=inviter,
             invitee=new_user,
             reward_gold=INVITE_REWARD_GOLD,
             status='issued',
-            business_no=str(tx.id),
+            business_no=str(inviter_tx.id),
             issued_at=timezone.now(),
             remark=f'邀请注册奖励 +{INVITE_REWARD_GOLD}',
         )
+
+        # 6. ★ 被邀请人(新用户)也发 INVITEE_REWARD_GOLD 金币
+        invitee_wallet, _ = UserWallet.objects.get_or_create(user=new_user)
+        invitee_tx = invitee_wallet.change_gold(
+            amount=INVITEE_REWARD_GOLD,
+            action=WalletTransaction.Action.GOLD_GRANT,
+            operator_id=new_user.id,
+            operator_role='system',
+            related_type='invite',
+            related_id=inviter.id,  # 关联到邀请人
+            remark=f'受邀注册奖励 +{INVITEE_REWARD_GOLD}',
+            idempotent_key=f'invitee_reward_{inviter.id}_{new_user.id}',
+        )
+
+        # 7. 回填被邀请人奖励到同一条记录
+        reward.invitee_reward_gold = INVITEE_REWARD_GOLD
+        reward.invitee_business_no = str(invitee_tx.id)
+        reward.save(update_fields=['invitee_reward_gold', 'invitee_business_no'])
+
     except IntegrityError:
-        # 并发场景下 InviteReward 已存在,正常忽略
+        # 并发场景下 InviteReward 已存在，正常忽略
         pass
     except Exception:
-        # 任何其它异常都吞掉,打日志即可,不影响注册
+        # 任何其它异常都吞掉，打日志即可，不影响注册
         import traceback
         traceback.print_exc()
-
-
 # ═══════════════════════════════════════════════════════════════
 # 用户端 - 邀请好友
 # ═══════════════════════════════════════════════════════════════
