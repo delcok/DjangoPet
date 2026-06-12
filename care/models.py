@@ -233,6 +233,13 @@ class CareRule(models.Model):
         db_table = "pet_care_rule"
         verbose_name = "护理排期规则"
         verbose_name_plural = verbose_name
+        # 同一 (大类, 年龄段, 任务类型) 只允许一条规则。
+        # 否则 _care_rules() 会同时返回多条,生成器在同一个计划内把同类任务(如遛弯)排多遍 → 计划内重复。
+        # 注意:迁移前需先清掉库里已存在的重复行,否则建约束会失败。
+        constraints = [
+            models.UniqueConstraint(fields=["category", "life_stage", "task_type"],
+                                    name="uniq_care_rule_scope"),
+        ]
         indexes = [models.Index(fields=["category", "task_type", "is_active"])]
 
     def __str__(self):

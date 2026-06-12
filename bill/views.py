@@ -1776,7 +1776,16 @@ class StaffServiceOrderViewSet(viewsets.GenericViewSet):
 class UserOrderCountsView(APIView):
     """
     GET /api/v1/bill/user/order-counts/
-    个人中心徽章:返回当前用户各状态订单数(商品+服务合并)
+    个人中心徽章 —— 商品订单 / 服务订单分开统计。
+
+    返回:
+      {
+        "product": {pending_payment, pending_delivery, pending_receive, pending_review, refund, unfinished},
+        "service": {pending_payment, pending_use, pending_review, refund, unfinished},
+        # ↓ 兼容旧字段(商品+服务合并),老前端仍可读
+        "pending_payment", "pending_use", "pending_review", "refund",
+        "goods_unfinished", "service_unfinished"
+      }
     """
     authentication_classes = [UserAuthentication]
     permission_classes = [IsUser]
@@ -1784,37 +1793,57 @@ class UserOrderCountsView(APIView):
     def get(self, request):
         user = request.user
 
-        # ── 商品订单 ──
+        # ══════════ 商品订单 ══════════
         p_qs = ProductOrder.objects.filter(user=user)
 
-        p_pending_pay = p_qs.filter(
+        p_pending_payment = p_qs.filter(
             status=ProductOrder.Status.PENDING_PAYMENT,
         ).count()
 
-        p_pending_use = p_qs.filter(status__in=[
+        # 待发货:已付款,商家还没发货(自提单 PAID 也归这里当"待履约")
+        p_pending_delivery = p_qs.filter(status__in=[
             ProductOrder.Status.PAID,
             ProductOrder.Status.PENDING_SHIPMENT,
+        ]).count()
+
+        # 待收货:已发货 / 待自提
+        p_pending_receive = p_qs.filter(status__in=[
             ProductOrder.Status.SHIPPED,
             ProductOrder.Status.PENDING_PICKUP,
         ]).count()
 
+        # 待评价:已完成未评价
         p_pending_review = p_qs.filter(
             status=ProductOrder.Status.COMPLETED,
             is_reviewed=False,
         ).count()
 
-        # 退款售后徽章:只统计「处理中」的退款,已完成退款(REFUNDED)不再计入
+        # 退款售后:只统计处理中
         p_refund = p_qs.filter(
             status=ProductOrder.Status.REFUNDING,
         ).count()
 
-        # ── 服务订单 ──
+        product_counts = {
+            'pending_payment':  p_pending_payment,
+            'pending_delivery': p_pending_delivery,
+            'pending_receive':  p_pending_receive,
+            'pending_review':   p_pending_review,
+            'refund':           p_refund,
+            # tab 角标合计:待付款 + 待发货 + 待收货 + 待评价
+            'unfinished': (
+                p_pending_payment + p_pending_delivery
+                + p_pending_receive + p_pending_review
+            ),
+        }
+
+        # ══════════ 服务订单 ══════════
         s_qs = ServiceOrder.objects.filter(user=user)
 
-        s_pending_pay = s_qs.filter(
+        s_pending_payment = s_qs.filter(
             status=ServiceOrder.Status.PENDING_PAYMENT,
         ).count()
 
+        # 待使用:已付款到服务完成前的所有进行中状态(含订阅中)
         s_pending_use = s_qs.filter(status__in=[
             ServiceOrder.Status.PAID,
             ServiceOrder.Status.PENDING_ACCEPT,
@@ -1824,6 +1853,7 @@ class UserOrderCountsView(APIView):
             ServiceOrder.Status.PENDING_USE,
             ServiceOrder.Status.PENDING_DELIVERY,
             ServiceOrder.Status.DELIVERING,
+            ServiceOrder.Status.SUBSCRIBING,
         ]).count()
 
         s_pending_review = s_qs.filter(
@@ -1831,18 +1861,30 @@ class UserOrderCountsView(APIView):
             is_reviewed=False,
         ).count()
 
-        # 退款售后徽章:只统计「处理中」的退款,已完成退款(REFUNDED)不再计入
         s_refund = s_qs.filter(
             status=ServiceOrder.Status.REFUNDING,
         ).count()
 
-        return Response({
-            'pending_payment': p_pending_pay + s_pending_pay,
-            'pending_use': p_pending_use + s_pending_use,
-            'pending_review': p_pending_review + s_pending_review,
-            'refund': p_refund + s_refund,
-        })
+        service_counts = {
+            'pending_payment': s_pending_payment,
+            'pending_use':     s_pending_use,
+            'pending_review':  s_pending_review,
+            'refund':          s_refund,
+            # tab 角标合计:待付款 + 待使用 + 待评价
+            'unfinished': s_pending_payment + s_pending_use + s_pending_review,
+        }
 
+        return Response({
+            'product': product_counts,
+            'service': service_counts,
+            # ── 兼容旧字段(合并),避免其他调用方崩 ──
+            'pending_payment': p_pending_payment + s_pending_payment,
+            'pending_use':     p_pending_delivery + p_pending_receive + s_pending_use,
+            'pending_review':  p_pending_review + s_pending_review,
+            'refund':          p_refund + s_refund,
+            'goods_unfinished':   product_counts['unfinished'],
+            'service_unfinished': service_counts['unfinished'],
+        })
 # ══════════════════════════════════════════════════════════════
 # 商家端 - 统一核销码接口(自动判断商品/服务)
 # ══════════════════════════════════════════════════════════════

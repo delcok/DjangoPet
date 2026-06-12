@@ -10,19 +10,37 @@ from wallet.models import (
     UserWallet,
     MerchantWallet,
     MerchantSettlementConfig,
+    WalletTransaction,          # ← 新增导入
 )
 
 # 商家默认初始密码(首次登录后需自行修改)
 DEFAULT_MERCHANT_PASSWORD = '123456'
 
+# 新用户注册奖励金币
+NEW_USER_REGISTER_GOLD = 100
+
 
 @transaction.atomic
 def register_user(**kwargs) -> User:
     """
-    注册用户 —— 建账号 + 开钱包。
+    注册用户 —— 建账号 + 开钱包 + 发放注册奖励金币。
     """
     user = User.objects.create(**kwargs)
-    UserWallet.objects.create(user=user)
+    wallet = UserWallet.objects.create(user=user)
+
+    # 新用户注册奖励：发放金币（GOLD_GRANT 为金币入账动作）
+    if NEW_USER_REGISTER_GOLD > 0:
+        wallet.change_gold(
+            amount=NEW_USER_REGISTER_GOLD,
+            action=WalletTransaction.Action.GOLD_GRANT,
+            operator_id=user.id,
+            operator_role='system',
+            related_type='register',
+            related_id=user.id,
+            remark=f'新用户注册奖励 +{NEW_USER_REGISTER_GOLD}',
+            idempotent_key=f'register_reward_{user.id}',
+        )
+
     return user
 
 

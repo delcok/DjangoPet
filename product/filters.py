@@ -1,9 +1,12 @@
 # goods/filters.py
 
-import django_filters
-from django.db.models import Q
+from math import cos, radians
 
-from .models import Goods, GoodsCategory, Brand,  MerchantGoodsGroup
+import django_filters
+from django.db.models import Q, F, FloatField, ExpressionWrapper
+from django.db.models.functions import Cast, Power, Sqrt
+
+from .models import Goods, GoodsCategory, Brand, MerchantGoodsGroup
 
 
 class GoodsCategoryFilter(django_filters.FilterSet):
@@ -30,7 +33,20 @@ class GoodsFilter(django_filters.FilterSet):
     """
     商品过滤器 —— 用户端、商家端、管理端共用，
     不同视图通过 queryset 控制可见范围。
+
+    ★ 新增：距离支持
+    - 传 longitude + latitude 时，会基于【商品所属商家】的坐标
+      annotate 出 distance(米)，序列化器可直接输出给前端展示。
+    - ordering=distance 按由近到远排序（商家无坐标的排最后）。
+    - 不传坐标时 ordering=distance 静默退回默认排序，不报错。
+
+    ⚠️ 声明顺序很重要：longitude/latitude 必须在 ordering 之前声明，
+    django-filter 按声明顺序执行，保证排序时 distance 注解已存在。
     """
+
+    # ── ★ 用户坐标（用于距离注解，必须在 ordering 之前）──
+    longitude = django_filters.NumberFilter(method='filter_by_location')
+    latitude = django_filters.NumberFilter(method='filter_pass')
 
     # ── 分类（含子分类递归） ──
     category_id = django_filters.NumberFilter(method='filter_category')
@@ -66,22 +82,87 @@ class GoodsFilter(django_filters.FilterSet):
     # ── 标签 ──
     tag_id = django_filters.NumberFilter(method='filter_tag')
 
-    # ── 排序 ──
-    ordering = django_filters.OrderingFilter(
-        fields=(
-            ('price', 'price'),
-            ('sales_count', 'sales'),
-            ('created_at', 'created'),
-            ('rating', 'rating'),
-            ('sort_order', 'sort'),
-        ),
-        # 默认按排序权重 + 创建时间倒序
-    )
+    # ── 排序（★ 改为自定义方法，新增 distance） ──
+    # 支持: price/-price, sales/-sales, created/-created,
+    #       rating/-rating, sort/-sort, distance
+    ordering = django_filters.CharFilter(method='filter_ordering')
+
+    ORDERING_MAP = {
+        'price': 'price',
+        '-price': '-price',
+        'sales': 'sales_count',
+        '-sales': '-sales_count',
+        'created': 'created_at',
+        '-created': '-created_at',
+        'rating': 'rating',
+        '-rating': '-rating',
+        'sort': 'sort_order',
+        '-sort': '-sort_order',
+    }
 
     class Meta:
         model = Goods
         fields = []
 
+    # ── ★ 距离注解 ────────────────────────────────────────
+    def filter_pass(self, queryset, name, value):
+        """latitude 占位，实际在 filter_by_location 中一起处理"""
+        return queryset
+
+    def filter_by_location(self, queryset, name, value):
+        """
+        基于商家坐标 annotate distance(米)。
+        商品依附于商家，所以直接用 merchant 的经纬度。
+        经度差乘 cos(lat) 修正，与 merchants/filters.py 保持一致。
+        """
+        lng_raw = value
+        lat_raw = self.data.get('latitude')
+        if lng_raw in (None, '') or lat_raw in (None, ''):
+            return queryset
+        try:
+            lng = float(lng_raw)
+            lat = float(lat_raw)
+        except (TypeError, ValueError):
+            return queryset
+
+        cos_lat = max(abs(cos(radians(lat))), 1e-6)  # 防极地除零
+        lng_f = Cast('merchant__longitude', output_field=FloatField())
+        lat_f = Cast('merchant__latitude', output_field=FloatField())
+
+        queryset = queryset.annotate(
+            distance=ExpressionWrapper(
+                Sqrt(
+                    Power((lng_f - lng) * cos_lat, 2) +
+                    Power(lat_f - lat, 2)
+                ) * 111000,
+                output_field=FloatField(),
+            )
+        )
+        # 标记已注解，供 filter_ordering 判断
+        self._has_distance = True
+        return queryset
+
+    # ── 排序 ──────────────────────────────────────────────
+    def filter_ordering(self, queryset, name, value):
+        if not value:
+            return queryset
+
+        if value == 'distance':
+            # 没传坐标时静默退回默认排序（queryset 自带 -sort_order, -created_at）
+            if not getattr(self, '_has_distance', False):
+                return queryset
+            # 商家没填坐标 → distance 为 NULL → 排最后
+            return queryset.order_by(
+                F('distance').asc(nulls_last=True),
+                '-sort_order', '-id',
+            )
+
+        field = self.ORDERING_MAP.get(value)
+        if field:
+            return queryset.order_by(field, '-id')
+        return queryset
+
+    # ── 其余过滤 ──────────────────────────────────────────
     def filter_category(self, queryset, name, value):
         """按分类过滤，包含所有子分类"""
         category_ids = self._get_category_tree_ids(value)

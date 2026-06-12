@@ -26,6 +26,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from pet.models import Pet
 from .models import (
     FeedingRule, Recipe, CareActivity, CareRule, CarePlan, CareTask,
 )
@@ -173,6 +174,15 @@ def _weighted_order(rng, items):
 # ============================================================
 @transaction.atomic
 def generate_care_plan(pet, start_date=None, days=7):
+    # 锁住该宠物行,把"同一宠物"的并发/重复生成串行化。
+    # 否则两个并发请求会各自 archive(彼此看不见对方未提交的新计划)再各自 create,
+    # 最终留下 2 个 active 计划(典型的"快速点两次生成"出现重复)。
+    # 注意:这里故意不 select_related("category")——category 是 PROTECT 外键、
+    #       且同一大类下很多宠物共用同一行,连它一起锁会让"不同宠物"的生成也互相阻塞;
+    #       单表 SELECT ... FOR UPDATE 只锁宠物自己这行即可,下面 pet.category 再走一次普通查询代价可忽略。
+    #       (select_for_update 在 SQLite 上是空操作,这条并发保护需到 MySQL/PostgreSQL 验证。)
+    pet = Pet.objects.select_for_update().get(pk=pet.pk)
+
     category = pet.category
     start_date = start_date or timezone.localdate()
     if isinstance(start_date, datetime):

@@ -35,7 +35,6 @@ urlpatterns = [
     # 新加的
     path('api/v1/', include('address.urls')),
     path('api/v1/', include('attract.urls')),
-    path('api/v1/', include('wallet.urls')),
     path('api/v1/', include('campaigns.urls')),
     path('api/v1/', include('comments.urls')),
     path('api/v1/', include('managers.urls')),

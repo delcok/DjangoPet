@@ -436,18 +436,28 @@ class UserProductOrderCreateSerializer(serializers.ModelSerializer):
             if not attrs['pickup_address']:
                 raise serializers.ValidationError({'pickup_address': '商家未设置地址，暂时无法自提'})
 
-        # ─ 4) SKU 校验 + 装配运费入参 ─
+        # ─ 4) SKU 校验 + 装配运费入参 + 收集金币配置 ─
         items_for_calc = []
+        coin_rules = []          # ★★★ 每个 item 的金币抵扣配置
         for item in attrs['items']:
             sku = (GoodsSku.objects
                    .select_related('goods')
                    .filter(id=item['sku_id']).first())
             if not sku:
                 raise serializers.ValidationError({'items': f"SKU {item['sku_id']} 不存在"})
+            goods = sku.goods
             items_for_calc.append({
-                'goods': sku.goods,
+                'goods': goods,
                 'quantity': item['quantity'],
                 'price': sku.price,
+            })
+            # ★★★ SKU 的 max 为 0 时沿用 SPU 的 max;SPU 的 max 为 0 表示不限
+            sku_max = sku.max_coin_deduction or 0
+            spu_max = goods.max_coin_deduction or 0
+            coin_rules.append({
+                'title': goods.title,
+                'allow': bool(goods.allow_coin_deduction),
+                'effective_max': sku_max if sku_max > 0 else spu_max,  # 0=不限
             })
 
         # ─ 5) 收货坐标 ─
@@ -485,6 +495,24 @@ class UserProductOrderCreateSerializer(serializers.ModelSerializer):
         total = Decimal(str(attrs['total_amount']))
         if coin_deduct > total:
             raise serializers.ValidationError({'coin_deduct_amount': '金币抵扣不能超过商品总额'})
+
+        # ─ 7.1) ★★★ allow_coin_deduction / max_coin_deduction 强制校验 ─
+        coins_int = int(coins or 0)
+        if coins_int > 0:
+            # (a) 任一商品关闭了「允许金币抵扣」→ 整单拒绝
+            blocked = next((r['title'] for r in coin_rules if not r['allow']), None)
+            if blocked:
+                raise serializers.ValidationError({
+                    'coins_deducted': f'商品「{blocked}」不支持金币抵扣',
+                })
+            # (b) 上限:任一商品 effective_max=0 视为不限;
+            #     全部有限时,上限取各商品上限之和(与前端单值口径一致,不乘数量)
+            if all(r['effective_max'] > 0 for r in coin_rules):
+                order_cap = sum(r['effective_max'] for r in coin_rules)
+                if coins_int > order_cap:
+                    raise serializers.ValidationError({
+                        'coins_deducted': f'本单最多可抵扣 {order_cap} 金币',
+                    })
 
         # ─ 8) ★ 优惠券校验 ─
         coupon, coupon_deduct = validate_and_calc_coupon(
@@ -545,7 +573,6 @@ class UserProductOrderCreateSerializer(serializers.ModelSerializer):
             description='用户创建商品订单',
         )
         return order
-
 # ══════════════════════════════════════════════════════════════
 # 用户端 — 服务订单(查看)
 # ══════════════════════════════════════════════════════════════

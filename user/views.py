@@ -851,8 +851,10 @@ def _process_invite_reward(new_user, invite_code):
     处理邀请奖励:
       1. 找到邀请人 → 绑定 invited_by
       2. 给【邀请人】加 INVITE_REWARD_GOLD 金币
-      3. 写 InviteReward 记录(先建，保证邀请人侧总有记录)
-      4. ★ 给【被邀请人】(新用户)加 INVITEE_REWARD_GOLD 金币，并回填到同一条记录
+      3. 写 InviteReward 记录
+
+    注:被邀请人(新用户)的注册奖励已由 register_user 统一发放(100 金币)，
+       这里不再额外给被邀请人发钱，避免叠加成 200。
 
     ⚠️ 必须在主注册事务【之外】调用，失败不阻断注册主流程
     """
@@ -882,7 +884,7 @@ def _process_invite_reward(new_user, invite_code):
         if InviteReward.objects.filter(inviter=inviter, invitee=new_user).exists():
             return
 
-        # 4. 邀请人钱包 + 加金币(GOLD_GRANT，因为钱包模型把 INVITE_REWARD 归类为积分 action)
+        # 4. 邀请人钱包 + 加金币
         inviter_wallet, _ = UserWallet.objects.get_or_create(user=inviter)
         inviter_tx = inviter_wallet.change_gold(
             amount=INVITE_REWARD_GOLD,
@@ -895,8 +897,8 @@ def _process_invite_reward(new_user, invite_code):
             idempotent_key=f'invite_reward_{inviter.id}_{new_user.id}',
         )
 
-        # 5. 先写邀请奖励记录(unique_together 兜底防重复)
-        reward = InviteReward.objects.create(
+        # 5. 写邀请奖励记录(unique_together 兜底防重复)
+        InviteReward.objects.create(
             inviter=inviter,
             invitee=new_user,
             reward_gold=INVITE_REWARD_GOLD,
@@ -905,24 +907,6 @@ def _process_invite_reward(new_user, invite_code):
             issued_at=timezone.now(),
             remark=f'邀请注册奖励 +{INVITE_REWARD_GOLD}',
         )
-
-        # 6. ★ 被邀请人(新用户)也发 INVITEE_REWARD_GOLD 金币
-        invitee_wallet, _ = UserWallet.objects.get_or_create(user=new_user)
-        invitee_tx = invitee_wallet.change_gold(
-            amount=INVITEE_REWARD_GOLD,
-            action=WalletTransaction.Action.GOLD_GRANT,
-            operator_id=new_user.id,
-            operator_role='system',
-            related_type='invite',
-            related_id=inviter.id,  # 关联到邀请人
-            remark=f'受邀注册奖励 +{INVITEE_REWARD_GOLD}',
-            idempotent_key=f'invitee_reward_{inviter.id}_{new_user.id}',
-        )
-
-        # 7. 回填被邀请人奖励到同一条记录
-        reward.invitee_reward_gold = INVITEE_REWARD_GOLD
-        reward.invitee_business_no = str(invitee_tx.id)
-        reward.save(update_fields=['invitee_reward_gold', 'invitee_business_no'])
 
     except IntegrityError:
         # 并发场景下 InviteReward 已存在，正常忽略

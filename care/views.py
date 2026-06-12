@@ -151,9 +151,14 @@ class UserCareTaskViewSet(viewsets.ReadOnlyModelViewSet):
     ordering = ["date", "scheduled_start"]
 
     def get_queryset(self):
+        # 只看"进行中"计划的任务:重新生成时旧计划会被归档,但它名下的旧 CareTask 仍留在库里。
+        # 不按 care_plan__status 过滤的话,today / 列表会把"旧计划今天的任务 + 新计划今天的任务"
+        # 一起查出来 → 早餐/遛狗等出现两遍,也就是你看到的"重复"。
+        # care_plan 在 CareTask 上是非空外键,这里是 INNER JOIN,天然只剩当前 active 计划的任务。
+        # (若以后要让用户翻历史计划的打卡,可改成"没传 ?care_plan= 时才默认只看 active"。)
         return (CareTask.objects
-                .filter(pet__owner=self.request.user)
-                .select_related("recipe", "activity", "pet"))
+                .filter(pet__owner=self.request.user, care_plan__status="active")
+                .select_related("recipe", "activity", "pet", "care_plan"))
 
     @action(detail=False, methods=["get"])
     def today(self, request):

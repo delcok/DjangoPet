@@ -223,6 +223,7 @@ class GoodsSkuSerializer(serializers.ModelSerializer):
             'stock', 'stock_warning', 'sales_count',
             'weight', 'barcode',
             'is_active', 'sort_order',
+            'max_coin_deduction',          # ← 新增这一行
             'is_low_stock', 'is_available',
         ]
         read_only_fields = ['id', 'sales_count']
@@ -260,6 +261,7 @@ class GoodsSkuSimpleSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'sku_sn', 'spec_values', 'spec_text', 'image',
             'price', 'original_price', 'stock',
+            'max_coin_deduction',
             'is_active',
         ]
 
@@ -278,6 +280,12 @@ class GoodsListSerializer(serializers.ModelSerializer):
         source='merchant_group.name', read_only=True, default=''
     )
 
+    # ★ 新增：距离（米）+ 格式化文本
+    #   仅当请求带 longitude/latitude、GoodsFilter 注解过 distance 时才有值，
+    #   否则返回 null（前端隐藏即可）
+    distance = serializers.SerializerMethodField()
+    distance_text = serializers.SerializerMethodField()
+
     class Meta:
         model = Goods
         fields = [
@@ -289,8 +297,31 @@ class GoodsListSerializer(serializers.ModelSerializer):
             'merchant', 'merchant_name',
             'merchant_group', 'group_name',
             'is_recommended', 'is_hot', 'is_new', 'is_best',
-            'created_at', 'detail_images'
+            'created_at', 'detail_images',
+            'distance', 'distance_text',  # ★ 新增
         ]
+
+    def get_distance(self, obj):
+        """距离（米，整数）。无坐标/未注解时为 None"""
+        d = getattr(obj, 'distance', None)
+        if d is None:
+            return None
+        try:
+            return int(round(float(d)))
+        except (TypeError, ValueError):
+            return None
+
+    def get_distance_text(self, obj):
+        """格式化距离: <1km 显示 '850m'，否则 '1.2km'；>99km 显示 '>99km'"""
+        d = self.get_distance(obj)
+        if d is None:
+            return None
+        if d < 1000:
+            return f'{d}m'
+        km = d / 1000
+        if km > 99:
+            return '>99km'
+        return f'{km:.1f}km'
 
 
 class GoodsDetailSerializer(serializers.ModelSerializer):
