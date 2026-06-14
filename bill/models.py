@@ -242,6 +242,9 @@ class ProductOrder(models.Model):
     cancel_reason = models.CharField(max_length=200, blank=True, default='', verbose_name='取消原因')
     is_reviewed = models.BooleanField(default=False, db_index=True, verbose_name='是否已评价')
     reviewed_at = models.DateTimeField(null=True, blank=True, verbose_name='评价时间')
+    # ── 用户软删除(仅影响用户自己的列表,不影响商家/对账)──
+    user_deleted = models.BooleanField(default=False, db_index=True, verbose_name='用户已删除')
+    user_deleted_at = models.DateTimeField(null=True, blank=True, verbose_name='用户删除时间')
 
     paid_at = models.DateTimeField(null=True, blank=True, verbose_name='支付时间')
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
@@ -301,6 +304,15 @@ class ProductOrder(models.Model):
     @property
     def is_paid(self):
         return self.status not in (self.Status.PENDING_PAYMENT, self.Status.CANCELLED)
+
+    @property
+    def can_user_delete(self):
+        """用户是否可删除(软删除):仅终态订单"""
+        return self.status in (
+            self.Status.COMPLETED,
+            self.Status.CANCELLED,
+            self.Status.REFUNDED,
+        )
 
 
 class ProductOrderItem(models.Model):
@@ -620,6 +632,10 @@ class ServiceOrder(models.Model):
     is_reviewed = models.BooleanField(default=False, db_index=True, verbose_name='是否已评价')
     reviewed_at = models.DateTimeField(null=True, blank=True, verbose_name='评价时间')
 
+    # ── 用户软删除(仅影响用户自己的列表,不影响商家/对账)──
+    user_deleted = models.BooleanField(default=False, db_index=True, verbose_name='用户已删除')
+    user_deleted_at = models.DateTimeField(null=True, blank=True, verbose_name='用户删除时间')
+
     # ════ 时间戳 ════
     paid_at = models.DateTimeField(null=True, blank=True, verbose_name='支付时间')
     service_start_at = models.DateTimeField(null=True, blank=True, verbose_name='服务开始时间')
@@ -672,6 +688,15 @@ class ServiceOrder(models.Model):
     @property
     def is_paid(self):
         return self.status not in (self.Status.PENDING_PAYMENT, self.Status.CANCELLED)
+
+    @property
+    def can_user_delete(self):
+        """用户是否可删除(软删除):仅终态订单"""
+        return self.status in (
+            self.Status.COMPLETED,
+            self.Status.CANCELLED,
+            self.Status.REFUNDED,
+        )
 
     @property
     def full_address(self):

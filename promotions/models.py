@@ -94,6 +94,12 @@ class PaymentActivity(models.Model):
     per_user_limit = models.PositiveIntegerField(default=0, verbose_name='每用户领取上限(0=不限)')
     total_budget_coins = models.PositiveBigIntegerField(default=0, verbose_name='活动金币预算(0=不限)')
 
+    # ── 金币抵扣排除(仅 order_spend 有意义) ──
+    exclude_coin_deduction = models.BooleanField(
+        default=True, verbose_name='金币抵扣订单不参与',
+        help_text='True=用户本单使用了金币抵扣时,本单不参与该活动',
+    )
+
     status = models.CharField(
         max_length=20, choices=Status.choices,
         default=Status.DRAFT, db_index=True, verbose_name='状态',
@@ -180,6 +186,14 @@ class PaymentActivity(models.Model):
             activity=self, merchant_id=merchant_id,
             status=MerchantActivityEnrollment.Status.ACTIVE,
         ).exists()
+
+    def skip_for_coin_deduction(self, coins_deducted) -> bool:
+        """本单是否因使用金币抵扣而不参与本活动。仅 ORDER_SPEND 受此规则约束。"""
+        if self.activity_type != self.ActivityType.ORDER_SPEND:
+            return False
+        if not self.exclude_coin_deduction:
+            return False
+        return (coins_deducted or 0) > 0
 
     def supports_order_type(self, order_type):
         if not self.apply_order_types:

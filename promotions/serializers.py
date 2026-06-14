@@ -70,6 +70,7 @@ class PaymentActivitySerializer(serializers.ModelSerializer):
             'enrollment_mode', 'enrollment_mode_display', 'enrollment_audit',
 
             'per_user_limit', 'total_budget_coins',
+            'exclude_coin_deduction',
 
             'status', 'status_display', 'is_runnable',
             'user_granted_count', 'user_granted_coins',

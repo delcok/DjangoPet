@@ -1204,6 +1204,9 @@ def _grant_activity_on_pay(payment, order):
             continue
         if act.per_user_limit > 0 and not act.user_can_take_more(order.user_id):
             continue
+        # ★ 用了金币抵扣 → 本单不参与活动,用户和商家奖励一并跳过
+        if act.skip_for_coin_deduction(getattr(order, 'coins_deducted', 0)):
+            continue
 
         if act.user_reward_enabled:
             r = act.calc_user_reward(payment.amount)

@@ -290,7 +290,7 @@ class UserProductOrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return (
             ProductOrder.objects
-            .filter(user=self.request.user)
+            .filter(user=self.request.user, user_deleted=False)
             .prefetch_related('items')
             .order_by('-created_at')
         )
@@ -377,6 +377,20 @@ class UserProductOrderViewSet(viewsets.ModelViewSet):
         )
         return Response({'message': '退款申请已提交'})
 
+    # ── 删除订单(软删除,仅终态可删)──
+    @action(detail=True, methods=['post'], url_path='delete')
+    def soft_delete(self, request, pk=None):
+        order = self.get_object()
+        if not order.can_user_delete:
+            return Response(
+                {'error': '只有已完成、已取消或已退款的订单可以删除'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.user_deleted = True
+        order.user_deleted_at = timezone.now()
+        order.save(update_fields=['user_deleted', 'user_deleted_at', 'updated_at'])
+        return Response({'message': '订单已删除'})
+
 
 # ══════════════════════════════════════════════════════════════
 # 用户端 — 服务订单
@@ -446,7 +460,7 @@ class UserServiceOrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return (
             ServiceOrder.objects
-            .filter(user=self.request.user)
+            .filter(user=self.request.user, user_deleted=False)
             .prefetch_related('items')
             .select_related('assigned_staff')
             .order_by('-created_at')
@@ -660,6 +674,20 @@ class UserServiceOrderViewSet(viewsets.ModelViewSet):
             description=ser.validated_data['reason'],
         )
         return Response({'message': '退款申请已提交'})
+
+    # ── 删除订单(软删除,仅终态可删)──
+    @action(detail=True, methods=['post'], url_path='delete')
+    def soft_delete(self, request, pk=None):
+        order = self.get_object()
+        if not order.can_user_delete:
+            return Response(
+                {'error': '只有已完成、已取消或已退款的订单可以删除'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.user_deleted = True
+        order.user_deleted_at = timezone.now()
+        order.save(update_fields=['user_deleted', 'user_deleted_at', 'updated_at'])
+        return Response({'message': '订单已删除'})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -925,6 +953,62 @@ class MerchantProductOrderViewSet(
             order.order_no, 'product', 'verify',
             request=request, operator_type='merchant',
             description=f'扫码核销 {code}',
+        )
+
+        _on_order_completed(order, 'product')
+
+        return Response({
+            'message': '核销成功',
+            'order': MerchantProductOrderDetailSerializer(order).data,
+        })
+
+    @action(detail=True, methods=['post'], url_path='force-verify')
+    def force_verify(self, request, pk=None):
+        """
+        超时补核销(自提商品)——特殊入口。
+        仅用于商家忘了及时核销、核销码已过期的少数情况;
+        正常核销请继续走 verify / verify-by-code(过期仍会拦截)。
+        与普通核销的唯一区别:即便核销码过期也放行。
+        """
+        order = self.get_object()
+
+        if order.delivery_type != ProductOrder.DeliveryType.SELF_PICKUP:
+            return Response({'error': '只有自提订单可核销'}, status=status.HTTP_400_BAD_REQUEST)
+
+        allowed = (
+            ProductOrder.Status.PAID,
+            ProductOrder.Status.PENDING_PICKUP,
+        )
+        if order.status not in allowed:
+            return Response(
+                {'error': f'当前状态({order.get_status_display()})无法核销'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 可选:传了核销码才核对,不传直接补核销
+        code = (request.data.get('verify_code') or '').strip()
+        if code and code != order.verify_code:
+            return Response({'error': '核销码错误'}, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+        expired = bool(order.verify_expire_at and now > order.verify_expire_at)
+
+        order.status = ProductOrder.Status.COMPLETED
+        order.verified_at = now
+        order.completed_at = now
+        update_fields = ['status', 'verified_at', 'completed_at', 'updated_at']
+
+        staff = getattr(request.user, 'staff', None)
+        if staff:
+            order.verified_by_staff = staff
+            update_fields.append('verified_by_staff')
+
+        order.save(update_fields=update_fields)
+
+        create_order_log(
+            order.order_no, 'product', 'verify',
+            request=request, operator_type='merchant',
+            description=('超时补核销' if expired else '补核销') + (f' {code}' if code else ''),
         )
 
         _on_order_completed(order, 'product')
@@ -1331,6 +1415,55 @@ class MerchantServiceOrderViewSet(
         # 触发完成钩子:销量+1 / 商家结算 / 发积分
         if order.status == ServiceOrder.Status.COMPLETED:
             _on_order_completed(order, 'service')
+
+        return Response({
+            'message': '核销成功',
+            'order': MerchantServiceOrderDetailSerializer(order).data,
+        })
+
+    @action(detail=True, methods=['post'], url_path='force-verify')
+    def force_verify(self, request, pk=None):
+        """
+        超时补核销(服务)——特殊入口。
+        仅用于核销码已过期、商家忘了及时核销的少数情况;
+        正常核销请继续走 verify / verify-by-code(过期仍会拦截)。
+        逻辑与本类 verify 一致,唯一区别:即便核销码过期也放行。
+        """
+        order = self.get_object()
+
+        is_walk_in_paid = (
+                order.service_type == 'walk_in'
+                and order.status == ServiceOrder.Status.PAID
+        )
+        if order.status != ServiceOrder.Status.PENDING_USE and not is_walk_in_paid:
+            return Response({'error': '当前状态无法核销'}, status=status.HTTP_400_BAD_REQUEST)
+
+        code = (request.data.get('verify_code') or '').strip()
+        if code and code != order.verify_code:
+            return Response({'error': '核销码错误'}, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+        expired = bool(order.verify_expire_at and now > order.verify_expire_at)
+
+        order.status = ServiceOrder.Status.COMPLETED
+        order.verified_at = now
+        order.completed_at = now
+        update_fields = ['status', 'verified_at', 'completed_at', 'updated_at']
+
+        staff = getattr(request.user, 'staff', None)
+        if staff:
+            order.verified_by_staff = staff
+            update_fields.append('verified_by_staff')
+
+        order.save(update_fields=update_fields)
+
+        create_order_log(
+            order.order_no, 'service', 'verify',
+            request=request, operator_type='merchant',
+            description=('超时补核销' if expired else '补核销') + (f' {code}' if code else ''),
+        )
+
+        _on_order_completed(order, 'service')
 
         return Response({
             'message': '核销成功',
@@ -1794,7 +1927,7 @@ class UserOrderCountsView(APIView):
         user = request.user
 
         # ══════════ 商品订单 ══════════
-        p_qs = ProductOrder.objects.filter(user=user)
+        p_qs = ProductOrder.objects.filter(user=user, user_deleted=False)
 
         p_pending_payment = p_qs.filter(
             status=ProductOrder.Status.PENDING_PAYMENT,
@@ -1837,7 +1970,7 @@ class UserOrderCountsView(APIView):
         }
 
         # ══════════ 服务订单 ══════════
-        s_qs = ServiceOrder.objects.filter(user=user)
+        s_qs = ServiceOrder.objects.filter(user=user, user_deleted=False)
 
         s_pending_payment = s_qs.filter(
             status=ServiceOrder.Status.PENDING_PAYMENT,
