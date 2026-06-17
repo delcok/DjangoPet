@@ -13,6 +13,7 @@ router.register(r'comments', views.CommentViewSet, basename='comment')
 router.register(r'actions', views.UserActionViewSet, basename='action')
 router.register(r'notifications', views.NotificationViewSet, basename='notification')
 router.register(r'reports', views.ReportViewSet, basename='report')
+router.register(r'history', views.PostHistoryViewSet, basename='history')
 # 注意：PetCommunityViewSet 不注册到 router，避免 community/community/ 双重前缀
 #       改用下方独立路径挂载
 

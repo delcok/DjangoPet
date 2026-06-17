@@ -25,6 +25,16 @@ user_urlpatterns = [
     path('me/',
          views.UserWalletView.as_view(),
          name='user-wallet-me'),
+    # ─── 签到(更具体的 calendar / makeup 放在 sign-in/ 之前)───
+    path('me/sign-in/calendar/',
+         views.UserSignInCalendarView.as_view(),
+         name='user-sign-in-calendar'),
+    path('me/sign-in/makeup/',
+         views.UserSignInMakeupView.as_view(),
+         name='user-sign-in-makeup'),
+    path('me/sign-in/',
+         views.UserSignInView.as_view(),
+         name='user-sign-in'),
     path('me/transactions/',
          views.UserWalletTransactionView.as_view(),
          name='user-wallet-transactions'),
@@ -79,6 +89,12 @@ admin_router.register(
     views.AdminWithdrawalViewSet,
     basename='admin-withdrawal',
 )
+# 🆕 签到记录管理(list / retrieve / stats)
+admin_router.register(
+    r'sign-ins',
+    views.AdminUserSignInViewSet,
+    basename='admin-sign-in',
+)
 
 admin_urlpatterns = [
     path('', include(admin_router.urls)),
@@ -86,6 +102,12 @@ admin_urlpatterns = [
         'user-wallet-transactions/<int:pk>/reverse/',
         views.AdminUserWalletTransactionReverseView.as_view(),
         name='admin-user-wallet-tx-reverse',
+    ),
+    # 🆕 签到奖励配置(GET 读 / PUT 改)
+    path(
+        'sign-in-config/',
+        views.AdminSignInConfigView.as_view(),
+        name='admin-sign-in-config',
     ),
 ]
 

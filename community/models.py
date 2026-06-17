@@ -246,29 +246,25 @@ class Post(BaseModel):
             self.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
 
     def _grant_post_reward(self, points, scene):
-        """
-        给作者发帖子积分奖励（走 UserWallet，幂等防重）。
-        失败不影响帖子保存本身。
-        scene: 'approved' | 'featured'，用于拼幂等键，保证每篇帖子每个场景只发一次。
-        """
+        import logging
+        from django.db import transaction
+        logger = logging.getLogger(__name__)
         try:
-            # 延迟导入，避免 app 之间循环依赖
             from wallet.models import UserWallet, WalletTransaction
-
-            wallet, _ = UserWallet.objects.get_or_create(user_id=self.author_id)
-            wallet.change_points(
-                amount=points,
-                action=WalletTransaction.Action.ACTIVITY_REWARD,
-                operator_id=self.author_id,
-                operator_role='system',
-                related_type='post',
-                related_id=self.pk,
-                remark=f'帖子奖励（{scene}）+{points}',
-                idempotent_key=f'post_{scene}_reward_{self.pk}',
-            )
+            with transaction.atomic():  # 独立 savepoint，失败只回滚这一段
+                wallet, _ = UserWallet.objects.get_or_create(user_id=self.author_id)
+                wallet.change_points(
+                    amount=points,
+                    action=WalletTransaction.Action.ACTIVITY_REWARD,
+                    operator_id=self.author_id,
+                    operator_role='system',
+                    related_type='post',
+                    related_id=self.pk,
+                    remark=f'帖子奖励（{scene}）+{points}',
+                    idempotent_key=f'post_{scene}_reward_{self.pk}',
+                )
         except Exception:
-            import traceback
-            traceback.print_exc()
+            logger.exception('grant post reward failed: post=%s scene=%s', self.pk, scene)
 
     @property
     def is_published(self):
@@ -349,6 +345,11 @@ class PostTopic(BaseModel):
 
     def __str__(self):
         return f"post#{self.post_id} - topic#{self.topic_id}"
+
+    @property
+    def can_be_used(self):
+        """是否可用于发帖 / 展示（未删除且未被封禁 / 拒绝 / 暂停）"""
+        return not self.is_deleted and self.status not in ('banned', 'rejected', 'suspended')
 
 
 class Comment(BaseModel):

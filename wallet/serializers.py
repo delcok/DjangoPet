@@ -15,7 +15,7 @@ from .models import (
     UserWallet, WalletTransaction, WalletStatusLog,
     MerchantWallet, MerchantWalletTransaction,
     WithdrawalRequest, MerchantSettlementConfig,
-    Currency,
+    Currency, SignInConfig, UserSignIn,
 )
 
 
@@ -445,3 +445,70 @@ class AdminWithdrawalSuccessSerializer(serializers.Serializer):
 class AdminWithdrawalFailedSerializer(serializers.Serializer):
     reason           = serializers.CharField(max_length=200)
     channel_response = serializers.JSONField(required=False, allow_null=True)
+
+# ════════════════════════════════════════════════════════════════
+#                        管理端 - 签到
+# ════════════════════════════════════════════════════════════════
+
+class AdminUserSignInSerializer(serializers.ModelSerializer):
+    """管理员看单条签到记录(带用户信息)"""
+    user_id       = serializers.IntegerField(read_only=True)
+    user_mobile   = serializers.CharField(source='user.mobile',   read_only=True, default='')
+    user_nickname = serializers.CharField(source='user.nickname', read_only=True, default='')
+
+    class Meta:
+        model = UserSignIn
+        fields = [
+            'id', 'user_id', 'user_mobile', 'user_nickname',
+            'sign_date', 'reward_points', 'continuous_days',
+            'is_makeup', 'makeup_cost', 'transaction', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class AdminSignInConfigSerializer(serializers.ModelSerializer):
+    """管理员读写签到配置(单例)"""
+    class Meta:
+        model = SignInConfig
+        fields = [
+            'cycle_rewards', 'sign_in_expire_days',
+            'makeup_enabled', 'makeup_cost_points', 'makeup_max_back_days',
+            'is_active', 'updated_by', 'updated_at',
+        ]
+        read_only_fields = ['updated_by', 'updated_at']
+
+    def validate_cycle_rewards(self, value):
+        if not isinstance(value, list) or not value:
+            raise serializers.ValidationError('循环奖励必须是非空数组')
+        if len(value) > 31:
+            raise serializers.ValidationError('循环周期最多 31 天')
+        cleaned = []
+        for i, v in enumerate(value):
+            # bool 是 int 子类,先挡掉
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise serializers.ValidationError(f'第 {i + 1} 项必须是数字')
+            if isinstance(v, float):
+                if not v.is_integer():
+                    raise serializers.ValidationError(f'第 {i + 1} 项必须是整数')
+                v = int(v)
+            if v < 0:
+                raise serializers.ValidationError(f'第 {i + 1} 项不能为负数')
+            if v > 100000:
+                raise serializers.ValidationError(f'第 {i + 1} 项奖励过大')
+            cleaned.append(v)
+        return cleaned
+
+    def validate_sign_in_expire_days(self, value):
+        if value > 3650:
+            raise serializers.ValidationError('有效期最长 3650 天')
+        return value
+
+    def validate_makeup_cost_points(self, value):
+        if value > 100000:
+            raise serializers.ValidationError('补签消耗积分过大')
+        return value
+
+    def validate_makeup_max_back_days(self, value):
+        if not (1 <= value <= 31):
+            raise serializers.ValidationError('补签回溯天数应在 1~31 之间')
+        return value

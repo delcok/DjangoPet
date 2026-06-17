@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 
 from django.db import transaction
-from django.db.models import F, Q, Count, Sum
+from django.db.models import F, Q, Count, Sum, Prefetch
 from django.utils import timezone
+from django.utils.text import slugify
+from django.db import IntegrityError
+import uuid
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from datetime import timedelta
 
@@ -34,7 +37,7 @@ from community.serializers import (
     # 其他
     UserActionSerializer, PostCollectionSerializer,
     UserFollowSerializer, ReportSerializer, ReportAdminSerializer,
-    NotificationSerializer,
+    NotificationSerializer, PostViewHistorySerializer,
 )
 from community.filters import (
     PostFilter, CommentFilter, UserFilter, TopicFilter,
@@ -154,14 +157,14 @@ class UserViewSet(ReadOnlyModelViewSet):
             return Response({'detail': '无权访问'}, status=status.HTTP_403_FORBIDDEN)
 
         qs = (
-            PostCollection.objects.filter(user=user)
+            PostCollection.objects.filter(user=user, post__is_deleted=False)  # ← 作者已删的帖子不再出现在收藏里
             .select_related('post__author', 'post__category')
             .prefetch_related('post__medias', 'post__post_topics__topic')
+            .order_by('-created_at')
         )
         paginated, paginator = paginate_queryset(qs, request, 'standard')
         serializer = PostCollectionSerializer(paginated, many=True, context={'request': request})
         return create_paginated_response(serializer.data, paginator)
-
     # ---------- 关注 / 取消关注 ----------
     @action(detail=True, methods=['post'], permission_classes=[IsUser])
     def follow(self, request, username=None):
@@ -169,21 +172,27 @@ class UserViewSet(ReadOnlyModelViewSet):
         if target == request.user:
             return Response({'detail': '不能关注自己'}, status=status.HTTP_400_BAD_REQUEST)
 
-        relation, created = UserFollow.objects.get_or_create(
-            follower=request.user, following=target
-        )
-        if not created:
-            relation.delete()
-            UserAction.objects.create(
-                user=request.user, action_type='unfollow_user', target_user=target
+        with transaction.atomic():
+            relation = UserFollow.objects.filter(
+                follower=request.user, following=target
+            ).first()
+            if relation:
+                relation.delete()
+                # ① 反向关系的 is_mutual 复位
+                UserFollow.objects.filter(
+                    follower=target, following=request.user
+                ).update(is_mutual=False)
+                # ② 删掉旧的 follow_user，避免再次关注撞唯一约束
+                UserAction.objects.filter(
+                    user=request.user, action_type='follow_user', target_user=target
+                ).delete()
+                return Response({'detail': '已取消关注', 'followed': False})
+
+            UserFollow.objects.create(follower=request.user, following=target)
+            UserAction.objects.get_or_create(
+                user=request.user, action_type='follow_user', target_user=target
             )
-            return Response({'detail': '已取消关注', 'followed': False})
-
-        UserAction.objects.create(
-            user=request.user, action_type='follow_user', target_user=target
-        )
-        return Response({'detail': '关注成功', 'followed': True})
-
+            return Response({'detail': '关注成功', 'followed': True})
     # ---------- 拉黑 / 取消拉黑 ----------
     @action(detail=True, methods=['post'], permission_classes=[IsUser])
     def block(self, request, username=None):
@@ -335,6 +344,45 @@ class TopicViewSet(ReadOnlyModelViewSet):
     def get_serializer_class(self):
         return SimpleTopicSerializer if self.action == 'list' else TopicSerializer
 
+    @action(detail=False, methods=['post'], url_path='create', permission_classes=[IsUser])
+    def create_topic(self, request):
+        name = (request.data.get('name') or '').strip().lstrip('#').strip()
+        if not name:
+            return Response({'detail': '请输入话题名称'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(name) > 50:
+            return Response({'detail': '话题名称不能超过 50 字'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 先搜：同名话题是否已存在（含所有状态 / 软删）
+        existing = Topic.all_objects.filter(name=name).first()
+        if existing:
+            if existing.status == 'banned':
+                return Response({'detail': '该话题已被封禁，不可使用'}, status=status.HTTP_400_BAD_REQUEST)
+            if existing.is_deleted or existing.status in ('rejected', 'suspended'):
+                return Response({'detail': '该话题暂不可用'}, status=status.HTTP_400_BAD_REQUEST)
+            # 已存在且可用（pending / approved 等）→ 直接复用，不建重复
+            return Response(SimpleTopicSerializer(existing).data)
+
+        # 不存在 → 新建，状态 pending：随帖子一起审核，不预先放行
+        base = slugify(name, allow_unicode=True)[:40] or f'topic-{uuid.uuid4().hex[:8]}'
+        slug = base
+        if Topic.all_objects.filter(slug=slug).exists():
+            slug = f'{base[:33]}-{uuid.uuid4().hex[:6]}'
+
+        try:
+            topic = Topic.objects.create(
+                name=name,
+                slug=slug,
+                creator=request.user,
+                status='pending',
+            )
+        except IntegrityError:
+            # 并发下被别人抢先建了 → 复用，但要重新判一次封禁
+            topic = Topic.all_objects.filter(name=name).first()
+            if not topic or topic.status == 'banned' or topic.is_deleted \
+                    or topic.status in ('rejected', 'suspended'):
+                return Response({'detail': '该话题暂不可用'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(SimpleTopicSerializer(topic).data, status=status.HTTP_201_CREATED)
     @action(detail=True, methods=['get'])
     def posts(self, request, slug=None):
         topic = self.get_object()
@@ -402,45 +450,56 @@ class PostViewSet(BaseViewSet):
         if self.action == 'list':
             queryset = queryset.filter(status='approved')
 
-        # 详情页：记录浏览
         if self.action == 'retrieve':
-            post_id = self.kwargs.get('pk')
-            if post_id:
-                # 登录用户记录 PostView
-                if isinstance(self.request.user, User) and self.request.user.is_authenticated:
-                    pv, created = PostView.objects.get_or_create(
-                        user=self.request.user, post_id=post_id
-                    )
-                    if not created:
-                        pv.view_count += 1
-                        pv.save(update_fields=['view_count'])
-                # 帖子浏览量 +1（匿名也计）
-                Post.objects.filter(id=post_id).update(view_count=F('view_count') + 1)
+            user = self.request.user
+            if isinstance(user, User) and user.is_authenticated:
+                # 允许作者看自己未过审的帖；其他人只能看 approved
+                queryset = queryset.filter(Q(status='approved') | Q(author=user))
+            else:
+                queryset = queryset.filter(status='approved')
 
         return queryset
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        pid = instance.pk
+
+        if isinstance(request.user, User) and request.user.is_authenticated:
+            _, created = PostView.objects.get_or_create(user=request.user, post_id=pid)
+            if not created:
+                PostView.objects.filter(user=request.user, post_id=pid).update(
+                    view_count=F('view_count') + 1,
+                    updated_at=timezone.now(),   # 关键：.update() 不触发 auto_now，手动刷新供「浏览历史」按最近浏览排序
+                )
+        Post.objects.filter(pk=pid).update(view_count=F('view_count') + 1)
+
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
 
     def perform_create(self, serializer):
         post = serializer.save(author=self.request.user)
         self._grant_create_reward(post)
 
     def _grant_create_reward(self, post):
-        """发帖即时奖励 +10，失败不影响发帖"""
+        import logging
+        from django.db import transaction
+        logger = logging.getLogger(__name__)
         try:
             from wallet.models import UserWallet, WalletTransaction
-            wallet, _ = UserWallet.objects.get_or_create(user_id=self.request.user.id)
-            wallet.change_points(
-                amount=10,
-                action=WalletTransaction.Action.ACTIVITY_REWARD,
-                operator_id=self.request.user.id,
-                operator_role='system',
-                related_type='post',
-                related_id=post.pk,
-                remark='发帖奖励 +10',
-                idempotent_key=f'post_create_reward_{post.pk}',
-            )
+            with transaction.atomic():
+                wallet, _ = UserWallet.objects.get_or_create(user_id=self.request.user.id)
+                wallet.change_points(
+                    amount=10,
+                    action=WalletTransaction.Action.ACTIVITY_REWARD,
+                    operator_id=self.request.user.id,
+                    operator_role='system',
+                    related_type='post',
+                    related_id=post.pk,
+                    remark='发帖奖励 +10',
+                    idempotent_key=f'post_create_reward_{post.pk}',
+                )
         except Exception:
-            import traceback
-            traceback.print_exc()
+            logger.exception('grant create reward failed: post=%s', post.pk)
 
     def perform_destroy(self, instance):
         instance.soft_delete()
@@ -449,21 +508,16 @@ class PostViewSet(BaseViewSet):
     @action(detail=True, methods=['post'])
     def like(self, request, pk=None):
         post = self.get_object()
-        exists = UserAction.objects.filter(
-            user=request.user, action_type='like_post', post=post
-        ).exists()
-
         with transaction.atomic():
-            if exists:
-                UserAction.objects.filter(
-                    user=request.user, action_type='like_post', post=post
-                ).delete()
+            ua, created = UserAction.objects.get_or_create(
+                user=request.user, action_type='like_post', post=post
+            )
+            if not created:
+                ua.delete()
                 Post.objects.filter(id=post.id).update(like_count=F('like_count') - 1)
                 return Response({'detail': '已取消点赞', 'liked': False})
 
-            UserAction.objects.create(user=request.user, action_type='like_post', post=post)
             Post.objects.filter(id=post.id).update(like_count=F('like_count') + 1)
-
             if post.author_id != request.user.id:
                 Notification.objects.create(
                     receiver=post.author, sender=request.user,
@@ -473,7 +527,6 @@ class PostViewSet(BaseViewSet):
                     post=post,
                 )
             return Response({'detail': '点赞成功', 'liked': True})
-
     # ---------- 收藏 ----------
     @action(detail=True, methods=['post'])
     def collect(self, request, pk=None):
@@ -508,10 +561,11 @@ class PostViewSet(BaseViewSet):
             Post.objects.filter(status='approved')
             .select_related('author', 'category')
             .prefetch_related('medias', 'post_topics__topic')
-            .order_by('-hot_score', '-like_count')[:20]
+            .order_by('-hot_score', '-like_count')
         )
-        serializer = PostListSerializer(posts, many=True, context={'request': request})
-        return Response({'posts': serializer.data})
+        paginated, paginator = paginate_queryset(posts, request, 'standard')
+        serializer = PostListSerializer(paginated, many=True, context={'request': request})
+        return create_paginated_response(serializer.data, paginator)
 
     # ---------- 关注动态 ----------
     @action(detail=False, methods=['get'])
@@ -535,7 +589,7 @@ class PostViewSet(BaseViewSet):
     def my_posts(self, request):
         posts = (
             Post.objects.filter(author=request.user)
-            .select_related('category')
+            .select_related('author', 'category')
             .prefetch_related('medias', 'post_topics__topic')
             .order_by('-created_at')
         )
@@ -597,7 +651,18 @@ class PostViewSet(BaseViewSet):
 # ======================================================================
 
 class CommentViewSet(BaseViewSet):
-    queryset = Comment.objects.filter(is_deleted=False).select_related('author', 'post')
+    queryset = (
+        Comment.objects.filter(is_deleted=False)
+        .select_related('author', 'post')
+        .prefetch_related(
+            Prefetch(
+                'replies',
+                queryset=Comment.objects.filter(is_deleted=False)
+                .select_related('author').order_by('-created_at'),
+                to_attr='active_replies',
+            )
+        )
+    )
     serializer_class = CommentSerializer
     filterset_class = CommentFilter
     permission_classes = [IsAuthenticatedOrReadOnly]
@@ -726,6 +791,45 @@ class NotificationViewSet(ReadOnlyModelViewSet):
 
 
 # ======================================================================
+# 浏览历史（仅本人）
+# ======================================================================
+
+class PostHistoryViewSet(
+    mixins.ListModelMixin,
+    mixins.DestroyModelMixin,
+    GenericViewSet,
+):
+    """
+    浏览历史 —— 仅本人可见，按帖子去重（每帖一条，记累计浏览次数 + 最近浏览时间）
+    · GET    /community/history/            列表（最近浏览在前）
+    · DELETE /community/history/{id}/       删除单条
+    · POST   /community/history/clear/      清空全部
+    """
+    serializer_class = PostViewHistorySerializer
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def get_queryset(self):
+        # 历史是「能点开就显示」的临时数据：作者软删 / 未过审的帖子直接不进历史，避免死链
+        return (
+            PostView.objects
+            .filter(user=self.request.user, post__is_deleted=False, post__status='approved')
+            .select_related('post__author', 'post__category')
+            .prefetch_related('post__medias', 'post__post_topics__topic')
+            .order_by('-updated_at')   # 依赖上面 retrieve 里手动刷新的 updated_at
+        )
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        paginated, paginator = paginate_queryset(qs, request, 'standard')
+        serializer = self.get_serializer(paginated, many=True)
+        return create_paginated_response(serializer.data, paginator)
+
+    @action(detail=False, methods=['post', 'delete'])
+    def clear(self, request):
+        deleted, _ = PostView.objects.filter(user=request.user).delete()
+        return Response({'detail': '已清空浏览历史', 'deleted': deleted})
+# ======================================================================
 # 举报（用户端）
 # ======================================================================
 
@@ -836,9 +940,22 @@ class AdminPostViewSet(ModelViewSet):
             post.status = 'approved'
             post.reviewer = request.user
             post.reviewed_at = timezone.now()
-            post.published_at = post.published_at or timezone.now()
+            if not post.published_at:
+                post.published_at = timezone.now()
+                post.last_active_at = timezone.now()
             post.review_note = request.data.get('note', '')
-            post.save()
+            post.save(update_fields=[
+                'status', 'reviewer', 'reviewed_at',
+                'published_at', 'last_active_at', 'review_note', 'updated_at',
+            ])
+
+            # 帖子过审 → 关联的待审核话题一并转正
+            Topic.objects.filter(topic_posts__post=post, status='pending').update(
+                status='approved',
+                reviewer=request.user,
+                reviewed_at=timezone.now(),
+                updated_at=timezone.now(),
+            )
 
             ReviewLog.objects.create(
                 content_type='post', content_id=post.id,
@@ -857,7 +974,6 @@ class AdminPostViewSet(ModelViewSet):
             )
 
         return Response({'detail': '审核通过'})
-
     # ---------- 审核拒绝 ----------
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
@@ -865,13 +981,83 @@ class AdminPostViewSet(ModelViewSet):
         reason = request.data.get('reason', '不符合社区规范')
         old_status = post.status
 
+        # 违规与话题相关时：ban_topics=true 封禁本帖全部话题，
+        # 或 ban_topic_ids=[...] 精确封禁其中几个
+        ban_topics = bool(request.data.get('ban_topics', False))
+        ban_topic_ids = request.data.get('ban_topic_ids') or []
+
         with transaction.atomic():
             post.status = 'rejected'
             post.reviewer = request.user
             post.reviewed_at = timezone.now()
             post.reject_reason = reason
             post.review_note = request.data.get('note', '')
-            post.save()
+            post.save(update_fields=[
+                'status', 'reviewer', 'reviewed_at',
+                'reject_reason', 'review_note', 'updated_at',
+            ])
+
+            # ===== 封禁关联话题（只动挂在本帖上的话题）=====
+            if ban_topics or ban_topic_ids:
+                tq = Topic.objects.filter(topic_posts__post=post)
+                if ban_topic_ids:
+                    tq = tq.filter(id__in=ban_topic_ids)
+                to_ban = list(tq.exclude(status='banned'))
+
+                if to_ban:
+                    banned_ids = [t.id for t in to_ban]
+                    now = timezone.now()
+
+                    Topic.objects.filter(id__in=banned_ids).update(
+                        status='banned',
+                        reviewer=request.user,
+                        reviewed_at=now,
+                        updated_at=now,
+                    )
+                    for t in to_ban:
+                        ReviewLog.objects.create(
+                            content_type='topic', content_id=t.id,
+                            reviewer=request.user, action='ban',
+                            old_status=t.status, new_status='banned',
+                            reason=reason,
+                            note=f'随帖子 #{post.id} 审核拒绝一并封禁',
+                        )
+
+                    # ===== 级联：引用这些话题的其它待审核帖子一并打回 =====
+                    affected = list(
+                        Post.objects.filter(
+                            post_topics__topic_id__in=banned_ids,
+                            status__in=['pending', 'reviewing'],
+                        )
+                        .exclude(id=post.id)
+                        .distinct()
+                        .select_related('author')
+                    )
+                    if affected:
+                        cascade_reason = '所含话题因违规被封禁，帖子一并下架'
+                        Post.objects.filter(id__in=[p.id for p in affected]).update(
+                            status='rejected',
+                            reviewer=request.user,
+                            reject_reason=cascade_reason,
+                            reviewed_at=now,
+                            updated_at=now,
+                        )
+                        for p in affected:
+                            ReviewLog.objects.create(
+                                content_type='post', content_id=p.id,
+                                reviewer=request.user,
+                                action='manual_reject',
+                                old_status=p.status, new_status='rejected',
+                                reason=cascade_reason,
+                                note=f'因话题封禁联动（触发帖 #{post.id}）',
+                            )
+                            Notification.objects.create(
+                                receiver=p.author,
+                                notification_type='post_rejected',
+                                title='帖子审核未通过',
+                                content=f'你的帖子《{p.title}》所含话题已被封禁，未能通过审核',
+                                post=p,
+                            )
 
             ReviewLog.objects.create(
                 content_type='post', content_id=post.id,
@@ -891,7 +1077,6 @@ class AdminPostViewSet(ModelViewSet):
             )
 
         return Response({'detail': '审核拒绝'})
-
     # ---------- 隐藏 ----------
     @action(detail=True, methods=['post'])
     def hide(self, request, pk=None):
@@ -920,7 +1105,7 @@ class AdminPostViewSet(ModelViewSet):
     def feature(self, request, pk=None):
         post = self.get_object()
         post.is_featured = not post.is_featured
-        post.save()  # 走 Post.save() 触发精选积分逻辑
+        post.save(update_fields=['is_featured', 'updated_at'])  # 仍触发精选奖励，且不覆盖计数
         return Response({'detail': '精选状态已更新', 'is_featured': post.is_featured})
 
     # ---------- 置顶 ----------

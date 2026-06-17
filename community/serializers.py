@@ -13,9 +13,39 @@ from managers.models import Manager
 from .models import (
     PostCategory, Post, PostMedia, Comment, Topic, UserAction,
     Report, Notification, UserFollow, PostCollection, BlockedUser,
-    PostTopic, Mention,
+    PostTopic, Mention, PostView
 )
 
+
+def _attach_post_flags(context, post_ids, user):
+    """一次性算出当前用户点赞/收藏的帖子集合，存进 context（只算一次）。"""
+    if user and post_ids and context.get('liked_post_ids') is None:
+        context['liked_post_ids'] = set(
+            UserAction.objects.filter(
+                user=user, action_type='like_post', post_id__in=post_ids
+            ).values_list('post_id', flat=True)
+        )
+        context['collected_post_ids'] = set(
+            PostCollection.objects.filter(
+                user=user, post_id__in=post_ids
+            ).values_list('post_id', flat=True)
+        )
+
+
+class _PostFlagListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        items = list(data)
+        user = _get_user(self.context)
+        _attach_post_flags(self.context, [p.pk for p in items], user)
+        return super().to_representation(items)
+
+
+class _CollectionFlagListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        items = list(data)
+        user = _get_user(self.context)
+        _attach_post_flags(self.context, [c.post_id for c in items], user)
+        return super().to_representation(items)
 
 # ======================================================================
 # 工具函数
@@ -184,6 +214,22 @@ class PostTopicSerializer(serializers.ModelSerializer):
 # ======================================================================
 # 评论（用户端）
 # ======================================================================
+class _CommentFlagListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        items = list(data)
+        user = _get_user(self.context)
+        if user and items and self.context.get('liked_comment_ids') is None:
+            ids = set()
+            for c in items:
+                ids.add(c.pk)
+                for r in getattr(c, 'active_replies', None) or []:
+                    ids.add(r.pk)
+            self.context['liked_comment_ids'] = set(
+                UserAction.objects.filter(
+                    user=user, action_type='like_comment', comment_id__in=ids
+                ).values_list('comment_id', flat=True)
+            )
+        return super().to_representation(items)
 
 class CommentSerializer(serializers.ModelSerializer):
     """评论（用户端，含 is_liked / can_delete）"""
@@ -194,6 +240,7 @@ class CommentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Comment
+        list_serializer_class = _CommentFlagListSerializer
         fields = [
             'id', 'author', 'parent', 'content',
             'like_count', 'reply_count',
@@ -207,13 +254,19 @@ class CommentSerializer(serializers.ModelSerializer):
         ]
 
     def get_replies(self, obj):
-        """前 3 条子回复；依赖视图 prefetch 避免 N+1"""
-        qs = obj.replies.filter(is_deleted=False)[:3]
-        if not qs:
+        replies = getattr(obj, 'active_replies', None)
+        if replies is None:  # 兜底（详情页 recent_comments 没预取时）
+            replies = list(obj.replies.filter(is_deleted=False).order_by('-created_at')[:3])
+        else:
+            replies = replies[:3]
+        if not replies:
             return []
-        return CommentSerializer(qs, many=True, context=self.context).data
+        return CommentSerializer(replies, many=True, context=self.context).data
 
     def get_is_liked(self, obj):
+        ids = self.context.get('liked_comment_ids')
+        if ids is not None:
+            return obj.pk in ids
         user = _get_user(self.context)
         if not user:
             return False
@@ -267,6 +320,7 @@ class PostListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Post
+        list_serializer_class = _PostFlagListSerializer
         fields = [
             'id', 'author', 'category', 'post_type', 'status',
             'title', 'content', 'cover_image', 'cover_media', 'topics',
@@ -277,9 +331,8 @@ class PostListSerializer(serializers.ModelSerializer):
         ]
 
     def get_cover_media(self, obj):
-        # 依赖视图 prefetch_related('medias')
-        first = obj.medias.first()
-        return PostMediaSerializer(first).data if first else None
+        medias = list(obj.medias.all())  # 命中 prefetch 缓存，按 sort_order 排序
+        return PostMediaSerializer(medias[0]).data if medias else None
 
     def get_topics(self, obj):
         # 依赖视图 prefetch_related('post_topics__topic')
@@ -288,7 +341,10 @@ class PostListSerializer(serializers.ModelSerializer):
         ).data
 
     def get_is_liked(self, obj):
-        user = _get_user(self.context)
+        ids = self.context.get('liked_post_ids')
+        if ids is not None:
+            return obj.pk in ids
+        user = _get_user(self.context)  # 单对象/详情场景的兜底
         if not user:
             return False
         return UserAction.objects.filter(
@@ -296,6 +352,9 @@ class PostListSerializer(serializers.ModelSerializer):
         ).exists()
 
     def get_is_collected(self, obj):
+        ids = self.context.get('collected_post_ids')
+        if ids is not None:
+            return obj.pk in ids
         user = _get_user(self.context)
         if not user:
             return False
@@ -412,7 +471,8 @@ class CreatePostSerializer(serializers.ModelSerializer):
         if not value:
             return value
         valid_ids = set(
-            Topic.objects.filter(id__in=value, status='approved')
+            Topic.objects.filter(id__in=value)
+            .exclude(status__in=['banned', 'rejected', 'suspended'])
             .values_list('id', flat=True)
         )
         invalid = [tid for tid in value if tid not in valid_ids]
@@ -560,8 +620,10 @@ class PostCollectionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PostCollection
+        list_serializer_class = _CollectionFlagListSerializer   # ← 新增：批量预取点赞/收藏标记，修掉 N+1
         fields = ['id', 'post', 'folder', 'note', 'created_at']
         read_only_fields = ['id', 'created_at']
+
 
 
 class CreateCollectionSerializer(serializers.ModelSerializer):
@@ -574,6 +636,24 @@ class CreateCollectionSerializer(serializers.ModelSerializer):
         validated_data['user'] = self.context['request'].user
         return super().create(validated_data)
 
+# ======================================================================
+# 浏览历史
+# ======================================================================
+
+class PostViewHistorySerializer(serializers.ModelSerializer):
+    """
+    浏览历史（含帖子摘要）。
+    PostView 和 PostCollection 一样都有 .post_id，直接复用
+    _CollectionFlagListSerializer 按 post_id 批量预取当前用户的点赞/收藏标记，
+    避免逐条 PostView 再去查 UserAction / PostCollection（N+1）。
+    """
+    post = PostListSerializer(read_only=True)
+
+    class Meta:
+        model = PostView
+        list_serializer_class = _CollectionFlagListSerializer
+        fields = ['id', 'post', 'view_count', 'duration', 'source', 'created_at', 'updated_at']
+        read_only_fields = fields
 
 # ======================================================================
 # 关注

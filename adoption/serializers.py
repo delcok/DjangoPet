@@ -242,7 +242,7 @@ class AdoptionApplicationCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {'accept_window_sealing': '领养猫咪需承诺封窗'})
 
-        # 4. 重复申请友好拦截(数据库条件唯一约束兜底并发)
+        # 4. 重复申请友好拦截(行锁内还会复核,MySQL 无条件唯一约束)
         if AdoptionApplication.objects.filter(
                 pet=pet, applicant=user,
                 status__in=AdoptionApplication.ACTIVE_STATUSES).exists():
@@ -260,6 +260,15 @@ class AdoptionApplicationCreateSerializer(serializers.ModelSerializer):
             with transaction.atomic():
                 # 行锁防止并发把名额打超
                 locked_pet = StrayPet.objects.select_for_update().get(pk=pet.pk)
+
+                # 行锁内复核重复申请: MySQL/MariaDB 不支持 partial index,模型上的条件唯一
+                # 约束 uniq_active_application 不会被创建,无法靠 IntegrityError 兜底。
+                # 宠物行已被 select_for_update 锁住,同宠物的并发提交在此被串行化,复核可靠。
+                if AdoptionApplication.objects.filter(
+                        pet=locked_pet, applicant=user,
+                        status__in=AdoptionApplication.ACTIVE_STATUSES).exists():
+                    raise serializers.ValidationError('您已提交过该宠物的申请,请勿重复提交')
+
                 if not locked_pet.can_accept_application:
                     raise serializers.ValidationError('手慢了,该宠物的申请名额刚刚满了')
 
@@ -275,7 +284,7 @@ class AdoptionApplicationCreateSerializer(serializers.ModelSerializer):
                 AdopterProfile.objects.filter(pk=self._profile.pk).update(
                     applied_count=F('applied_count') + 1)
         except IntegrityError:
-            # 并发下撞条件唯一约束
+            # 若库支持条件唯一约束(PostgreSQL),并发下撞约束时的兜底
             raise serializers.ValidationError('您已提交过该宠物的申请,请勿重复提交')
 
         dispatch_task('adoption.tasks.notify_new_application', application.id)
@@ -542,7 +551,8 @@ class ApplicationAdminActionSerializer(serializers.Serializer):
 class AdoptionUpdateCreateSerializer(serializers.ModelSerializer):
     """领养人提交打卡(关联任务)或自主加更(task 为空)"""
     application = serializers.PrimaryKeyRelatedField(
-        queryset=AdoptionApplication.objects.filter(status='completed'))
+        queryset=AdoptionApplication.objects.filter(status='completed'),
+        required=False)
     task = serializers.PrimaryKeyRelatedField(
         queryset=AdoptionUpdateTask.objects.all(), required=False, allow_null=True)
     images = serializers.ListField(
@@ -557,16 +567,33 @@ class AdoptionUpdateCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         user = self.context['request'].user
-        app = attrs['application']
+        task = attrs.get('task')
+        app = attrs.get('application')
+
+        # 打卡: 有 task 时 application 由 task 唯一确定,前端只传 task 即可
+        if task is not None:
+            if app is None:
+                app = task.application
+                attrs['application'] = app
+            elif task.application_id != app.id:
+                raise serializers.ValidationError({'task': '打卡任务与申请单不匹配'})
+        # 自主加更: 没有 task 必须显式指定申请
+        if app is None:
+            raise serializers.ValidationError({'application': '需指定打卡任务或领养申请'})
+
         if app.applicant_id != user.id:
             raise serializers.ValidationError('只能为自己的领养记录打卡')
+        # 退养/未完成的领养记录不可打卡: task 反推路径会绕过字段级 status='completed' 过滤,这里兜底
+        if app.status != 'completed':
+            raise serializers.ValidationError('该领养记录当前不可打卡')
 
-        task = attrs.get('task')
-        if task:
-            if task.application_id != app.id:
-                raise serializers.ValidationError({'task': '打卡任务与申请单不匹配'})
+        if task is not None:
             if task.status in ('submitted', 'exempted'):
                 raise serializers.ValidationError({'task': '该期打卡已完成,无需重复提交'})
+            # 未到本期打卡窗口(due_start)不可提交;已逾期仍允许补交,故只卡下界
+            if timezone.now() < task.due_start:
+                raise serializers.ValidationError(
+                    {'task': '本期回访打卡尚未开始,请到打卡时间后再来'})
         return attrs
 
     def create(self, validated_data):
@@ -746,7 +773,9 @@ class AdoptionViolationCreateSerializer(serializers.ModelSerializer):
                 # 已有更晚的限制则保留更晚者
                 if not (profile.restricted_until and profile.restricted_until > until):
                     profile.restricted_until = until
-                profile.status = 'restricted'
+                # 不把已有的永久封禁降级成限期限制
+                if profile.status != 'banned':
+                    profile.status = 'restricted'
             elif penalty == 'ban':
                 profile.status = 'banned'
                 profile.restricted_until = None

@@ -14,6 +14,9 @@ urlpatterns = [
     path('user/update/', views.update_user_info, name='user-update'),
     # Token 刷新
     path('user/auth/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
+# ═══════════════════ App 端 - 短信验证码登录 ═══════════════════
+    path('user/sms/send/', views.send_sms_code_api, name='user-sms-send'),
+    path('user/sms-login/', views.sms_login, name='user-sms-login'),
 
     # ═══════════════════ 管理员端 - 用户管理 ═══════════════════
     # 列表 / 详情 / 编辑

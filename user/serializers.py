@@ -2,6 +2,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from .models import User, UserAuthProvider, UserDevice, UserLoginLog, UserProfileAudit
+import re
 
 
 # ═══════════════════════════════════════════════════════
@@ -96,6 +97,54 @@ class WechatLoginSerializer(serializers.Serializer):
     user_info = serializers.JSONField(required=False, help_text="微信用户信息")
     invite_code = serializers.CharField(required=False, allow_blank=True, default="")
 
+# 中国大陆手机号（与阿里云短信一致，App 登录注册用）
+CN_PHONE_RE = re.compile(r'^1[3-9]\d{9}$')
+
+
+class SendSmsCodeSerializer(serializers.Serializer):
+    """发送短信验证码（App 端：登录/注册）"""
+    phone = serializers.CharField(max_length=17, help_text="手机号")
+    scene = serializers.ChoiceField(
+        choices=['login', 'register', 'reset_password'],
+        default='login',
+        help_text="登录注册统一用 login，留空即可",
+    )
+
+    def validate_phone(self, value):
+        value = (value or '').strip()
+        if not CN_PHONE_RE.match(value):
+            raise serializers.ValidationError("手机号格式不正确")
+        return value
+
+
+class SmsLoginSerializer(serializers.Serializer):
+    """短信验证码登录/注册（手机号不存在则自动注册）"""
+    phone = serializers.CharField(max_length=17, help_text="手机号")
+    code = serializers.CharField(min_length=4, max_length=6, help_text="短信验证码")
+    scene = serializers.ChoiceField(
+        choices=['login', 'register'], default='login',
+        help_text="需与发送时一致；统一登录注册流程留空即可",
+    )
+    platform = serializers.ChoiceField(
+        choices=['ios', 'android', 'h5', 'web'],
+        default='ios', help_text="客户端平台",
+    )
+    invite_code = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="邀请码（仅新用户注册时生效）",
+    )
+
+    def validate_phone(self, value):
+        value = (value or '').strip()
+        if not CN_PHONE_RE.match(value):
+            raise serializers.ValidationError("手机号格式不正确")
+        return value
+
+    def validate_code(self, value):
+        value = (value or '').strip()
+        if not value.isdigit():
+            raise serializers.ValidationError("验证码必须为数字")
+        return value
 
 # ═══════════════════════════════════════════════════════
 # 管理员端 - 用户列表/详情序列化器

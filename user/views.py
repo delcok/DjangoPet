@@ -25,7 +25,7 @@ from user.serializers import (
     AdminCancelVipSerializer,
     AdminVerifyUserSerializer,
     AdminChangeLevelSerializer,
-    AdminResetPasswordSerializer,
+    AdminResetPasswordSerializer, SendSmsCodeSerializer, SmsLoginSerializer,
 )
 from user.filters import UserFilter, UserLoginLogFilter
 from user.paginations import AdminUserPagination, LoginLogPagination, StandardPagination
@@ -34,6 +34,7 @@ from utils.authentication import generate_jwt_tokens, UserAuthentication, Manage
 from utils.permission import IsManager, IsSuperAdmin
 from utils.fetch_number import fetch_phone_number
 from utils.account_factory import register_user
+from utils.send_sms import verify_sms_code, send_sms_code
 from utils.wechat_client import get_user_mini_client
 from wallet.models import WalletTransaction, UserWallet
 
@@ -85,6 +86,38 @@ def _build_login_response(user, openid=None):
         data['openid'] = openid
     return data
 
+
+def _get_client_ip(request):
+    """优先取反代透传的真实 IP"""
+    xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
+def _platform_to_channel(platform):
+    """登录平台 → 注册渠道 register_channel"""
+    return {'ios': 'ios', 'android': 'android', 'h5': 'h5', 'web': 'h5'}.get(platform, 'ios')
+
+
+def _record_login_log(request, user, *, login_method, platform,
+                      is_success=True, fail_reason='', device_id=''):
+    """写登录日志（埋点 + 风控），失败不影响主流程"""
+    try:
+        UserLoginLog.objects.create(
+            user=user,
+            login_method=login_method,
+            platform=platform,
+            device_id=device_id or '',
+            ip_address=_get_client_ip(request),
+            location='',  # 如需 IP 归属地可在此补充
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:1000],
+            is_success=is_success,
+            fail_reason=fail_reason or '',
+        )
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
 @api_view(['POST'])
 def wechat_login(request):
@@ -347,6 +380,100 @@ def get_user_info(request):
     user.update_last_active()
     return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
 
+@api_view(['POST'])
+def send_sms_code_api(request):
+    """
+    POST /user/sms/send/   发送短信验证码（App 登录/注册）
+    body: { phone, scene? }   scene 默认 login
+    """
+    serializer = SendSmsCodeSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    phone = serializer.validated_data['phone']
+    scene = serializer.validated_data['scene']
+
+    ok, msg, debug_code = send_sms_code(phone, scene)
+    if not ok:
+        # can_send 限流 / 发送失败都会走这里
+        return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    resp = {'message': msg}
+    if debug_code:           # 仅 SMS_DEBUG_MODE=True 返回，线上为 None
+        resp['debug_code'] = debug_code
+    return Response(resp, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def sms_login(request):
+    """
+    POST /user/sms-login/   短信验证码登录/注册（手机号不存在则自动注册）
+    body: { phone, code, platform?, invite_code? }
+    """
+    serializer = SmsLoginSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    phone = data['phone']
+    code = data['code']
+    scene = data['scene']
+    platform = data['platform']
+    invite_code = (data.get('invite_code') or '').strip()
+
+    # 1. 校验验证码
+    ok, msg = verify_sms_code(phone, code, scene=scene)
+    if not ok:
+        return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    # 2. 查找用户
+    user = User.objects.filter(phone=phone).first()
+    is_new_register = False
+
+    if user:
+        # ---- 老用户：状态校验 ----
+        if user.is_banned:
+            _record_login_log(request, user, login_method='sms', platform=platform,
+                              is_success=False, fail_reason='账号已封禁')
+            return Response({'error': f'您已被封禁: {user.ban_reason}'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not user.is_active:
+            _record_login_log(request, user, login_method='sms', platform=platform,
+                              is_success=False, fail_reason='账号已禁用')
+            return Response({'error': '您已被禁用，请联系客服!'},
+                            status=status.HTTP_400_BAD_REQUEST)
+    else:
+        # ---- 新用户：自动注册（register_user 内部会发 100 金币注册奖励）----
+        try:
+            with transaction.atomic():
+                user = register_user(
+                    phone=phone,
+                    username=f"用户{phone[-4:]}",
+                    avatar='https://cdn.yimengzhiyuan.com/avatar/av-gen.png',
+                    register_channel=_platform_to_channel(platform),
+                )
+            is_new_register = True
+        except IntegrityError:
+            # 并发下同一手机号已被注册，回查复用
+            user = User.objects.filter(phone=phone).first()
+            if not user:
+                raise
+
+    # 3. 邀请奖励（仅新用户，主事务之外，失败不阻断登录）
+    if is_new_register and invite_code:
+        _process_invite_reward(user, invite_code)
+
+    # 4. 更新最后登录时间
+    user.last_login = timezone.now()
+    user.save(update_fields=['last_login'])
+
+    # 5. 登录日志
+    _record_login_log(request, user, login_method='sms', platform=platform, is_success=True)
+
+    # 6. 统一登录返回
+    resp = _build_login_response(user)
+    resp['is_new_user'] = is_new_register
+    return Response(resp, status=status.HTTP_200_OK)
 
 # ═══════════════════════════════════════════════════════════════
 # 管理员端 - 用户列表 / 详情

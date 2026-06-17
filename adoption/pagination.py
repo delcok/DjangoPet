@@ -49,12 +49,9 @@ class UpdateFeedCursorPagination(CursorPagination):
     max_page_size = 30
     page_size_query_param = 'page_size'
     cursor_query_param = 'cursor'
-    ordering = '-created_at'
+    ordering = ('-created_at', '-id')
 
-    def get_paginated_response(self, data):
-        # 小程序拿 next 里的 cursor 参数继续请求即可,为 null 表示到底了
-        return Response(OrderedDict([
-            ('next', self.get_next_link()),
-            ('previous', self.get_previous_link()),
-            ('list', data),
-        ]))
+    def get_ordering(self, request, queryset, view):
+        # 游标分页的 cursor 是按排序键编码位置的,排序必须由分页器自己锁定,
+        # 不能让 view 上的 OrderingFilter 改写(否则换了模型/字段就崩或静默错乱)
+        return self.ordering

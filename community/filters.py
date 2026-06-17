@@ -7,6 +7,7 @@ from django.db.models import Q, Count
 from django.utils import timezone
 from datetime import timedelta, datetime
 from user.models import User
+from managers.models import Manager
 
 from .models import (
     Post, PostCategory, Comment, Topic, UserAction,
@@ -506,7 +507,7 @@ class ReportFilter(BaseFilter):
     # 基础字段过滤
     reporter = filters.ModelChoiceFilter(queryset=User.objects.all())
     reporter_username = filters.CharFilter(field_name='reporter__username', lookup_expr='icontains')
-    handler = filters.ModelChoiceFilter(queryset=User.objects.all())
+    handler = filters.ModelChoiceFilter(queryset=Manager.objects.all())
     content_type = filters.MultipleChoiceFilter(choices=Report.CONTENT_TYPE_CHOICES)
     report_type = filters.MultipleChoiceFilter(choices=Report.REPORT_TYPE_CHOICES)
     status = filters.MultipleChoiceFilter(choices=Report.STATUS_CHOICES)
@@ -573,7 +574,7 @@ class AdminPostFilter(PostFilter):
     category_slug = filters.CharFilter(field_name='category__slug')
 
     # 审核相关过滤
-    reviewer = filters.ModelChoiceFilter(queryset=User.objects.all())
+    reviewer = filters.ModelChoiceFilter(queryset=Manager.objects.all())
     review_priority = filters.NumberFilter()
     review_priority_min = filters.NumberFilter(field_name='review_priority', lookup_expr='gte')
     auto_review_score_min = filters.NumberFilter(field_name='auto_review_score', lookup_expr='gte')
