@@ -60,5 +60,8 @@ urlpatterns = [
         path('realtime/',
              views.RealtimeView.as_view(),
              name='realtime'),
+        path('content-data/',
+             views.ContentDataView.as_view(),
+             name='content-data'),
     ])),
 ]

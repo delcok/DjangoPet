@@ -8,7 +8,7 @@ from django.db import IntegrityError
 import uuid
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from datetime import timedelta
-
+from django.db.models.functions import TruncDate
 from rest_framework import status, permissions, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -121,6 +121,13 @@ class UserViewSet(ReadOnlyModelViewSet):
 
     def get_object(self):
         lookup = self.kwargs.get(self.lookup_field)
+        if lookup == 'me':
+            user = self.request.user
+            if not (isinstance(user, User) and user.is_authenticated):
+                from rest_framework.exceptions import NotFound
+                raise NotFound('用户不存在')
+            self.check_object_permissions(self.request, user)
+            return user
         try:
             qs = User.objects.filter(is_active=True)
             user = qs.get(id=int(lookup)) if lookup.isdigit() else qs.get(username=lookup)
@@ -1380,3 +1387,125 @@ class RealtimeView(APIView):
             'notifications': NotificationSerializer(recent, many=True).data,
             'timestamp': timezone.now().isoformat(),
         })
+
+# ======================================================================
+# 创作者中心 — 内容数据（近 N 天互动表现，仅本人）
+# ======================================================================
+class ContentDataView(APIView):
+    """
+    创作者中心「内容数据」面板。
+    返回窗口总数、累计总数，以及每日 trend，供前端绘制真实折线图。
+    口径：近 N 个自然日，包含今天；days 限制 1~90。
+    """
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def get(self, request):
+        user = request.user
+
+        try:
+            days = int(request.GET.get('days', 7))
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, min(days, 90))
+
+        # 自然日口径：今天 + 前 days-1 天，和折线图 X 轴一致
+        today = timezone.localdate()
+        start_date = today - timedelta(days=days - 1)
+        start_dt = timezone.localtime(timezone.now()).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) - timedelta(days=days - 1)
+
+        my_posts = Post.objects.filter(author=user)
+        posts_count = my_posts.count()
+
+        def daily_map(qs, field_name):
+            return {
+                row['day']: row['count']
+                for row in qs.annotate(day=TruncDate(field_name))
+                .values('day')
+                .annotate(count=Count('id'))
+                .order_by('day')
+            }
+
+        if posts_count == 0:
+            views_map = likes_map = collects_map = comments_map = {}
+            total = self._zero()
+        else:
+            # 注意：PostView 这里仍沿用你原本的 count() 口径：登录用户去重浏览记录数。
+            # 如果希望重复浏览也计入趋势，可把 Count('id') 改成 Sum('view_count')。
+            views_map = daily_map(
+                PostView.objects.filter(
+                    post__author=user,
+                    post__is_deleted=False,
+                    updated_at__gte=start_dt,
+                ),
+                'updated_at',
+            )
+            likes_map = daily_map(
+                UserAction.objects.filter(
+                    action_type='like_post',
+                    post__author=user,
+                    post__is_deleted=False,
+                    created_at__gte=start_dt,
+                ),
+                'created_at',
+            )
+            collects_map = daily_map(
+                PostCollection.objects.filter(
+                    post__author=user,
+                    post__is_deleted=False,
+                    created_at__gte=start_dt,
+                ),
+                'created_at',
+            )
+            comments_map = daily_map(
+                Comment.objects.filter(
+                    post__author=user,
+                    post__is_deleted=False,
+                    created_at__gte=start_dt,
+                ),
+                'created_at',
+            )
+
+            agg = my_posts.aggregate(
+                views=Sum('view_count'),
+                likes=Sum('like_count'),
+                collects=Sum('collect_count'),
+                comments=Sum('comment_count'),
+            )
+            total = {k: (v or 0) for k, v in agg.items()}
+
+        trend = []
+        for i in range(days):
+            day = start_date + timedelta(days=i)
+            trend.append({
+                'date': day.isoformat(),
+                'label': day.strftime('%m/%d'),
+                'views': views_map.get(day, 0),
+                'likes': likes_map.get(day, 0),
+                'collects': collects_map.get(day, 0),
+                'comments': comments_map.get(day, 0),
+            })
+
+        window = {
+            'views': sum(item['views'] for item in trend),
+            'likes': sum(item['likes'] for item in trend),
+            'collects': sum(item['collects'] for item in trend),
+            'comments': sum(item['comments'] for item in trend),
+        }
+
+        return Response({
+            'success': True,
+            'data': {
+                'days': days,
+                'posts_count': posts_count,
+                'window': window,
+                'total': total,
+                'trend': trend,
+            },
+        })
+
+    @staticmethod
+    def _zero():
+        return {'views': 0, 'likes': 0, 'collects': 0, 'comments': 0}
