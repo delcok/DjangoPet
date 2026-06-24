@@ -794,3 +794,20 @@ class PetFavoriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = PetFavorite
         fields = ['id', 'pet', 'created_at']
+
+
+class MyUpdateListSerializer(serializers.ModelSerializer):
+    """C端: 我发布过的动态"""
+    period_no = serializers.SerializerMethodField()
+    application_no = serializers.CharField(
+        source='application.application_no', read_only=True)
+    pet = PetBriefSerializer(source='application.pet', read_only=True)
+
+    class Meta:
+        model = AdoptionUpdate
+        fields = ['id', 'application', 'application_no', 'pet', 'task',
+                  'period_no', 'content', 'images', 'video_url',
+                  'is_public', 'created_at']
+
+    def get_period_no(self, obj):
+        return obj.task.period_no if obj.task_id else None

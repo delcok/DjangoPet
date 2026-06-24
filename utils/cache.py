@@ -59,6 +59,9 @@ class CacheKey:
     CATEGORY_LIST = "category:list"
     DISTRICT_LIST = "district:list"
 
+    # 数据面板
+    DASHBOARD_OVERVIEW = "dashboard:overview"
+
 
 # ══════════════════════════════════════════════════════════════
 # 验证码管理

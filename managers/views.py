@@ -3,6 +3,7 @@
 管理员视图
 使用项目已有的 authentication.py 和 permissions.py
 """
+import json
 
 from datetime import datetime
 from rest_framework import status, viewsets
@@ -18,14 +19,16 @@ from .serializers import (
     ManagerCreateSerializer, ManagerUpdateSerializer,
     ManagerProfileSerializer, ManagerProfileUpdateSerializer,
     ManagerOperationLogSerializer, ManagerOperationLogDetailSerializer,
-    SystemConfigSerializer,  SystemConfigBatchUpdateSerializer
+    SystemConfigSerializer, SystemConfigUpdateSerializer, SystemConfigBatchUpdateSerializer
 )
 
 # 使用项目已有的认证和权限
 from utils.authentication import ManagerAuthentication, generate_manager_tokens
-from utils.permission import AllowAny, IsManager
+from utils.permission import AllowAny, IsManager, IsSuperAdmin, HasModuleAccess
 from utils.cache import LoginSecurityManager
 from .paginations import AdminPagination
+from utils.cache import get_redis_connection, CacheKey
+from managers.dashboard_stats import refresh_dashboard_cache
 
 
 # ══════════════════════════════════════════════════════════════
@@ -616,57 +619,35 @@ class SystemConfigViewSet(viewsets.ModelViewSet):
 # 仪表盘统计
 # ══════════════════════════════════════════════════════════════
 
+def get_admin_realtime_overview():
+    """管理端实时概览(管理员数 / 今日登录 / 最近日志), 不进 Redis。"""
+    from django.utils import timezone
+    today = timezone.localdate()
+    return {
+        'manager_stats': {
+            'total': Manager.objects.count(),
+            'active': Manager.objects.filter(status=Manager.Status.ACTIVE).count(),
+        },
+        'today_logins': ManagerOperationLog.objects.filter(
+            action='login', created_at__date=today
+        ).count(),
+        'recent_logs': ManagerOperationLogSerializer(
+            ManagerOperationLog.objects.order_by('-created_at')[:10], many=True
+        ).data,
+    }
+
 class DashboardView(APIView):
-    """仪表盘统计数据"""
     authentication_classes = [ManagerAuthentication]
     permission_classes = [IsManager]
 
     def get(self, request):
-        from django.db.models import Count
-        from django.utils import timezone
+        conn = get_redis_connection()
+        if request.query_params.get('refresh') == '1':
+            data = refresh_dashboard_cache()
+        else:
+            cached = conn.get(CacheKey.DASHBOARD_OVERVIEW)
+            data = json.loads(cached) if cached else refresh_dashboard_cache()
 
-        today = timezone.now().date()
-
-        # 导入商家模型
-        try:
-            from merchants.models import Merchant, MerchantCategory
-
-            # 商家统计
-            merchant_stats = {
-                'total': Merchant.objects.count(),
-                'active': Merchant.objects.filter(status='active').count(),
-                'pending': Merchant.objects.filter(status='pending').count(),
-                'today_new': Merchant.objects.filter(created_at__date=today).count(),
-            }
-
-            # 分类统计
-            category_stats = list(MerchantCategory.objects.annotate(
-                merchant_count=Count('merchants')
-            ).values('name', 'merchant_count'))
-        except ImportError:
-            merchant_stats = {}
-            category_stats = []
-
-        # 管理员统计
-        manager_stats = {
-            'total': Manager.objects.count(),
-            'active': Manager.objects.filter(status='active').count(),
-        }
-
-        # 今日登录
-        today_logins = ManagerOperationLog.objects.filter(
-            action='login',
-            created_at__date=today
-        ).count()
-
-        # 最近操作日志
-        recent_logs = ManagerOperationLog.objects.order_by('-created_at')[:10]
-        recent_logs_data = ManagerOperationLogSerializer(recent_logs, many=True).data
-
-        return Response({
-            'merchant_stats': merchant_stats,
-            'category_stats': category_stats,
-            'manager_stats': manager_stats,
-            'today_logins': today_logins,
-            'recent_logs': recent_logs_data,
-        })
+        # 实时叠加, 保证日志/今日登录是新鲜的
+        data['admin'] = get_admin_realtime_overview()
+        return Response(data)

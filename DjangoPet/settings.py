@@ -14,6 +14,7 @@ import environ
 
 from pathlib import Path
 from datetime import timedelta
+from celery.schedules import crontab
 
 env = environ.Env(
     DEBUG=(bool, False)
@@ -68,6 +69,9 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'django_filters',
+    'django_celery_beat',
+    'django_celery_results',
+
     'corsheaders',
 
     # 已检查
@@ -260,6 +264,27 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': False,
         },
+        'celery': {
+                'handlers': ['file', 'console'],
+                'level': 'INFO',
+                'propagate': False,
+            },
+        'bill': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'sms': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'adoption': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+
     },
 }
 
@@ -288,3 +313,58 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+CELERY_BROKER_URL = env('CELERY_BROKER_URL')
+CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='django-db')
+
+# 序列化
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+
+# 时区: 跟 Django 保持一致
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_ENABLE_UTC = True
+
+# 任务路由 — 按业务拆队列,防互相阻塞
+CELERY_TASK_ROUTES = {
+    # ── QSever 原有路由(bill/campaigns/promotions 共用) ──
+    'bill.tasks.task_try_auto_dispatch': {'queue': 'dispatch'},
+    'bill.tasks.task_expire_pending_dispatches': {'queue': 'dispatch'},
+    'bill.tasks.task_dispatch_upcoming_deliveries': {'queue': 'dispatch'},
+    'bill.tasks.task_activate_due_subscriptions': {'queue': 'default'},
+    'bill.tasks.task_send_sms': {'queue': 'sms'},
+
+    # ── 领养模块: 通知走 default,定时扫描走 adoption 队列 ──
+    'adoption.tasks.notify_new_application': {'queue': 'default'},
+    'adoption.tasks.notify_application_result': {'queue': 'default'},
+    'adoption.tasks.notify_application_cancelled': {'queue': 'default'},
+    'adoption.tasks.notify_update_submitted': {'queue': 'default'},
+    'adoption.tasks.alert_abnormal_update': {'queue': 'default'},
+    'adoption.tasks.notify_violation': {'queue': 'default'},
+    'adoption.tasks.notify_update_reminder': {'queue': 'default'},
+    'adoption.tasks.scan_approve_expired': {'queue': 'adoption'},
+    'adoption.tasks.scan_overdue_updates': {'queue': 'adoption'},
+    'adoption.tasks.scan_restriction_lift': {'queue': 'adoption'},
+}
+
+CELERY_TASK_DEFAULT_QUEUE = 'default'
+
+# 可靠性: worker 处理完才 ack,宕机不丢任务
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+
+# 任务超时
+CELERY_TASK_TIME_LIMIT = 60
+CELERY_TASK_SOFT_TIME_LIMIT = 50
+
+# Beat 用 DB 调度器,可在 admin 后台改间隔
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+CELERY_BEAT_SCHEDULE = {
+    'refresh-dashboard-daily': {
+        'task': 'managers.tasks.refresh_dashboard_task',
+        'schedule': crontab(hour=3, minute=0),   # 每天 03:00(Asia/Shanghai)
+    },
+}

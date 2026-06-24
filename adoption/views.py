@@ -53,7 +53,7 @@ from .serializers import (AdopterProfileAdminSerializer,
                           MyApplicationDetailSerializer,
                           MyApplicationListSerializer, PetFavoriteSerializer,
                           PetMediaSerializer, StrayPetAdminSerializer,
-                          StrayPetDetailSerializer, StrayPetListSerializer)
+                          StrayPetDetailSerializer, StrayPetListSerializer, MyUpdateListSerializer)
 
 # ════════════════════════════════════════════════════════════
 # C端 — 小程序
@@ -217,21 +217,20 @@ class MyApplicationViewSet(mixins.CreateModelMixin, mixins.ListModelMixin,
 
 class MyUpdateViewSet(mixins.CreateModelMixin, mixins.ListModelMixin,
                       GenericViewSet):
-    """
-    我的领养动态
-    POST /updates/   提交打卡(带 task)或自主加更(不带 task)
-    GET  /updates/   我发布过的动态
-    """
     authentication_classes = [UserAuthentication]
     permission_classes = [IsActiveUser]
     pagination_class = StandardPagination
-    serializer_class = AdoptionUpdateCreateSerializer
 
     def get_queryset(self):
         return (AdoptionUpdate.objects
                 .filter(application__applicant=self.request.user, source='user')
-                .select_related('task')
+                .select_related('task', 'application', 'application__pet')  # ← 补 application__pet
                 .order_by('-created_at'))
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return AdoptionUpdateCreateSerializer
+        return MyUpdateListSerializer   # ← list 用读序列化器
 
 
 class MyUpdateTaskListView(generics.ListAPIView):
