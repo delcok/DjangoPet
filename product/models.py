@@ -289,8 +289,8 @@ class Goods(models.Model):
         help_text='False=仅自提'
     )
     allow_pickup = models.BooleanField(
-        default=False, verbose_name='是否允许自提',
-        help_text='False=仅配送'
+        default=True, verbose_name='是否允许自提',
+        help_text='与店铺"支持自提"取交集后生效；False=该商品强制不支持自提'
     )
 
     # ══════════════════ 7. 购买限制 ══════════════════

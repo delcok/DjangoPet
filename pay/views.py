@@ -91,10 +91,25 @@ class CreatePaymentView(APIView):
         # 正常调微信下单
         helper = WeChatPayHelper()
         try:
+            # 拼接支付描述：商品订单用真实商品详情，其他用默认
+            order_type = ser.validated_data['order_type']
+            if order_type == 'product':
+                order = ser.validated_data['_order']
+                items_desc = []
+                for item in order.items.all():
+                    items_desc.append(f"{item.product_name}x{item.quantity}")
+                pay_body = "，".join(items_desc)
+                # 微信支付description最长127字符，超长截断
+                if len(pay_body) > 127:
+                    pay_body = pay_body[:124] + "..."
+            else:
+                # 服务/其他订单暂时用订单号标识
+                pay_body = f'订单 {payment.order_no}'
+
             pay_params = helper.create_payment_order(
                 openid=ser.validated_data.get('openid', ''),
                 total_fee=payment.amount_in_cents,
-                body=f'订单 {payment.order_no}',
+                body=pay_body,
                 out_trade_no=payment.out_trade_no,
             )
         except Exception as e:

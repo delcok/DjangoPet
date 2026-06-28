@@ -15,7 +15,7 @@ from .models import (
     UserWallet, WalletTransaction, WalletStatusLog,
     MerchantWallet, MerchantWalletTransaction,
     WithdrawalRequest, MerchantSettlementConfig,
-    Currency, SignInConfig, UserSignIn,
+    Currency,
 )
 
 
@@ -91,6 +91,20 @@ class MerchantWalletSerializer(serializers.ModelSerializer):
     available_balance = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
     gold_available    = serializers.IntegerField(read_only=True)
     status_display    = serializers.CharField(source='get_status_display', read_only=True)
+    commission_rate = serializers.DecimalField(
+        source='merchant.commission_rate',
+        max_digits=5,
+        decimal_places=2,
+        read_only=True,
+    )
+
+    category_commission_rate = serializers.DecimalField(
+        source='merchant.category.commission_rate',
+        max_digits=5,
+        decimal_places=2,
+        read_only=True,
+        default=Decimal('0.00'),
+    )
 
     class Meta:
         model = MerchantWallet
@@ -99,7 +113,7 @@ class MerchantWalletSerializer(serializers.ModelSerializer):
             # ─── 现金 ───
             'balance', 'frozen_amount', 'available_balance', 'pending_settlement',
             'total_income', 'total_commission', 'total_refunded',
-            'total_withdrawn', 'total_withdraw_fee',
+            'total_withdrawn', 'total_withdraw_fee','commission_rate', 'category_commission_rate',
             # ─── 金币 ───
             'gold_balance', 'gold_frozen', 'gold_available',
             'gold_total_earned', 'gold_total_spent', 'gold_total_expired',
@@ -141,6 +155,58 @@ class MerchantSettlementConfigSerializer(serializers.ModelSerializer):
             'auto_withdraw', 'auto_withdraw_threshold',
         ]
         read_only_fields = fields
+
+
+class AdminMerchantSettlementConfigSerializer(serializers.ModelSerializer):
+    """管理端修改结算配置用的可写序列化器"""
+    class Meta:
+        model = MerchantSettlementConfig
+        fields = [
+            'settlement_cycle',
+            'min_withdraw_amount',
+            'max_withdraw_per_day',
+            'max_withdraw_times_per_day',
+            'withdraw_fee_rate',
+            'withdraw_fee_fixed',
+            'auto_withdraw',
+            'auto_withdraw_threshold',
+        ]
+
+    def validate_settlement_cycle(self, value):
+        valid_choices = [c[0] for c in MerchantSettlementConfig.SettlementCycle.choices]
+        if value not in valid_choices:
+            raise serializers.ValidationError(f"结算周期只能是 {valid_choices} 中的值")
+        return value
+
+    def validate_min_withdraw_amount(self, value):
+        if value < 0:
+            raise serializers.ValidationError("最低提现金额不能小于0")
+        return value
+
+    def validate_max_withdraw_per_day(self, value):
+        if value < 0:
+            raise serializers.ValidationError("每日提现金额上限不能小于0")
+        return value
+
+    def validate_max_withdraw_times_per_day(self, value):
+        if value < 0:
+            raise serializers.ValidationError("每日提现次数上限不能小于0")
+        return value
+
+    def validate_withdraw_fee_rate(self, value):
+        if value < 0 or value > 1:
+            raise serializers.ValidationError("手续费率必须在0-1之间（例如0.006表示0.6%）")
+        return value
+
+    def validate_withdraw_fee_fixed(self, value):
+        if value < 0:
+            raise serializers.ValidationError("固定手续费不能小于0")
+        return value
+
+    def validate_auto_withdraw_threshold(self, value):
+        if value < 0:
+            raise serializers.ValidationError("自动提现门槛不能小于0")
+        return value
 
 
 class WithdrawalRequestSerializer(serializers.ModelSerializer):
@@ -209,7 +275,7 @@ class AdminUserWalletSerializer(serializers.ModelSerializer):
     """管理员看用户钱包(带用户信息)"""
     user_id          = serializers.IntegerField(read_only=True)
     user_mobile      = serializers.CharField(source='user.mobile',   read_only=True, default='')
-    user_nickname    = serializers.CharField(source='user.nickname', read_only=True, default='')
+    user_username    = serializers.CharField(source='user.username', read_only=True, default='')
     points_available = serializers.IntegerField(read_only=True)
     gold_available   = serializers.IntegerField(read_only=True)
     status_display   = serializers.CharField(source='get_status_display', read_only=True)
@@ -217,7 +283,7 @@ class AdminUserWalletSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserWallet
         fields = [
-            'id', 'user_id', 'user_mobile', 'user_nickname',
+            'id', 'user_id', 'user_mobile', 'user_username',
             'status', 'status_display', 'status_reason',
             'points_balance', 'points_frozen', 'points_available',
             'points_total_earned', 'points_total_spent', 'points_total_expired',
@@ -445,70 +511,3 @@ class AdminWithdrawalSuccessSerializer(serializers.Serializer):
 class AdminWithdrawalFailedSerializer(serializers.Serializer):
     reason           = serializers.CharField(max_length=200)
     channel_response = serializers.JSONField(required=False, allow_null=True)
-
-# ════════════════════════════════════════════════════════════════
-#                        管理端 - 签到
-# ════════════════════════════════════════════════════════════════
-
-class AdminUserSignInSerializer(serializers.ModelSerializer):
-    """管理员看单条签到记录(带用户信息)"""
-    user_id       = serializers.IntegerField(read_only=True)
-    user_mobile   = serializers.CharField(source='user.mobile',   read_only=True, default='')
-    user_nickname = serializers.CharField(source='user.nickname', read_only=True, default='')
-
-    class Meta:
-        model = UserSignIn
-        fields = [
-            'id', 'user_id', 'user_mobile', 'user_nickname',
-            'sign_date', 'reward_points', 'continuous_days',
-            'is_makeup', 'makeup_cost', 'transaction', 'created_at',
-        ]
-        read_only_fields = fields
-
-
-class AdminSignInConfigSerializer(serializers.ModelSerializer):
-    """管理员读写签到配置(单例)"""
-    class Meta:
-        model = SignInConfig
-        fields = [
-            'cycle_rewards', 'sign_in_expire_days',
-            'makeup_enabled', 'makeup_cost_points', 'makeup_max_back_days',
-            'is_active', 'updated_by', 'updated_at',
-        ]
-        read_only_fields = ['updated_by', 'updated_at']
-
-    def validate_cycle_rewards(self, value):
-        if not isinstance(value, list) or not value:
-            raise serializers.ValidationError('循环奖励必须是非空数组')
-        if len(value) > 31:
-            raise serializers.ValidationError('循环周期最多 31 天')
-        cleaned = []
-        for i, v in enumerate(value):
-            # bool 是 int 子类,先挡掉
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                raise serializers.ValidationError(f'第 {i + 1} 项必须是数字')
-            if isinstance(v, float):
-                if not v.is_integer():
-                    raise serializers.ValidationError(f'第 {i + 1} 项必须是整数')
-                v = int(v)
-            if v < 0:
-                raise serializers.ValidationError(f'第 {i + 1} 项不能为负数')
-            if v > 100000:
-                raise serializers.ValidationError(f'第 {i + 1} 项奖励过大')
-            cleaned.append(v)
-        return cleaned
-
-    def validate_sign_in_expire_days(self, value):
-        if value > 3650:
-            raise serializers.ValidationError('有效期最长 3650 天')
-        return value
-
-    def validate_makeup_cost_points(self, value):
-        if value > 100000:
-            raise serializers.ValidationError('补签消耗积分过大')
-        return value
-
-    def validate_makeup_max_back_days(self, value):
-        if not (1 <= value <= 31):
-            raise serializers.ValidationError('补签回溯天数应在 1~31 之间')
-        return value

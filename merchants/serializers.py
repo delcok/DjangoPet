@@ -537,3 +537,43 @@ class MerchantDeliveryConfigSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({key: '不能为负数'})
 
         return attrs
+
+class MerchantAdminCreateSerializer(serializers.ModelSerializer):
+    """管理端 - 开通商家账号（只填登录手机号）"""
+    phone = serializers.CharField(max_length=17, validators=[validate_phone])
+
+    class Meta:
+        model = Merchant
+        fields = ['name', 'phone', 'contact_phone']
+
+    def validate_phone(self, value):
+        if Merchant.objects.filter(phone=value).exists():
+            raise serializers.ValidationError('该手机号已被占用')
+        return value
+
+class MerchantOnboardingSerializer(serializers.ModelSerializer):
+    """商家端 - 入驻资料填写 / 提交审核。
+    地址文字由商家填;经纬度只读,由管理员审核时定位。
+    """
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = Merchant
+        fields = [
+            'name', 'logo', 'images', 'description', 'announcement',
+            'category', 'business_district',
+            'contact_name', 'contact_phone',
+            'province', 'city', 'district', 'address',
+            'longitude', 'latitude',
+            'business_hours',
+            'license_no', 'license_image', 'id_card_front', 'id_card_back',
+            'bank_name', 'bank_account_name', 'bank_account_no',
+            # ↓ 只读，供前端判断流程阶段
+            'status', 'status_display', 'reject_reason',
+        ]
+        read_only_fields = ['longitude', 'latitude', 'status', 'reject_reason']
+
+    def validate_images(self, value):
+        if len(value) > 9:
+            raise serializers.ValidationError('最多上传9张图片')
+        return value

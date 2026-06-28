@@ -248,6 +248,10 @@ class ProductOrder(models.Model):
 
     paid_at = models.DateTimeField(null=True, blank=True, verbose_name='支付时间')
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    # ── 结算 ──
+    is_settled = models.BooleanField(default=False, db_index=True, verbose_name='是否已结算')
+    settle_due_at = models.DateTimeField(null=True, blank=True, verbose_name='结算到期时间')
+    settled_at = models.DateTimeField(null=True, blank=True, verbose_name='实际结算时间')
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -641,6 +645,10 @@ class ServiceOrder(models.Model):
     service_start_at = models.DateTimeField(null=True, blank=True, verbose_name='服务开始时间')
     service_end_at = models.DateTimeField(null=True, blank=True, verbose_name='服务结束时间')
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    # ── 结算 ──
+    is_settled = models.BooleanField(default=False, db_index=True, verbose_name='是否已结算')
+    settle_due_at = models.DateTimeField(null=True, blank=True, verbose_name='结算到期时间')
+    settled_at = models.DateTimeField(null=True, blank=True, verbose_name='实际结算时间')
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True)
 

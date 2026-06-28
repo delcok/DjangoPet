@@ -34,7 +34,7 @@ class TokenType:
 # - active     → 正常营业,完全放行
 # - suspended  → 暂停中,允许登录查看通知/申诉,业务接口靠 IsActiveMerchant 拦
 # 其他状态(pending/rejected/closed)一律拒绝认证。
-MERCHANT_AUTH_ALLOWED_STATUSES = {'active', 'suspended'}
+MERCHANT_AUTH_ALLOWED_STATUSES = {'active', 'suspended', 'draft', 'pending', 'rejected'}
 
 
 # ============================================================

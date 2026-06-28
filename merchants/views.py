@@ -43,7 +43,7 @@ from .serializers import (
     MerchantAdminUpdateSerializer,
     MerchantAuditSerializer,
     MerchantCategoryAdminSerializer, MerchantBankAccountUpdateSerializer,
-    MerchantDeliveryConfigSerializer,
+    MerchantDeliveryConfigSerializer, MerchantAdminCreateSerializer, MerchantOnboardingSerializer,
 )
 
 
@@ -224,15 +224,13 @@ class MerchantPasswordLoginView(APIView):
             )
 
         # 4) 密码正确才检查 status — 不算失败,直接告知
-        if merchant.status != Merchant.Status.ACTIVE:
-            status_msg = {
-                'pending': '账户待审核',
-                'suspended': '账户已被暂停',
-                'rejected': '账户审核被拒绝',
-                'closed': '账户已关闭',
-            }
+        blocked = {
+            Merchant.Status.SUSPENDED: '账户已被暂停',
+            Merchant.Status.CLOSED: '账户已关闭',
+        }
+        if merchant.status in blocked:
             return Response(
-                {'error': status_msg.get(merchant.status, '账户状态异常')},
+                {'error': blocked[merchant.status]},
                 status=status.HTTP_403_FORBIDDEN
             )
 
@@ -269,17 +267,13 @@ class MerchantSMSLoginView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        if merchant.status != Merchant.Status.ACTIVE:
-            status_msg = {
-                'pending': '账户待审核',
-                'suspended': '账户已被暂停',
-                'rejected': '账户审核被拒绝',
-                'closed': '账户已关闭',
-            }
-            return Response(
-                {'error': status_msg.get(merchant.status, '账户状态异常')},
-                status=status.HTTP_403_FORBIDDEN
-            )
+        blocked = {
+            Merchant.Status.SUSPENDED: '账户已被暂停',
+            Merchant.Status.CLOSED: '账户已关闭',
+        }
+        if merchant.status in blocked:
+            return Response({'error': blocked[merchant.status]},
+                            status=status.HTTP_403_FORBIDDEN)
 
         LoginSecurityManager().clear_fail_count(phone, 'merchant')
         merchant.last_login = timezone.now()  # ✅ 修复 #7
@@ -466,6 +460,66 @@ class MerchantProfileView(APIView):
         return Merchant.objects.filter(id=merchant_id).first()
 
 
+class MerchantOnboardingView(APIView):
+    """商家端 - 入驻资料
+    GET  读取当前资料
+    PUT  暂存资料（不改状态），仅 DRAFT/REJECTED 可改
+    POST 提交审核：保存资料 + 校验必填 + 状态切到 PENDING
+    """
+    authentication_classes = [MerchantAuthentication]   # 主账号操作入驻
+    permission_classes = [IsMerchant]
+
+    EDITABLE = {Merchant.Status.DRAFT, Merchant.Status.REJECTED}
+
+    def get(self, request):
+        return Response(MerchantOnboardingSerializer(request.user).data)
+
+    def put(self, request):
+        merchant = request.user
+        if merchant.status not in self.EDITABLE:
+            return Response({'error': '当前状态不可修改入驻资料'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        serializer = MerchantOnboardingSerializer(
+            merchant, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        BusinessCache().delete_merchant(merchant.id)
+        return Response(MerchantOnboardingSerializer(merchant).data)
+
+    def post(self, request):
+        merchant = request.user
+        if merchant.status not in self.EDITABLE:
+            return Response({'error': '当前状态不可提交审核'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # 先把这次提交的资料存下来（即使下面必填校验不过，也算暂存）
+        serializer = MerchantOnboardingSerializer(
+            merchant, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        # 提交前的必填校验
+        missing = []
+        if not merchant.name:
+            missing.append('商家名称')
+        if not merchant.category_id:
+            missing.append('商家分类')
+        if not merchant.address:
+            missing.append('详细地址')
+        if missing:
+            return Response(
+                {'error': '请先完善：' + '、'.join(missing)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        merchant.status = Merchant.Status.PENDING
+        merchant.reject_reason = ''
+        merchant.save(update_fields=['status', 'reject_reason'])
+        BusinessCache().delete_merchant(merchant.id)
+
+        return Response({'message': '资料已提交，等待审核', 'status': merchant.status})
 class MerchantChangePasswordView(APIView):
     """
     ✅ 修复 #5: 子账号场景下改子账号自己的密码,
@@ -522,29 +576,37 @@ class MerchantAdminViewSet(AdminLogMixin, viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'list':
             return MerchantAdminListSerializer
+        elif self.action == 'create':
+            return MerchantAdminCreateSerializer
         elif self.action in ['update', 'partial_update']:
             return MerchantAdminUpdateSerializer
         else:
             return MerchantAdminDetailSerializer
 
-    def perform_create(self, serializer):
-        merchant = onboard_merchant(**serializer.validated_data)
+    def create(self, request, *args, **kwargs):
+        """管理员开通商家：仅手机号，账号进入 DRAFT，等商家完善资料后再审核。"""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
+        merchant = onboard_merchant(**serializer.validated_data)
         if merchant is None:
-            phone = serializer.validated_data.get('phone')
-            if phone:
-                merchant = Merchant.objects.filter(phone=phone).first()
+            merchant = Merchant.objects.filter(
+                phone=serializer.validated_data['phone']
+            ).first()
 
         if merchant is not None:
             _safe_log(
-                self.request,
+                request,
                 action='create',
                 module=self.log_module,
-                description=f'创建{self.log_object_label}: {merchant.name}',
+                description=f'开通{self.log_object_label}账号: {merchant.phone}',
                 target_type=self.log_target_type,
                 target_id=str(merchant.id),
                 new_data=_snapshot(merchant),
             )
+
+        data = MerchantAdminDetailSerializer(merchant).data if merchant else {}
+        return Response(data, status=status.HTTP_201_CREATED)
 
     def perform_update(self, serializer):
         """
@@ -598,6 +660,11 @@ class MerchantAdminViewSet(AdminLogMixin, viewsets.ModelViewSet):
         old_status = merchant.status
 
         if audit_action == 'approve':
+            if merchant.longitude is None or merchant.latitude is None:
+                return Response(
+                    {'error': '请先在地图上为该商家定位(经纬度)再通过审核'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             merchant.status = Merchant.Status.ACTIVE
             merchant.reject_reason = ''
             action_text = '审核通过'

@@ -262,3 +262,134 @@ def task_cancel_stale_pending_orders():
     if cancelled:
         logger.info('task_cancel_stale_pending_orders 取消 %s 笔', cancelled)
     return cancelled
+
+
+@shared_task(
+    name='bill.tasks.task_settle_due_orders',
+    soft_time_limit=300,
+    time_limit=360,
+)
+def task_settle_due_orders():
+    """
+    每天凌晨自动结算到期的订单：
+    扫描所有已完成、未结算、结算时间已到的订单，执行结算（待结算转可提现，扣除佣金）
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    from django.utils import timezone
+    from django.db import transaction
+    from django.db.models import Sum
+    from bill.models import ProductOrder, ServiceOrder
+    from wallet.models import MerchantWallet, MerchantWalletTransaction
+    from pay.models import PaymentOrder, PaymentRefund
+
+    now = timezone.now()
+    settled_count = 0
+    failed_count = 0
+
+    def settle_single_order(order, order_type):
+        """结算单个订单"""
+        nonlocal settled_count, failed_count
+        try:
+            # 获取支付单
+            payment = (PaymentOrder.objects
+                       .filter(order_no=order.order_no, status='paid')
+                       .order_by('-created_at')
+                       .first())
+            if not payment:
+                logger.warning('订单 %s 无有效支付单，跳过结算', order.order_no)
+                order.is_settled = True  # 标记为已结算，避免重复扫描
+                order.save(update_fields=['is_settled', 'updated_at'])
+                return
+
+            mw = MerchantWallet.objects.filter(merchant_id=order.merchant_id).first()
+            if not mw:
+                logger.warning('订单 %s 商家钱包不存在，跳过结算', order.order_no)
+                return
+
+            # 计算退款金额
+            refunded = (PaymentRefund.objects
+                        .filter(payment_order=payment, status='success')
+                        .aggregate(s=Sum('refund_amount'))['s']) or Decimal('0')
+            settle_amount = payment.amount - refunded
+            if settle_amount <= 0:
+                # 全额退款，无需结算
+                order.is_settled = True
+                order.settled_at = now
+                order.save(update_fields=['is_settled', 'settled_at', 'updated_at'])
+                return
+
+            # 获取佣金率
+            merchant = mw.merchant
+            rate = Decimal(str(getattr(merchant, 'commission_rate', 0) or 0))
+            if rate <= 0 and getattr(merchant, 'category_id', None):
+                rate = Decimal(str(getattr(merchant.category, 'commission_rate', 0) or 0))
+
+            commission_amount = (
+                    settle_amount * rate / Decimal('100')
+            ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            if commission_amount > settle_amount:
+                commission_amount = settle_amount
+
+            with transaction.atomic():
+                # 锁定订单，防止重复结算
+                if order_type == 'product':
+                    order = ProductOrder.objects.select_for_update().get(pk=order.pk)
+                else:
+                    order = ServiceOrder.objects.select_for_update().get(pk=order.pk)
+                if order.is_settled:
+                    return  # 已经被其他任务结算过了
+
+                # 待结算转可提现
+                mw.settle_pending(
+                    amount=settle_amount,
+                    related_order_no=order.order_no,
+                    related_type=f'{order_type}_order',
+                    related_id=order.id,
+                    remark=f'订单 {order.order_no} 到期自动结算，佣金率 {rate}%',
+                    idempotent_key=f'order_settle_{order.order_no}',
+                )
+
+                # 扣除平台佣金
+                if commission_amount > 0:
+                    mw.change_balance(
+                        amount=-commission_amount,
+                        action=MerchantWalletTransaction.Action.COMMISSION_DEDUCT,
+                        related_order_no=order.order_no,
+                        related_type=f'{order_type}_order',
+                        related_id=order.id,
+                        remark=f'订单 {order.order_no} 平台佣金 {rate}%，扣除 ¥{commission_amount}',
+                        idempotent_key=f'order_commission_{order.order_no}',
+                    )
+
+                # 标记订单已结算
+                order.is_settled = True
+                order.settled_at = now
+                order.save(update_fields=['is_settled', 'settled_at', 'updated_at'])
+                settled_count += 1
+
+        except Exception as e:
+            failed_count += 1
+            logger.exception('自动结算订单失败 order_no=%s error=%s', order.order_no, str(e))
+
+    # 结算商品订单
+    due_product_orders = ProductOrder.objects.filter(
+        status=ProductOrder.Status.COMPLETED,
+        is_settled=False,
+        settle_due_at__lte=now,
+    ).order_by('settle_due_at')[:500]  # 每次最多处理500单，避免超时
+
+    for order in due_product_orders:
+        settle_single_order(order, 'product')
+
+    # 结算服务订单
+    due_service_orders = ServiceOrder.objects.filter(
+        status=ServiceOrder.Status.COMPLETED,
+        is_settled=False,
+        settle_due_at__lte=now,
+    ).order_by('settle_due_at')[:500]
+
+    for order in due_service_orders:
+        settle_single_order(order, 'service')
+
+    logger.info('自动结算任务完成：成功 %s 单，失败 %s 单', settled_count, failed_count)
+    return {'success': settled_count, 'failed': failed_count}

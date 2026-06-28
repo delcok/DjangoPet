@@ -92,8 +92,9 @@ class Merchant(models.Model):
         SUSPENDED = 'suspended', '已暂停'
         REJECTED = 'rejected', '审核拒绝'
         CLOSED = 'closed', '已关闭'
+        DRAFT = 'draft', '资料待完善'
 
-    name = models.CharField(max_length=100, verbose_name='商家名称')
+    name = models.CharField(max_length=100, blank=True, default='', verbose_name='商家名称')
     logo = models.CharField(max_length=255, blank=True, default='', verbose_name='Logo')
     images = models.JSONField(
         default=list, blank=True, verbose_name='商家图片',
@@ -104,6 +105,7 @@ class Merchant(models.Model):
 
     category = models.ForeignKey(
         MerchantCategory, on_delete=models.PROTECT,
+        null=True, blank=True,
         related_name='merchants', verbose_name='商家分类'
     )
     business_district = models.ForeignKey(
@@ -128,7 +130,7 @@ class Merchant(models.Model):
     province = models.CharField(max_length=50, blank=True, default='', verbose_name='省份')
     city = models.CharField(max_length=50, blank=True, default='', verbose_name='城市')
     district = models.CharField(max_length=50, blank=True, default='', verbose_name='区县')
-    address = models.CharField(max_length=255, verbose_name='详细地址')
+    address = models.CharField(max_length=255, verbose_name='详细地址', blank=True)
     longitude = models.DecimalField(
         max_digits=10, decimal_places=7, null=True, blank=True,
         verbose_name='经度'

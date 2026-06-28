@@ -53,6 +53,7 @@ def onboard_merchant(**kwargs) -> Merchant:
     密码一律经 set_password() 加密后入库。
     """
     raw_password = kwargs.pop('password', None) or DEFAULT_MERCHANT_PASSWORD
+    kwargs.setdefault('status', Merchant.Status.DRAFT)
 
     merchant = Merchant(**kwargs)
     merchant.set_password(raw_password)

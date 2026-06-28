@@ -87,6 +87,34 @@ def _build_login_response(user, openid=None):
     return data
 
 
+def _create_login_log(request, user, login_method, platform, is_success=True, fail_reason=''):
+    """创建登录日志，统一获取IP、UA、设备信息"""
+    # 获取客户端IP
+    xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
+    ip = xff.split(',')[0].strip() if xff else request.META.get('REMOTE_ADDR', '')
+    # 获取User-Agent
+    ua = request.META.get('HTTP_USER_AGENT', '')
+    # 获取设备ID（前端传的device_id）
+    device_id = request.data.get('device_id', '') or request.META.get('HTTP_DEVICE_ID', '')
+
+    try:
+        UserLoginLog.objects.create(
+            user=user,
+            login_method=login_method,
+            platform=platform,
+            device_id=device_id,
+            ip_address=ip,
+            user_agent=ua,
+            is_success=is_success,
+            fail_reason=fail_reason,
+        )
+    except Exception as e:
+        # 日志创建失败不影响登录流程
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"创建登录日志失败 user_id={user.id}, error={str(e)}", exc_info=True)
+
+
 def _get_client_ip(request):
     """优先取反代透传的真实 IP"""
     xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
@@ -140,11 +168,15 @@ def wechat_login(request):
             if user.is_active and not user.is_banned:
                 user.last_login = timezone.now()
                 user.save(update_fields=['last_login'])
+                _create_login_log(request, user, 'wx_mini', 'wx_mini')
                 return Response(_build_login_response(user, openid), status=status.HTTP_200_OK)
             elif user.is_banned:
+                _create_login_log(request, user, 'wx_mini', 'wx_mini', is_success=False,
+                                  fail_reason=f'账号被封禁: {user.ban_reason}')
                 return Response({'error': f'您已被封禁: {user.ban_reason}'},
                                 status=status.HTTP_400_BAD_REQUEST)
             else:
+                _create_login_log(request, user, 'wx_mini', 'wx_mini', is_success=False, fail_reason='账号已被禁用')
                 return Response({'error': '您已被禁用，请联系客服!'},
                                 status=status.HTTP_400_BAD_REQUEST)
 
@@ -178,11 +210,15 @@ def wechat_login(request):
             if unionid and not auth_provider.union_id:
                 auth_provider.union_id = unionid
                 auth_provider.save(update_fields=['union_id', 'updated_at'])
+            _create_login_log(request, user, 'wx_mini', 'wx_mini')
             return Response(_build_login_response(user, openid), status=status.HTTP_200_OK)
         elif user.is_banned:
+            _create_login_log(request, user, 'wx_mini', 'wx_mini', is_success=False,
+                              fail_reason=f'账号被封禁: {user.ban_reason}')
             return Response({'error': f'您已被封禁: {user.ban_reason}'},
                             status=status.HTTP_400_BAD_REQUEST)
         else:
+            _create_login_log(request, user, 'wx_mini', 'wx_mini', is_success=False, fail_reason='账号已被禁用')
             return Response({'error': '您已被禁用，请联系客服!'},
                             status=status.HTTP_400_BAD_REQUEST)
 
@@ -246,6 +282,7 @@ def wechat_login(request):
 
     user.last_login = timezone.now()
     user.save(update_fields=['last_login'])
+    _create_login_log(request, user, 'wx_mini', 'wx_mini')
     return Response(_build_login_response(user, openid), status=status.HTTP_200_OK)
 
 

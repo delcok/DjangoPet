@@ -10,12 +10,11 @@
 """
 import logging
 import uuid
-from calendar import monthrange
-from datetime import timedelta, date
 from decimal import Decimal
+from datetime import timedelta
 
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
@@ -37,7 +36,7 @@ from .models import (
     UserWallet, WalletTransaction, WalletStatusLog,
     MerchantWallet, MerchantWalletTransaction,
     WithdrawalRequest, MerchantSettlementConfig,
-    Currency, UserSignIn, SignInConfig,
+    Currency,
 )
 from . import serializers as sz
 
@@ -163,150 +162,6 @@ class UserExpiringPointsView(APIView):
         )
         return Response({'results': list(rows), 'total': sum(r['amount'] for r in rows)})
 
-# ── 用户签到──
-class UserSignInView(APIView):
-    """
-    GET  /api/wallet/me/sign-in/   今日签到状态 + 统计
-    POST /api/wallet/me/sign-in/   执行签到(当天重复调用不会重复发积分)
-    """
-    authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticated, IsActiveUser]
-
-    def get(self, request):
-        user = request.user
-        today = timezone.localdate()
-        cfg = SignInConfig.load()
-        today_rec = UserSignIn.objects.filter(user=user, sign_date=today).first()
-        streak = UserSignIn.calc_current_streak(user, today)
-        month_start = today.replace(day=1)
-
-        return Response({
-            'signed_in_today': bool(today_rec),
-            'continuous_days': streak,
-            'today_reward': today_rec.reward_points if today_rec else 0,
-            'next_reward': UserSignIn.next_reward(user, today, cfg),
-            'cycle_rewards': cfg.cycle_rewards,
-            'is_active': cfg.is_active,  # 🆕 总开关,前端可据此禁用按钮
-            'monthly_count': UserSignIn.objects.filter(
-                user=user, sign_date__gte=month_start, sign_date__lte=today).count(),
-            'total_days': UserSignIn.objects.filter(user=user).count(),
-            'longest_streak': UserSignIn.longest_streak(user),
-            'makeup_enabled': cfg.makeup_enabled,  # 🆕 前端据此显隐补签
-            'makeup_cost': cfg.makeup_cost_points,
-            'makeup_max_back_days': cfg.makeup_max_back_days,
-            'sign_date': today.isoformat(),
-        })
-
-    def post(self, request):
-        try:
-            record, created = UserSignIn.do_sign_in(
-                request.user, operator_ip=_get_client_ip(request),
-            )
-        except ValueError as e:
-            return _error(e)
-
-        wallet = UserWallet.objects.filter(user=request.user).first()
-        return Response({
-            'signed_in_today': True,
-            'created': created,                       # False=今天已签过
-            'reward_points': record.reward_points if created else 0,
-            'continuous_days': record.continuous_days,
-            'next_reward': UserSignIn.next_reward(request.user),
-            'points_balance': wallet.points_balance if wallet else None,
-            'total_points': wallet.points_balance if wallet else None,
-            'sign_date': record.sign_date.isoformat(),
-            'message': '签到成功' if created else '今天已经签到过了',
-        })
-
-
-class UserSignInCalendarView(APIView):
-    """GET /api/wallet/me/sign-in/calendar/?year=2026&month=6  按月签到日历"""
-    authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticated, IsActiveUser]
-
-    def get(self, request):
-        user = request.user
-        today = timezone.localdate()
-        try:
-            year = int(request.query_params.get('year', today.year))
-            month = int(request.query_params.get('month', today.month))
-        except (ValueError, TypeError):
-            return _error('year/month 参数无效')
-        if not (1 <= month <= 12) or not (2000 <= year <= 2100):
-            return _error('year/month 超出范围')
-
-        first = date(year, month, 1)
-        last = date(year, month, monthrange(year, month)[1])
-        recs = UserSignIn.objects.filter(
-            user=user, sign_date__gte=first, sign_date__lte=last
-        ).order_by('sign_date')
-
-        return Response({
-            'year': year,
-            'month': month,
-            'days_in_month': monthrange(year, month)[1],
-            'first_weekday': first.weekday(),          # 周一=0 ... 周日=6
-            'signed_days': [{
-                'date': r.sign_date.isoformat(),
-                'day': r.sign_date.day,
-                'reward_points': r.reward_points,
-                'is_makeup': r.is_makeup,
-            } for r in recs],
-            'signed_count': recs.count(),
-            'today': today.isoformat(),
-            'signed_in_today': UserSignIn.objects.filter(user=user, sign_date=today).exists(),
-            'continuous_days': UserSignIn.calc_current_streak(user, today),
-            'cycle_rewards': SignInConfig.load().cycle_rewards,
-        })
-
-
-class UserSignInMakeupView(APIView):
-    """POST /api/wallet/me/sign-in/makeup/  {date: 'YYYY-MM-DD'}  补签(消耗积分并发放当日奖励)"""
-    authentication_classes = [UserAuthentication]
-    permission_classes = [IsAuthenticated, IsActiveUser]
-
-    def post(self, request):
-        date_str = request.data.get('date')
-        if not date_str:
-            return _error('请提供要补签的日期 date(YYYY-MM-DD)')
-        try:
-            target = date.fromisoformat(str(date_str))
-        except ValueError:
-            return _error('date 格式应为 YYYY-MM-DD')
-
-        try:
-            record = UserSignIn.do_makeup(
-                request.user, target, operator_ip=_get_client_ip(request),
-            )
-        except ValueError as e:
-            return _error(e)
-
-        wallet = UserWallet.objects.filter(user=request.user).first()
-        target_reward = int(getattr(record, '_makeup_target_reward', record.reward_points or 0))
-        total_reward = int(getattr(record, '_makeup_total_reward', target_reward))
-        repriced_count = int(getattr(record, '_makeup_repriced_count', 1))
-        segment_days = int(getattr(record, '_makeup_segment_days', 0))
-        net_delta = int(getattr(record, '_makeup_net_delta', total_reward - int(record.makeup_cost or 0)))
-        return Response({
-            'success': True,
-            'sign_date': record.sign_date.isoformat(),
-            'is_makeup': True,
-            'reward_points': target_reward,
-            'total_reward_points': total_reward,
-            'makeup_cost': record.makeup_cost,
-            'net_points_delta': net_delta,
-            'repriced_count': repriced_count,
-            'segment_days': segment_days,
-            'continuous_days': UserSignIn.calc_current_streak(request.user),
-            'points_balance': wallet.points_balance if wallet else None,
-            'total_points': wallet.points_balance if wallet else None,
-            'message': (
-                f'补签成功,+{target_reward} 积分,消耗 {record.makeup_cost} 积分'
-                if total_reward == target_reward else
-                f'补签成功,本日+{target_reward},连续奖励补发共+{total_reward},消耗 {record.makeup_cost} 积分'
-            ),
-        })
-
 
 # ════════════════════════════════════════════════════════════════
 #                        商户端视图
@@ -370,6 +225,28 @@ class MerchantSettlementConfigView(APIView):
     def get(self, request):
         merchant_id = _get_merchant_id_from_user(request.user)
         config = get_object_or_404(MerchantSettlementConfig, merchant_id=merchant_id)
+        return Response(sz.MerchantSettlementConfigSerializer(config).data)
+
+
+class AdminMerchantSettlementConfigView(APIView):
+    """管理端获取/修改商家结算配置
+    GET /api/admin/wallet/merchants/<merchant_id>/settlement-config/
+    PUT /api/admin/wallet/merchants/<merchant_id>/settlement-config/
+    """
+    authentication_classes = [ManagerAuthentication]
+    permission_classes = [IsAuthenticated, IsManager]
+
+    def get(self, request, merchant_id):
+        # 自动为没有配置的商家创建默认配置
+        config, _ = MerchantSettlementConfig.objects.get_or_create(merchant_id=merchant_id)
+        return Response(sz.AdminMerchantSettlementConfigSerializer(config).data)
+
+    def put(self, request, merchant_id):
+        config, _ = MerchantSettlementConfig.objects.get_or_create(merchant_id=merchant_id)
+        serializer = sz.AdminMerchantSettlementConfigSerializer(config, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        # 返回时带上显示名称
         return Response(sz.MerchantSettlementConfigSerializer(config).data)
 
 
@@ -1099,113 +976,3 @@ class AdminWithdrawalViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mix
         except ValueError as e:
             return _error(e)
         return Response(sz.AdminWithdrawalSerializer(wd).data)
-
-# ════════════════════════════════════════════════════════════════
-#                        管理端 - 签到
-# ════════════════════════════════════════════════════════════════
-
-class AdminSignInConfigView(APIView):
-    """
-    GET /api/admin/wallet/sign-in-config/   读取签到配置
-    PUT /api/admin/wallet/sign-in-config/   更新签到配置(部分字段亦可)
-    """
-    authentication_classes = [ManagerAuthentication]
-    permission_classes = [IsAuthenticated, IsManager, HasModuleAccess]
-    required_module = 'wallet'
-
-    def get(self, request):
-        return Response(sz.AdminSignInConfigSerializer(SignInConfig.load()).data)
-
-    def put(self, request):
-        cfg = SignInConfig.load()
-        ser = sz.AdminSignInConfigSerializer(cfg, data=request.data, partial=True)
-        ser.is_valid(raise_exception=True)
-        ser.save(updated_by=request.user.id)
-        return Response(sz.AdminSignInConfigSerializer(cfg).data)
-
-
-class AdminUserSignInViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.RetrieveModelMixin):
-    """
-    管理员查看用户签到记录
-      GET /api/admin/wallet/sign-ins/        列表(user_id / mobile / is_makeup / date 范围)
-      GET /api/admin/wallet/sign-ins/{id}/   详情
-      GET /api/admin/wallet/sign-ins/stats/  统计(按天 + 汇总,默认近30天)
-    """
-    authentication_classes = [ManagerAuthentication]
-    permission_classes = [IsAuthenticated, IsManager, HasModuleAccess]
-    required_module = 'wallet'
-
-    queryset = UserSignIn.objects.select_related('user').all()
-    serializer_class = sz.AdminUserSignInSerializer
-    pagination_class = StandardPagination
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        user_id = self.request.query_params.get('user_id')
-        if user_id:
-            qs = qs.filter(user_id=user_id)
-        mobile = self.request.query_params.get('mobile')
-        if mobile:
-            qs = qs.filter(user__mobile__icontains=mobile)
-        is_makeup = self.request.query_params.get('is_makeup')
-        if is_makeup is not None:
-            qs = qs.filter(is_makeup=str(is_makeup).lower() in ('1', 'true', 'yes'))
-        start = self.request.query_params.get('start_date')
-        end   = self.request.query_params.get('end_date')
-        if start:
-            qs = qs.filter(sign_date__gte=start)
-        if end:
-            qs = qs.filter(sign_date__lte=end)
-        return qs.order_by('-sign_date', '-created_at')
-
-    @action(detail=False, methods=['get'])
-    def stats(self, request):
-        today = timezone.localdate()
-        try:
-            end = (date.fromisoformat(request.query_params['end_date'])
-                   if request.query_params.get('end_date') else today)
-            start = (date.fromisoformat(request.query_params['start_date'])
-                     if request.query_params.get('start_date') else end - timedelta(days=29))
-        except ValueError:
-            return _error('日期格式应为 YYYY-MM-DD')
-
-        if start > end:
-            return _error('start_date 不能晚于 end_date')
-        if (end - start).days > 366:
-            return _error('统计区间不能超过 366 天')
-
-        base = UserSignIn.objects.filter(sign_date__gte=start, sign_date__lte=end)
-        rows = (base.values('sign_date')
-                .annotate(
-                    total=Count('id'),
-                    makeup=Count('id', filter=Q(is_makeup=True)),
-                    points=Sum('reward_points'),
-                ))
-        rmap = {r['sign_date']: r for r in rows}
-
-        # 补齐空白天为 0,前端可直接画连续曲线
-        daily, cur = [], start
-        while cur <= end:
-            r = rmap.get(cur)
-            total = r['total'] if r else 0
-            makeup = r['makeup'] if r else 0
-            daily.append({
-                'date': cur.isoformat(),
-                'total': total,
-                'normal': total - makeup,
-                'makeup': makeup,
-                'points': int((r['points'] or 0)) if r else 0,
-            })
-            cur += timedelta(days=1)
-
-        summary = {
-            'start_date': start.isoformat(),
-            'end_date': end.isoformat(),
-            'total_records': sum(d['total'] for d in daily),
-            'total_normal':  sum(d['normal'] for d in daily),
-            'total_makeup':  sum(d['makeup'] for d in daily),
-            'total_points_issued': sum(d['points'] for d in daily),
-            'unique_users': base.values('user_id').distinct().count(),
-            'active_days': sum(1 for d in daily if d['total'] > 0),
-        }
-        return Response({'summary': summary, 'daily': daily})
