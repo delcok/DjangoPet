@@ -2,6 +2,7 @@
 
 from datetime import datetime
 
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import generics, status, viewsets, serializers
 from rest_framework.decorators import action
@@ -369,7 +370,9 @@ class MerchantStaffViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         # 软删除:标记为离职,不物理删除
         instance.status = Staff.Status.INACTIVE
-        instance.save(update_fields=['status'])
+        instance.leave_date = timezone.now().date()
+        instance.work_status = Staff.WorkStatus.OFFLINE
+        instance.save(update_fields=['status', 'leave_date', 'work_status', 'updated_at'])
 
     @action(detail=True, methods=['post'])
     def reset_password(self, request, pk=None):
@@ -397,12 +400,47 @@ class MerchantStaffViewSet(viewsets.ModelViewSet):
             message = '已恢复接单'
         else:
             return Response(
-                {'error': '离职员工不支持此操作'},
+                {'error': '离职员工不支持此操作，请使用恢复功能'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         staff.save(update_fields=['status'])
         return Response({'message': message, 'status': staff.status})
+
+    @action(detail=True, methods=['post'])
+    def restore(self, request, pk=None):
+        """恢复离职员工为在职状态"""
+        staff = self.get_object()
+
+        if staff.status != Staff.Status.INACTIVE:
+            return Response(
+                {'error': '只有离职员工可以恢复'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 校验同商家下同手机号是否有其他在职员工（防止重复）
+        if Staff.objects.filter(
+            merchant_id=staff.merchant_id,
+            phone=staff.phone,
+            status=Staff.Status.ACTIVE
+        ).exclude(id=staff.id).exists():
+            return Response(
+                {'error': '该手机号已有其他在职员工使用，无法恢复'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 恢复为在职状态
+        staff.status = Staff.Status.ACTIVE
+        staff.leave_date = None
+        staff.work_status = Staff.WorkStatus.OFFLINE
+        staff.token_version += 1  # 失效旧登录token，需要重新登录
+        staff.save(update_fields=['status', 'leave_date', 'work_status', 'token_version', 'updated_at'])
+
+        return Response({
+            'message': '员工已恢复为在职状态',
+            'status': staff.status,
+            'need_relogin': True
+        })
 
     @action(detail=True, methods=['get'])
     def verification(self, request, pk=None):
