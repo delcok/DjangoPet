@@ -196,13 +196,24 @@ SIMPLE_JWT = {
 
 # 配置微信支付
 WECHAT_PAY_CONFIG = {
-    'APPID': env('APPID'),
-    'MCH_ID': env('MCH_ID'),
-    'API_KEY': env('API_KEY'),
-    'CERT_PATH': env('CERT_PATH'),  # 退款和提现需要
-    'KEY_PATH': env('KEY_PATH'),  # 退款和提现需要
-    'NOTIFY_URL': env('NOTIFY_URL'),  # 支付回调地址
-    'TRADE_TYPE': 'JSAPI',  # 小程序支付类型
+    'MINI_APPID': env('APPID', default=''),  # 小程序APPID
+    'APP_PAY_APPID': env('WECHAT_APP_PAY_APPID', default=''),  # APP支付APPID（微信开放平台移动应用）
+    'MCH_ID': env('MCH_ID', default=''),
+    'API_KEY': env('API_KEY', default=''),  # V2 API密钥
+    'CERT_PATH': env('CERT_PATH', default=''),  # 退款和提现需要
+    'KEY_PATH': env('KEY_PATH', default=''),  # 退款和提现需要
+    'NOTIFY_URL': env('NOTIFY_URL', default=''),  # 支付回调地址基础URL
+}
+
+# 配置支付宝支付
+ALIPAY_CONFIG = {
+    'APPID': env('ALIPAY_APPID', default=''),
+    'APP_PRIVATE_KEY': env('ALIPAY_APP_PRIVATE_KEY', default=''),  # 应用私钥
+    'ALIPAY_PUBLIC_KEY': env('ALIPAY_PUBLIC_KEY', default=''),  # 支付宝公钥
+    'NOTIFY_URL': env('ALIPAY_NOTIFY_URL', default=''),  # 支付宝异步回调地址
+    'RETURN_URL': env('ALIPAY_RETURN_URL', default=''),  # 支付宝同步跳转地址（APP支付不需要，可留空）
+    'DEBUG': env.bool('ALIPAY_DEBUG', default=False),  # 沙箱环境开关
+    'SIGN_TYPE': 'RSA2',  # 签名类型，固定RSA2
 }
 
 # 配置缓存为Redis

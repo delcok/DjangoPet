@@ -24,8 +24,9 @@ from .serializers import (
     ApproveRefundSerializer, RejectRefundSerializer,
 )
 
-# 微信支付封装
+# 支付渠道封装
 from utils.wechat_pay import WeChatPayHelper
+from utils.alipay_pay import AlipayPayHelper
 
 # 认证 / 权限
 from utils.authentication import (
@@ -44,6 +45,10 @@ logger = logging.getLogger(__name__)
 # 微信v2 回调成功 / 失败 响应
 _WX_OK   = b'<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>'
 _WX_FAIL = b'<xml><return_code><![CDATA[FAIL]]></return_code><return_msg><![CDATA[%s]]></return_msg></xml>'
+
+# 支付宝回调成功/失败响应
+_ALIPAY_OK = "success"
+_ALIPAY_FAIL = "fail"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -88,7 +93,7 @@ class CreatePaymentView(APIView):
         if payment.amount_in_cents <= 0:
             return self._handle_zero_payment(payment)
 
-        # 正常调微信下单
+        # 微信小程序支付（原有稳定逻辑，不做修改）
         helper = WeChatPayHelper()
         try:
             # 拼接支付描述：商品订单用真实商品详情，其他用默认
@@ -113,7 +118,7 @@ class CreatePaymentView(APIView):
                 out_trade_no=payment.out_trade_no,
             )
         except Exception as e:
-            logger.exception('调起微信支付失败 payment_no=%s', payment.payment_no)
+            logger.exception('调起微信小程序支付失败 payment_no=%s', payment.payment_no)
             payment.status = 'failed'
             payment.callback_raw = f'create error: {e}'
             payment.save(update_fields=['status', 'callback_raw', 'updated_at'])
@@ -151,6 +156,215 @@ class CreatePaymentView(APIView):
                 order = _advance_business_order_to_paid(payment)
 
             # 副作用放在主事务外,失败不影响 mark_paid
+            if order:
+                _run_payment_success_hooks(payment, order)
+        except Exception as e:
+            logger.exception('0 元支付处理失败 payment_no=%s', payment.payment_no)
+            return Response(
+                {'error': f'0 元订单处理失败: {e}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'payment_no':   payment.payment_no,
+            'out_trade_no': payment.out_trade_no,
+            'zero_payment': True,
+            'message':      '已支付',
+        })
+
+
+# ══════════════════════════════════════════════════════════════
+# APP端专用 —— 微信APP支付创建（Android/iOS通用）
+# ══════════════════════════════════════════════════════════════
+
+class WechatAppPayCreateView(APIView):
+    """微信APP支付创建接口，独立于小程序支付，不影响原有稳定逻辑"""
+    authentication_classes = [UserAuthentication]
+    permission_classes     = [IsUser]
+
+    def post(self, request):
+        # 强制设置渠道为微信APP支付，不需要前端传
+        request.data['channel'] = 'wechat_app'
+        ser = CreatePaymentSerializer(data=request.data, context={'request': request})
+        ser.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            payment = ser.save()
+
+        # 0 元订单短路
+        if payment.amount_in_cents <= 0:
+            return self._handle_zero_payment(payment)
+
+        # 微信APP支付逻辑
+        helper = WeChatPayHelper(trade_type='APP')
+        try:
+            # 拼接支付描述
+            order_type = ser.validated_data['order_type']
+            if order_type == 'product':
+                order = ser.validated_data['_order']
+                items_desc = []
+                for item in order.items.all():
+                    items_desc.append(f"{item.product_name}x{item.quantity}")
+                pay_body = "，".join(items_desc)
+                if len(pay_body) > 127:
+                    pay_body = pay_body[:124] + "..."
+            else:
+                pay_body = f'订单 {payment.order_no}'
+
+            # 获取用户真实IP
+            xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
+            client_ip = xff.split(',')[0].strip() if xff else request.META.get('REMOTE_ADDR', '127.0.0.1')
+
+            pay_params = helper.create_payment_order(
+                total_fee=payment.amount_in_cents,
+                body=pay_body,
+                out_trade_no=payment.out_trade_no,
+                client_ip=client_ip,
+            )
+        except Exception as e:
+            logger.exception('调起微信APP支付失败 payment_no=%s', payment.payment_no)
+            payment.status = 'failed'
+            payment.callback_raw = f'create error: {e}'
+            payment.save(update_fields=['status', 'callback_raw', 'updated_at'])
+            return Response(
+                {'error': f'调起微信APP支付失败: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payment.pay_params = pay_params
+        payment.save(update_fields=['pay_params', 'updated_at'])
+
+        return Response({
+            'payment_no':   payment.payment_no,
+            'out_trade_no': payment.out_trade_no,
+            'channel':      'wechat_app',
+            'pay_params':   pay_params,
+        })
+
+    def _handle_zero_payment(self, payment):
+        """0 元支付处理，和小程序逻辑一致"""
+        try:
+            with transaction.atomic():
+                payment = PaymentOrder.objects.select_for_update().get(pk=payment.pk)
+                if payment.status != 'pending':
+                    return Response({
+                        'payment_no':   payment.payment_no,
+                        'out_trade_no': payment.out_trade_no,
+                        'zero_payment': True,
+                        'message':      '已支付',
+                    })
+
+                payment.mark_paid(
+                    channel_trade_no=f'ZERO_{payment.payment_no}',
+                    callback_raw='zero amount auto paid',
+                )
+                order = _advance_business_order_to_paid(payment)
+
+            if order:
+                _run_payment_success_hooks(payment, order)
+        except Exception as e:
+            logger.exception('0 元支付处理失败 payment_no=%s', payment.payment_no)
+            return Response(
+                {'error': f'0 元订单处理失败: {e}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'payment_no':   payment.payment_no,
+            'out_trade_no': payment.out_trade_no,
+            'zero_payment': True,
+            'message':      '已支付',
+        })
+
+
+# ══════════════════════════════════════════════════════════════
+# APP端专用 —— 支付宝APP支付创建（Android/iOS通用）
+# ══════════════════════════════════════════════════════════════
+
+class AlipayPayCreateView(APIView):
+    """支付宝APP支付创建接口，独立于其他支付渠道"""
+    authentication_classes = [UserAuthentication]
+    permission_classes     = [IsUser]
+
+    def post(self, request):
+        # 强制设置渠道为支付宝，不需要前端传
+        request.data['channel'] = 'alipay'
+        ser = CreatePaymentSerializer(data=request.data, context={'request': request})
+        ser.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            payment = ser.save()
+
+        # 0 元订单短路
+        if payment.amount_in_cents <= 0:
+            return self._handle_zero_payment(payment)
+
+        # 支付宝APP支付逻辑
+        helper = AlipayPayHelper()
+        try:
+            # 拼接支付描述
+            order_type = ser.validated_data['order_type']
+            if order_type == 'product':
+                order = ser.validated_data['_order']
+                items_desc = []
+                for item in order.items.all():
+                    items_desc.append(f"{item.product_name}x{item.quantity}")
+                pay_body = "，".join(items_desc)
+                if len(pay_body) > 127:
+                    pay_body = pay_body[:124] + "..."
+                pay_subject = pay_body[:64]
+            else:
+                pay_body = f'订单 {payment.order_no}'
+                pay_subject = f'订单{payment.order_no}'
+
+            order_string = helper.create_app_pay_order(
+                out_trade_no=payment.out_trade_no,
+                total_amount=payment.amount,
+                subject=pay_subject,
+                body=pay_body,
+            )
+            pay_params = {
+                'order_string': order_string,
+            }
+        except Exception as e:
+            logger.exception('调起支付宝APP支付失败 payment_no=%s', payment.payment_no)
+            payment.status = 'failed'
+            payment.callback_raw = f'create error: {e}'
+            payment.save(update_fields=['status', 'callback_raw', 'updated_at'])
+            return Response(
+                {'error': f'调起支付宝APP支付失败: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payment.pay_params = pay_params
+        payment.save(update_fields=['pay_params', 'updated_at'])
+
+        return Response({
+            'payment_no':   payment.payment_no,
+            'out_trade_no': payment.out_trade_no,
+            'channel':      'alipay',
+            'pay_params':   pay_params,
+        })
+
+    def _handle_zero_payment(self, payment):
+        """0 元支付处理，和小程序逻辑一致"""
+        try:
+            with transaction.atomic():
+                payment = PaymentOrder.objects.select_for_update().get(pk=payment.pk)
+                if payment.status != 'pending':
+                    return Response({
+                        'payment_no':   payment.payment_no,
+                        'out_trade_no': payment.out_trade_no,
+                        'zero_payment': True,
+                        'message':      '已支付',
+                    })
+
+                payment.mark_paid(
+                    channel_trade_no=f'ZERO_{payment.payment_no}',
+                    callback_raw='zero amount auto paid',
+                )
+                order = _advance_business_order_to_paid(payment)
+
             if order:
                 _run_payment_success_hooks(payment, order)
         except Exception as e:
@@ -456,6 +670,84 @@ def wechat_callback(request, callback_type):
         return _handle_refund_callback(data)
 
     return HttpResponse(_WX_FAIL % b'unknown type', content_type='application/xml')
+
+
+@csrf_exempt
+@require_POST
+def alipay_callback(request):
+    """支付宝异步回调处理"""
+    try:
+        data = request.POST.dict()
+    except Exception:
+        logger.exception('支付宝回调参数解析失败')
+        return HttpResponse(_ALIPAY_FAIL, content_type='text/plain')
+
+    helper = AlipayPayHelper()
+    # 验证签名
+    if not helper.verify_notify(data.copy()):  # 传copy，因为verify会pop sign
+        logger.error('支付宝回调签名验证失败 data=%s', data)
+        return HttpResponse(_ALIPAY_FAIL, content_type='text/plain')
+
+    out_trade_no = data.get('out_trade_no')
+    trade_no = data.get('trade_no', '')
+    trade_status = data.get('trade_status', '')
+    total_amount = data.get('total_amount', '')
+
+    if not out_trade_no:
+        logger.error('支付宝回调缺少out_trade_no')
+        return HttpResponse(_ALIPAY_FAIL, content_type='text/plain')
+
+    # 只处理支付成功的状态
+    if trade_status not in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
+        logger.info('支付宝回调状态非成功 out_trade_no=%s, status=%s', out_trade_no, trade_status)
+        return HttpResponse(_ALIPAY_OK, content_type='text/plain')
+
+    order_to_run_hooks = None
+    payment_for_hooks = None
+
+    try:
+        with transaction.atomic():
+            payment = (PaymentOrder.objects
+                       .select_for_update()
+                       .get(out_trade_no=out_trade_no))
+
+            if payment.status == 'paid':
+                return HttpResponse(_ALIPAY_OK, content_type='text/plain')
+
+            # 验证金额是否一致（可选，安全加固）
+            try:
+                if str(payment.amount) != str(total_amount):
+                    logger.error('支付宝回调金额不匹配 out_trade_no=%s, payment_amount=%s, notify_amount=%s',
+                                 out_trade_no, payment.amount, total_amount)
+                    payment.status = 'failed'
+                    payment.callback_raw = f'amount mismatch: {total_amount}'
+                    payment.save(update_fields=['status', 'callback_raw', 'updated_at'])
+                    return HttpResponse(_ALIPAY_FAIL, content_type='text/plain')
+            except Exception:
+                pass  # 金额验证失败不影响主流程，仅记录日志
+
+            # 标记支付成功
+            payment.mark_paid(
+                channel_trade_no=trade_no,
+                callback_raw=str(data),
+            )
+            order = _advance_business_order_to_paid(payment)
+            if order:
+                order_to_run_hooks = order
+                payment_for_hooks = payment
+
+    except PaymentOrder.DoesNotExist:
+        logger.error('支付宝回调命中不存在的支付单 out_trade_no=%s', out_trade_no)
+        return HttpResponse(_ALIPAY_FAIL, content_type='text/plain')
+    except Exception:
+        logger.exception('处理支付宝回调异常 out_trade_no=%s', out_trade_no)
+        return HttpResponse(_ALIPAY_FAIL, content_type='text/plain')
+
+    # 主事务提交后执行钩子
+    if order_to_run_hooks:
+        _run_payment_success_hooks(payment_for_hooks, order_to_run_hooks)
+
+    return HttpResponse(_ALIPAY_OK, content_type='text/plain')
 
 
 def _handle_payment_callback(data):

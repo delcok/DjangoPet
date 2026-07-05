@@ -7,13 +7,14 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     # 用户端
     PaymentOrderViewSet, UserRefundViewSet,
-    CreatePaymentView, QueryPaymentView,
+    CreatePaymentView, WechatAppPayCreateView, AlipayPayCreateView,
+    QueryPaymentView,
     # 商家端
     MerchantRefundViewSet,
     # 管理端
     AdminRefundViewSet,
     # 回调
-    wechat_callback, ClosePaymentView,
+    wechat_callback, alipay_callback, ClosePaymentView,
 )
 
 
@@ -39,9 +40,12 @@ urlpatterns = [
     # GET  /refunds/{id}/                 退款单详情
     path('', include(user_router.urls)),
 
-    # POST /wechatpay/create_payment/     创建支付
+    # POST /wechatpay/create_payment/     微信小程序创建支付（原有稳定接口）
     # POST /wechatpay/query/              查询支付
     path('wechatpay/create_payment/', CreatePaymentView.as_view(), name='create_payment'),
+    # APP端专用支付接口
+    path('wechatpay/app/create/', WechatAppPayCreateView.as_view(), name='wechat_app_create_payment'),
+    path('alipay/create/', AlipayPayCreateView.as_view(), name='alipay_create_payment'),
     path('wechatpay/query/',          QueryPaymentView.as_view(),  name='query_payment'),
 
     # ─── 商家端 ───
@@ -61,6 +65,9 @@ urlpatterns = [
     # ─── 微信异步回调 ───
     # callback_type: payment / refund
     path('wechat_callback/<str:callback_type>/', wechat_callback, name='wechat_callback'),
+
+    # ─── 支付宝异步回调 ───
+    path('alipay_callback/', alipay_callback, name='alipay_callback'),
 
     path('wechatpay/close/', ClosePaymentView.as_view()),
 ]

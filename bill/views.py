@@ -5,7 +5,7 @@ import logging
 from datetime import timedelta
 from decimal import Decimal
 from django.utils import timezone as dj_tz
-from django.db.models import Sum, F
+from django.db.models import Sum, F, Count
 from django.utils import timezone
 from rest_framework import viewsets, status, mixins
 from rest_framework.decorators import action
@@ -73,12 +73,27 @@ def _get_merchant_id(request):
 
 
 def _get_order_item_desc(order):
-    """拼接订单商品描述，用于微信支付和发货同步"""
+    """
+    拼接订单商品/服务描述，用于微信支付和微信订单中心同步。
+
+    兼容不同订单 item 字段：
+      - 商品订单：product_name
+      - 服务订单：service_name / name / title
+    微信发货接口 item_desc 限 120 字。
+    """
     items_desc = []
     for item in order.items.all():
-        items_desc.append(f"{item.product_name}x{item.quantity}")
-    desc = "，".join(items_desc)
-    # 发货接口item_desc限120字，支付接口限127字，统一截断到120字
+        name = (
+            getattr(item, 'product_name', None)
+            or getattr(item, 'service_name', None)
+            or getattr(item, 'name', None)
+            or getattr(item, 'title', None)
+            or '商品/服务'
+        )
+        qty = getattr(item, 'quantity', 1) or 1
+        items_desc.append(f"{name}x{qty}")
+
+    desc = "，".join(items_desc) or f"订单 {getattr(order, 'order_no', '')}"
     if len(desc) > 120:
         desc = desc[:117] + "..."
     return desc
@@ -278,6 +293,161 @@ def _delegate_refund_approve(order, order_type, request, refund_reason_detail=''
         operator_id=request.user.id,
     )
     return refund, err
+
+
+# ══════════════════════════════════════════════════════════════
+# 微信订单中心同步工具
+# ══════════════════════════════════════════════════════════════
+
+WECHAT_PAYMENT_CHANNELS = {
+    'wechat_mini', 'wechat_app', 'wechat_h5',
+    'wechat', 'wxpay', 'wx_pay', 'miniapp', 'jsapi',
+}
+
+
+def _mask_openid(openid):
+    """日志中脱敏 openid，避免完整敏感标识落盘。"""
+    if not openid:
+        return None
+    openid = str(openid)
+    if len(openid) <= 10:
+        return openid[:3] + '***'
+    return openid[:6] + '***' + openid[-4:]
+
+
+def _sync_wechat_order_center(
+    order,
+    *,
+    logistics_type,
+    scene,
+    tracking_no=None,
+    express_company_name=None,
+):
+    """
+    同步微信小程序订单中心发货/自提信息。
+
+    logistics_type:
+      1 = 实体物流
+      4 = 用户自提
+
+    设计原则：
+      - 同步失败不影响本地发货/核销成功；
+      - 但必须打完整日志，方便排查 payment / openid / 微信接口返回；
+      - 不再把 channel__in 写死在查询条件里，避免数据库 channel 取值不一致导致直接查不到支付单。
+    """
+    sync_name = '微信自提信息' if logistics_type == 4 else '微信发货信息'
+
+    try:
+        payment = (
+            PaymentOrder.objects
+            .filter(order_no=order.order_no, status='paid')
+            .order_by('-paid_at')
+            .first()
+        )
+
+        logger.info(
+            "准备同步%s scene=%s order_no=%s payment_found=%s payment_channel=%s out_trade_no=%s channel_trade_no=%s",
+            sync_name,
+            scene,
+            order.order_no,
+            bool(payment),
+            getattr(payment, 'channel', None) if payment else None,
+            getattr(payment, 'out_trade_no', None) if payment else None,
+            getattr(payment, 'channel_trade_no', None) if payment else None,
+        )
+
+        if not payment:
+            logger.warning(
+                "跳过同步%s：未找到已支付 PaymentOrder scene=%s order_no=%s",
+                sync_name,
+                scene,
+                order.order_no,
+            )
+            return False
+
+        # 0 元订单不是微信支付单，不需要上传微信订单中心。
+        if str(payment.channel_trade_no or '').startswith('ZERO_'):
+            logger.info(
+                "跳过同步%s：0元订单 scene=%s order_no=%s out_trade_no=%s",
+                sync_name,
+                scene,
+                order.order_no,
+                payment.out_trade_no,
+            )
+            return False
+
+        channel = (getattr(payment, 'channel', '') or '').strip()
+        if channel and channel not in WECHAT_PAYMENT_CHANNELS:
+            # 不直接 return。很多项目早期 channel 命名不统一，先继续尝试，微信侧会返回明确错误。
+            logger.warning(
+                "支付渠道不在常见微信渠道列表，仍尝试同步%s scene=%s order_no=%s channel=%s out_trade_no=%s",
+                sync_name,
+                scene,
+                order.order_no,
+                channel,
+                payment.out_trade_no,
+            )
+
+        if not payment.out_trade_no:
+            logger.warning(
+                "跳过同步%s：PaymentOrder 缺少 out_trade_no scene=%s order_no=%s payment_id=%s",
+                sync_name,
+                scene,
+                order.order_no,
+                getattr(payment, 'id', None),
+            )
+            return False
+
+        wx_auth = order.user.auth_providers.filter(provider='wx_mini').first()
+        logger.info(
+            "微信授权信息 scene=%s order_no=%s wx_auth_found=%s openid=%s",
+            scene,
+            order.order_no,
+            bool(wx_auth),
+            _mask_openid(wx_auth.provider_uid if wx_auth else None),
+        )
+
+        if not wx_auth or not wx_auth.provider_uid:
+            logger.warning(
+                "跳过同步%s：用户没有 wx_mini openid scene=%s order_no=%s user_id=%s",
+                sync_name,
+                scene,
+                order.order_no,
+                order.user_id,
+            )
+            return False
+
+        item_desc = _get_order_item_desc(order)
+        ok = upload_wechat_shipping_info(
+            out_trade_no=payment.out_trade_no,
+            openid=wx_auth.provider_uid,
+            logistics_type=logistics_type,
+            item_desc=item_desc,
+            tracking_no=tracking_no,
+            express_company_name=express_company_name,
+        )
+
+        logger.info(
+            "同步%s完成 scene=%s order_no=%s out_trade_no=%s logistics_type=%s ok=%s",
+            sync_name,
+            scene,
+            order.order_no,
+            payment.out_trade_no,
+            logistics_type,
+            ok,
+        )
+        return ok
+
+    except Exception as e:
+        logger.warning(
+            "同步%s异常 scene=%s order_no=%s error=%s",
+            sync_name,
+            scene,
+            getattr(order, 'order_no', None),
+            str(e),
+            exc_info=True,
+        )
+        return False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -730,6 +900,7 @@ class MerchantProductOrderViewSet(
         return (
             ProductOrder.objects
             .filter(merchant_id=_get_merchant_id(self.request))
+            .select_related('user')
             .prefetch_related('items')
             .order_by('-created_at')
         )
@@ -782,28 +953,14 @@ class MerchantProductOrderViewSet(
             'shipping_company', 'shipping_no', 'shipped_at', 'status', 'updated_at',
         ])
 
-        # 同步发货信息到微信订单中心（仅微信支付订单，异常不影响主流程）
-        try:
-            payment = PaymentOrder.objects.filter(
-                order_no=order.order_no,
-                status='paid',
-                channel__startswith='wechat'
-            ).order_by('-paid_at').first()
-            if payment:
-                # 获取用户微信openid
-                wx_auth = order.user.user_auth_set.filter(provider='wx_mini').first()
-                if wx_auth:
-                    item_desc = _get_order_item_desc(order)
-                    upload_wechat_shipping_info(
-                        out_trade_no=payment.out_trade_no,
-                        openid=wx_auth.provider_uid,
-                        logistics_type=1,  # 实体物流
-                        item_desc=item_desc,
-                        tracking_no=order.shipping_no,
-                        express_company_name=order.shipping_company,
-                    )
-        except Exception as e:
-            logger.warning(f"同步发货信息到微信失败 order_no={order.order_no}, error={str(e)}", exc_info=True)
+        # 同步发货信息到微信订单中心（失败不影响主流程，但会完整打日志）
+        _sync_wechat_order_center(
+            order,
+            logistics_type=1,  # 实体物流
+            scene='merchant_product_ship',
+            tracking_no=order.shipping_no,
+            express_company_name=order.shipping_company,
+        )
 
         create_order_log(
             order.order_no, 'product', 'ship',
@@ -922,35 +1079,21 @@ class MerchantProductOrderViewSet(
 
         order.save(update_fields=update_fields)
 
-        # 同步自提信息到微信订单中心（仅微信支付订单，异常不影响主流程）
-        try:
-            payment = PaymentOrder.objects.filter(
-                order_no=order.order_no,
-                status='paid',
-                channel__startswith='wechat'
-            ).order_by('-paid_at').first()
-            if payment:
-                # 获取用户微信openid
-                wx_auth = order.user.user_auth_set.filter(provider='wx_mini').first()
-                if wx_auth:
-                    item_desc = _get_order_item_desc(order)
-                    upload_wechat_shipping_info(
-                        out_trade_no=payment.out_trade_no,
-                        openid=wx_auth.provider_uid,
-                        logistics_type=4,  # 用户自提
-                        item_desc=item_desc,
-                    )
-        except Exception as e:
-            logger.warning(f"同步自提信息到微信失败 order_no={order.order_no}, error={str(e)}", exc_info=True)
+        # 同步自提信息到微信订单中心（失败不影响主流程，但会完整打日志）
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提
+            scene='merchant_product_verify',
+        )
+
+        # 触发订单完成钩子：计算结算到期时间、销量+1、发积分
+        _on_order_completed(order, 'product')
 
         create_order_log(
             order.order_no, 'product', 'verify',
             request=request, operator_type='merchant',
             description=f'自提核销 {code or ""}'.strip(),
         )
-
-        # 触发完成钩子:销量+1 / 商家结算 / 发积分
-        _on_order_completed(order, 'product')
 
         return Response({
             'message': '核销成功',
@@ -1006,26 +1149,12 @@ class MerchantProductOrderViewSet(
 
         order.save(update_fields=update_fields)
 
-        # 同步自提信息到微信订单中心（仅微信支付订单，异常不影响主流程）
-        try:
-            payment = PaymentOrder.objects.filter(
-                order_no=order.order_no,
-                status='paid',
-                channel__startswith='wechat'
-            ).order_by('-paid_at').first()
-            if payment:
-                # 获取用户微信openid
-                wx_auth = order.user.user_auth_set.filter(provider='wx_mini').first()
-                if wx_auth:
-                    item_desc = _get_order_item_desc(order)
-                    upload_wechat_shipping_info(
-                        out_trade_no=payment.out_trade_no,
-                        openid=wx_auth.provider_uid,
-                        logistics_type=4,  # 用户自提
-                        item_desc=item_desc,
-                    )
-        except Exception as e:
-            logger.warning(f"同步自提信息到微信失败 order_no={order.order_no}, error={str(e)}", exc_info=True)
+        # 同步自提信息到微信订单中心（失败不影响主流程，但会完整打日志）
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提
+            scene='merchant_product_verify_by_code',
+        )
 
         create_order_log(
             order.order_no, 'product', 'verify',
@@ -1083,34 +1212,21 @@ class MerchantProductOrderViewSet(
 
         order.save(update_fields=update_fields)
 
-        # 同步自提信息到微信订单中心（仅微信支付订单，异常不影响主流程）
-        try:
-            payment = PaymentOrder.objects.filter(
-                order_no=order.order_no,
-                status='paid',
-                channel__startswith='wechat'
-            ).order_by('-paid_at').first()
-            if payment:
-                # 获取用户微信openid
-                wx_auth = order.user.user_auth_set.filter(provider='wx_mini').first()
-                if wx_auth:
-                    item_desc = _get_order_item_desc(order)
-                    upload_wechat_shipping_info(
-                        out_trade_no=payment.out_trade_no,
-                        openid=wx_auth.provider_uid,
-                        logistics_type=4,  # 用户自提
-                        item_desc=item_desc,
-                    )
-        except Exception as e:
-            logger.warning(f"同步自提信息到微信失败 order_no={order.order_no}, error={str(e)}", exc_info=True)
+        # 同步自提信息到微信订单中心（失败不影响主流程，但会完整打日志）
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提
+            scene='merchant_product_force_verify',
+        )
+
+        # 触发订单完成钩子：计算结算到期时间、销量+1、发积分
+        _on_order_completed(order, 'product')
 
         create_order_log(
             order.order_no, 'product', 'verify',
             request=request, operator_type='merchant',
             description=('超时补核销' if expired else '补核销') + (f' {code}' if code else ''),
         )
-
-        _on_order_completed(order, 'product')
 
         return Response({
             'message': '核销成功',
@@ -1148,8 +1264,8 @@ class MerchantServiceOrderViewSet(
         return (
             ServiceOrder.objects
             .filter(merchant_id=_get_merchant_id(self.request))
+            .select_related('user', 'assigned_staff')
             .prefetch_related('items')
-            .select_related('assigned_staff')
             .order_by('-created_at')
         )
 
@@ -1345,6 +1461,13 @@ class MerchantServiceOrderViewSet(
         order.completed_at   = now
         order.save(update_fields=['status', 'service_end_at', 'completed_at', 'updated_at'])
 
+        # 同步服务完成信息到微信订单中心。服务类线下交付/到店服务按用户自提处理。
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提/线下交付
+            scene='merchant_service_complete',
+        )
+
         create_order_log(
             order.order_no, 'service', 'complete',
             request=request, operator_type='merchant',
@@ -1376,6 +1499,13 @@ class MerchantServiceOrderViewSet(
         order.verified_at  = now
         order.completed_at = now
         order.save(update_fields=['status', 'verified_at', 'completed_at', 'updated_at'])
+
+        # 同步服务核销信息到微信订单中心。到店/核销类服务按用户自提处理。
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提/线下交付
+            scene='merchant_service_verify',
+        )
 
         create_order_log(
             order.order_no, 'service', 'verify',
@@ -1511,6 +1641,14 @@ class MerchantServiceOrderViewSet(
             description=f'扫码核销 {code}',
         )
 
+        # 服务扫码核销完成后，同步微信订单中心。
+        if order.status == ServiceOrder.Status.COMPLETED:
+            _sync_wechat_order_center(
+                order,
+                logistics_type=4,  # 用户自提/线下交付
+                scene='merchant_service_verify_by_code',
+            )
+
         # 触发完成钩子:销量+1 / 商家结算 / 发积分
         if order.status == ServiceOrder.Status.COMPLETED:
             _on_order_completed(order, 'service')
@@ -1556,6 +1694,13 @@ class MerchantServiceOrderViewSet(
 
         order.save(update_fields=update_fields)
 
+        # 服务强制核销/补核销也同步微信订单中心，避免商家走特殊入口时漏同步。
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提/线下交付
+            scene='merchant_service_force_verify',
+        )
+
         create_order_log(
             order.order_no, 'service', 'verify',
             request=request, operator_type='merchant',
@@ -1592,7 +1737,7 @@ class AdminProductOrderViewSet(viewsets.ModelViewSet):
     http_method_names      = ['get', 'put', 'patch', 'post']
 
     def get_queryset(self):
-        return ProductOrder.objects.prefetch_related('items').order_by('-created_at')
+        return ProductOrder.objects.select_related('user').prefetch_related('items').order_by('-created_at')
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -1721,8 +1866,8 @@ class AdminServiceOrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return (
             ServiceOrder.objects
+            .select_related('user', 'assigned_staff')
             .prefetch_related('items')
-            .select_related('assigned_staff')
             .order_by('-created_at')
         )
 
@@ -2079,6 +2224,71 @@ class UserOrderCountsView(APIView):
 # 商家端 - 统一核销码接口(自动判断商品/服务)
 # ══════════════════════════════════════════════════════════════
 
+# 商品订单状态分类
+PRODUCT_PENDING_STATUSES = {'pending_shipment', 'pending_pickup', 'refunding', 'paid'}
+PRODUCT_PICKUP_STATUSES = {'pending_pickup'}
+PRODUCT_PROCESSING_STATUSES = {'shipped', 'received', 'verified'}
+PRODUCT_FINISHED_STATUSES = {'completed', 'refunded', 'cancelled'}
+
+# 服务订单状态分类
+SERVICE_PENDING_STATUSES = {'pending_accept', 'pending_assignment', 'pending_use', 'pending_delivery', 'refunding', 'paid'}
+SERVICE_PICKUP_STATUSES = {'pending_use'}
+SERVICE_PROCESSING_STATUSES = {'assigned', 'in_service', 'verified', 'delivering', 'subscribing'}
+SERVICE_FINISHED_STATUSES = {'completed', 'refunded', 'cancelled'}
+
+
+class MerchantOrderStatsView(APIView):
+    """
+    商家端订单统计接口
+    GET /api/v1/merchant/orders/stats/
+    返回各分类订单数量
+    """
+    authentication_classes = [MerchantOrSubAuthentication]
+    permission_classes = [IsMerchant]
+
+    def get(self, request):
+        merchant_id = _get_merchant_id(request)
+        # 商品订单统计
+        product_qs = ProductOrder.objects.filter(merchant_id=merchant_id)
+        product_pending = product_qs.filter(status__in=PRODUCT_PENDING_STATUSES).count()
+        product_pickup = product_qs.filter(status__in=PRODUCT_PICKUP_STATUSES).count()
+        product_processing = product_qs.filter(status__in=PRODUCT_PROCESSING_STATUSES).count()
+        product_finished = product_qs.filter(status__in=PRODUCT_FINISHED_STATUSES).count()
+        product_total = product_pending + product_pickup + product_processing + product_finished
+
+        # 服务订单统计
+        service_qs = ServiceOrder.objects.filter(merchant_id=merchant_id)
+        service_pending = service_qs.filter(status__in=SERVICE_PENDING_STATUSES).count()
+        service_pickup = service_qs.filter(status__in=SERVICE_PICKUP_STATUSES).count()
+        service_processing = service_qs.filter(status__in=SERVICE_PROCESSING_STATUSES).count()
+        service_finished = service_qs.filter(status__in=SERVICE_FINISHED_STATUSES).count()
+        service_total = service_pending + service_pickup + service_processing + service_finished
+
+        return Response({
+            'product': {
+                'pending': product_pending,
+                'pickup': product_pickup,
+                'processing': product_processing,
+                'finished': product_finished,
+                'total': product_total,
+            },
+            'service': {
+                'pending': service_pending,
+                'pickup': service_pickup,
+                'processing': service_processing,
+                'finished': service_finished,
+                'total': service_total,
+            },
+            'all': {
+                'pending': product_pending + service_pending,
+                'pickup': product_pickup + service_pickup,
+                'processing': product_processing + service_processing,
+                'finished': product_finished + service_finished,
+                'total': product_total + service_total,
+            }
+        })
+
+
 class MerchantUnifiedVerifyView(APIView):
     """
     统一核销接口 — 商家扫码 / 输码,自动识别商品或服务订单。
@@ -2190,6 +2400,14 @@ class MerchantUnifiedVerifyView(APIView):
             description=f'扫码核销 {code}',
         )
 
+        # 统一核销入口的服务分支也同步微信订单中心。
+        if order.status == ServiceOrder.Status.COMPLETED:
+            _sync_wechat_order_center(
+                order,
+                logistics_type=4,  # 用户自提/线下交付
+                scene='merchant_unified_verify_service',
+            )
+
         # 推进完成钩子(销量+1 / 商家结算 / 发积分)
         if order.status == ServiceOrder.Status.COMPLETED:
             _on_order_completed(order, 'service')
@@ -2221,6 +2439,13 @@ class MerchantUnifiedVerifyView(APIView):
             update_fields.append('verified_by_staff')
 
         order.save(update_fields=update_fields)
+
+        # 统一核销入口也必须同步微信自提信息；这是之前最容易漏掉的路径。
+        _sync_wechat_order_center(
+            order,
+            logistics_type=4,  # 用户自提
+            scene='merchant_unified_verify_product',
+        )
 
         create_order_log(
             order.order_no, 'product', 'verify',
@@ -2341,4 +2566,124 @@ class MerchantDashboardStatsView(APIView):
                 'service_month_sales': svc_month_cnt,
             },
             'updated_at': now.isoformat(),
+        })
+
+class MerchantDashboardView(APIView):
+    """商家端数据看板统计接口"""
+    authentication_classes = [MerchantOrSubAuthentication]
+    permission_classes = [IsMerchant]
+    def get(self, request):
+        merchant_id = _get_merchant_id(request)
+        now = timezone.now()
+        today = timezone.localdate()
+        yesterday = today - timedelta(days=1)
+        week_start = today - timedelta(days=today.weekday())
+        month_start = today.replace(day=1)
+
+        # ───────────────────────── 订单统计 ─────────────────────────
+        product_qs = ProductOrder.objects.filter(merchant_id=merchant_id)
+        service_qs = ServiceOrder.objects.filter(merchant_id=merchant_id)
+        paid_product = product_qs.filter(paid_at__isnull=False)
+        paid_service = service_qs.filter(paid_at__isnull=False)
+
+        # 各时间周期订单数
+        orders = {
+            'total': product_qs.count() + service_qs.count(),
+            'today': product_qs.filter(created_at__date=today).count() + service_qs.filter(created_at__date=today).count(),
+            'yesterday': product_qs.filter(created_at__date=yesterday).count() + service_qs.filter(created_at__date=yesterday).count(),
+            'week': product_qs.filter(created_at__date__gte=week_start).count() + service_qs.filter(created_at__date__gte=week_start).count(),
+            'month': product_qs.filter(created_at__date__gte=month_start).count() + service_qs.filter(created_at__date__gte=month_start).count(),
+        }
+
+        # ───────────────────────── 营收统计 ─────────────────────────
+        def revenue_sum(qs, date_field=None, start=None):
+            f = qs
+            if date_field and start:
+                f = f.filter(**{f'{date_field}__date__gte': start})
+            return f.aggregate(s=Sum('pay_amount'))['s'] or Decimal('0')
+
+        revenue = {
+            'total': float((revenue_sum(paid_product) + revenue_sum(paid_service)).quantize(Decimal('0.01'))),
+            'today': float((revenue_sum(paid_product, 'paid_at', today) + revenue_sum(paid_service, 'paid_at', today)).quantize(Decimal('0.01'))),
+            'yesterday': float((revenue_sum(paid_product, 'paid_at', yesterday) + revenue_sum(paid_service, 'paid_at', yesterday)).quantize(Decimal('0.01'))),
+            'week': float((revenue_sum(paid_product, 'paid_at', week_start) + revenue_sum(paid_service, 'paid_at', week_start)).quantize(Decimal('0.01'))),
+            'month': float((revenue_sum(paid_product, 'paid_at', month_start) + revenue_sum(paid_service, 'paid_at', month_start)).quantize(Decimal('0.01'))),
+        }
+        # 客单价
+        paid_total = paid_product.count() + paid_service.count()
+        revenue['aov'] = round(revenue['total'] / paid_total, 2) if paid_total else 0.0
+        # 退款金额
+        refund_amount = (
+            (product_qs.filter(status='refunded').aggregate(s=Sum('pay_amount'))['s'] or Decimal('0'))
+            + (service_qs.filter(status='refunded').aggregate(s=Sum('pay_amount'))['s'] or Decimal('0'))
+        )
+        revenue['refund_amount'] = float(refund_amount.quantize(Decimal('0.01')))
+
+        # ───────────────────────── 钱包统计 ─────────────────────────
+        from wallet.models import MerchantWallet, MerchantWalletTransaction
+        wallet = MerchantWallet.objects.filter(merchant_id=merchant_id).first()
+        wallet_data = {
+            'balance': float(wallet.balance.quantize(Decimal('0.01'))) if wallet else 0.0,
+            'pending_settlement': float(wallet.pending_settlement.quantize(Decimal('0.01'))) if wallet else 0.0,
+            'total_income': float(wallet.total_income.quantize(Decimal('0.01'))) if wallet else 0.0,
+        }
+        # 累计佣金支出
+        commission_total = MerchantWalletTransaction.objects.filter(
+            wallet__merchant_id=merchant_id,
+            action=MerchantWalletTransaction.Action.COMMISSION_DEDUCT
+        ).aggregate(s=Sum('amount'))['s'] or Decimal('0')
+        wallet_data['total_commission'] = float(abs(commission_total).quantize(Decimal('0.01')))
+
+        # ───────────────────────── 待办提醒 ─────────────────────────
+        todos = {
+            'pending_shipment': product_qs.filter(status='pending_shipment').count(),
+            'pending_pickup': product_qs.filter(status='pending_pickup').count(),
+            'pending_accept': service_qs.filter(status__in=['pending_accept', 'pending_assignment']).count(),
+            'pending_use': service_qs.filter(status='pending_use').count(),
+            'refunding': product_qs.filter(status='refunding').count() + service_qs.filter(status='refunding').count(),
+        }
+        todos['total'] = sum(todos.values())
+
+        # ───────────────────────── 近7天趋势 ─────────────────────────
+        trend_start = today - timedelta(days=6)
+        trend = []
+        for i in range(7):
+            d = trend_start + timedelta(days=i)
+            p_cnt = product_qs.filter(created_at__date=d).count()
+            s_cnt = service_qs.filter(created_at__date=d).count()
+            p_rev = paid_product.filter(paid_at__date=d).aggregate(s=Sum('pay_amount'))['s'] or Decimal('0')
+            s_rev = paid_service.filter(paid_at__date=d).aggregate(s=Sum('pay_amount'))['s'] or Decimal('0')
+            trend.append({
+                'date': d.isoformat(),
+                'orders': p_cnt + s_cnt,
+                'revenue': float((p_rev + s_rev).quantize(Decimal('0.01'))),
+            })
+
+        # ───────────────────────── 热销排行 ─────────────────────────
+        from bill.models import ProductOrderItem, ServiceOrderItem
+        # 商品热销top5
+        hot_products = list(
+            ProductOrderItem.objects.filter(order__merchant_id=merchant_id, order__status__in=['paid', 'completed', 'verified'])
+            .values('product_id', 'product_name')
+            .annotate(sales=Sum('quantity'))
+            .order_by('-sales')[:5]
+        )
+        # 服务热销top5
+        hot_services = list(
+            ServiceOrderItem.objects.filter(order__merchant_id=merchant_id, order__status__in=['paid', 'completed', 'verified'])
+            .values('service_id', 'service_name')
+            .annotate(sales=Count('id'))
+            .order_by('-sales')[:5]
+        )
+
+        return Response({
+            'generated_at': now.isoformat(),
+            'date': today.isoformat(),
+            'orders': orders,
+            'revenue': revenue,
+            'wallet': wallet_data,
+            'todos': todos,
+            'trend_7d': trend,
+            'hot_products': hot_products,
+            'hot_services': hot_services,
         })

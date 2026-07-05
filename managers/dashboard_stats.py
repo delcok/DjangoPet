@@ -2,7 +2,6 @@
 # @Time    : 2026/6/24 15:04
 # @Author  : Delock
 
-
 import logging
 from datetime import timedelta
 from decimal import Decimal
@@ -196,6 +195,17 @@ class DashboardStats:
     # ───────────────────────── 营收 / GMV ─────────────────────────
     def revenue_stats(self) -> dict:
         from bill.models import ProductOrder, ServiceOrder
+        from wallet.models import MerchantWalletTransaction
+
+        # 平台佣金直接从钱包流水统计：实际扣除的佣金总和，100%准确
+        # COMMISSION_DEDUCT 是扣佣金操作，金额为负数，取绝对值总和
+        commission_qs = MerchantWalletTransaction.objects.filter(
+            action=MerchantWalletTransaction.Action.COMMISSION_DEDUCT
+        )
+        commission_total = _f(abs(commission_qs.aggregate(s=Sum('amount'))['s'] or 0))
+        commission_today = _f(abs(commission_qs.filter(created_at__date=self.today).aggregate(s=Sum('amount'))['s'] or 0))
+        commission_yesterday = _f(abs(commission_qs.filter(created_at__date=self.yesterday).aggregate(s=Sum('amount'))['s'] or 0))
+        commission_month = _f(abs(commission_qs.filter(created_at__date__gte=self.month_start).aggregate(s=Sum('amount'))['s'] or 0))
 
         def rev(model):
             paid = model.objects.filter(paid_at__isnull=False)
@@ -233,6 +243,11 @@ class DashboardStats:
                 'paid_orders_total': total_paid,
                 'aov': round(total_gmv / total_paid, 2) if total_paid else 0.0,
                 'refunded_amount': p['refunded_amount'] + s['refunded_amount'],
+                # 平台佣金：直接从钱包流水统计，实际扣除金额，100%准确
+                'commission_total': commission_total,
+                'commission_today': commission_today,
+                'commission_yesterday': commission_yesterday,
+                'commission_month': commission_month,
             },
         }
 

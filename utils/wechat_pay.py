@@ -14,17 +14,23 @@ logger = logging.getLogger(__name__)
 
 
 class WeChatPayHelper:
-    def __init__(self):
+    def __init__(self, trade_type='JSAPI'):
         config = settings.WECHAT_PAY_CONFIG
+        self.trade_type = trade_type
+        # 根据支付类型选择对应的APPID
+        if trade_type == 'APP':
+            appid = config['APP_PAY_APPID']
+        else:  # JSAPI 小程序/H5
+            appid = config['MINI_APPID']
+        
         self.pay = WeChatPay(
-            appid=config['APPID'],
+            appid=appid,
             mch_id=config['MCH_ID'],
             api_key=config['API_KEY'],
             mch_cert=config['CERT_PATH'],
             mch_key=config['KEY_PATH'],
         )
-
-        self.trade_type = config['TRADE_TYPE']
+        self.notify_url_base = config['NOTIFY_URL']
 
     def generate_out_trade_no(self):
         return f"{settings.WECHAT_PAY_CONFIG['MCH_ID']}{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
@@ -33,25 +39,43 @@ class WeChatPayHelper:
         """生成退款单号"""
         return f"R{settings.WECHAT_PAY_CONFIG['MCH_ID']}{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
 
-    def create_payment_order(self, openid, total_fee, body, out_trade_no=None, notify_url=None):
+    def create_payment_order(self, total_fee, body, out_trade_no=None, notify_url=None, openid=None, client_ip=None):
         if not notify_url:
-            notify_url = "https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/payment/"
+            notify_url = f"{self.notify_url_base}payment/"
         if not out_trade_no:
             out_trade_no = self.generate_out_trade_no()
+        if not client_ip:
+            client_ip = '121.196.245.220'  # 默认服务器IP，可由调用方传入用户真实IP
         try:
-            logger.info(f"开始创建支付订单: openid={openid}, total_fee={total_fee}, body={body}, out_trade_no={out_trade_no}")
-            order = self.pay.order.create(
-                body=body,
-                trade_type=self.trade_type,
-                notify_url=notify_url,
-                total_fee=total_fee,
-                client_ip='121.196.245.220',  # 替换为您的服务器IP
-                user_id=openid,
-                out_trade_no=out_trade_no,
-            )
+            logger.info(f"开始创建{self.trade_type}支付订单: total_fee={total_fee}, body={body}, out_trade_no={out_trade_no}")
+            # 构造统一下单参数
+            order_params = {
+                'body': body,
+                'trade_type': self.trade_type,
+                'notify_url': notify_url,
+                'total_fee': total_fee,
+                'client_ip': client_ip,
+                'out_trade_no': out_trade_no,
+            }
+            # JSAPI支付需要openid
+            if self.trade_type == 'JSAPI':
+                if not openid:
+                    raise ValueError("JSAPI支付必须传入openid")
+                order_params['user_id'] = openid
+            
+            order = self.pay.order.create(**order_params)
             logger.info(f"创建支付订单成功: {order}")
-            pay_params = self.pay.jsapi.get_jsapi_params(order.get('prepay_id'))
-            pay_params["prepay_id"] = order.get('prepay_id')
+            prepay_id = order.get('prepay_id')
+            
+            # 根据支付类型返回对应的前端调起参数
+            if self.trade_type == 'JSAPI':
+                pay_params = self.pay.jsapi.get_jsapi_params(prepay_id)
+            elif self.trade_type == 'APP':
+                pay_params = self.pay.app.get_app_params(prepay_id)
+            else:
+                raise ValueError(f"不支持的支付类型: {self.trade_type}")
+            
+            pay_params["prepay_id"] = prepay_id
             pay_params["mch_id"] = self.pay.mch_id
             return pay_params
         except WeChatPayException as e:
@@ -71,7 +95,7 @@ class WeChatPayHelper:
         :return: 微信退款接口返回结果
         """
         if not notify_url:
-            notify_url = "https://pet.yimengzhiyuan.com:8080/api/v1/wechat_callback/refund/"
+            notify_url = f"{self.notify_url_base}refund/"
         try:
             refund = self.pay.refund.apply(
                 transaction_id=transaction_id,

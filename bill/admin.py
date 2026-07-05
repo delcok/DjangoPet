@@ -1,11 +1,34 @@
 # orders/admin.py
 
 from django.contrib import admin
+from django.utils.safestring import mark_safe
 from .models import (
     ProductOrder, ProductOrderItem,
     ServiceOrder, ServiceOrderItem,
     OrderTransfer, OrderLog,
 )
+
+
+# ── 公共方法 ──
+
+def _get_settle_status(obj):
+    """显示订单结算状态，带颜色"""
+    if obj.is_settled:
+        color = "#52c41a"
+        text = f"✅ 已结算（{obj.settled_at.strftime('%Y-%m-%d') if obj.settled_at else ''}）"
+    elif obj.status == 'completed' and obj.settle_due_at:
+        from django.utils import timezone
+        if obj.settle_due_at <= timezone.now():
+            color = "#faad14"
+            text = f"⏳ 待结算（已到期）"
+        else:
+            color = "#faad14"
+            text = f"⏳ 待结算（{obj.settle_due_at.strftime('%Y-%m-%d')}到期）"
+    else:
+        color = "#8c8c8c"
+        text = "⏺️ 未到结算期"
+    return mark_safe(f'<span style="color: {color}; font-weight: 500;">{text}</span>')
+_get_settle_status.short_description = "结算状态"
 
 
 # ── 内联 ──
@@ -49,11 +72,11 @@ class OrderTransferInline(admin.TabularInline):
 class ProductOrderAdmin(admin.ModelAdmin):
     list_display = [
         'order_no', 'user', 'merchant_name', 'pay_amount',
-        'status', 'delivery_type',
+        'status', 'delivery_type', _get_settle_status,
         'receiver_name', 'receiver_community',
         'paid_at', 'created_at',
     ]
-    list_filter = ['status', 'delivery_type', 'created_at']
+    list_filter = ['status', 'delivery_type', 'is_settled', 'created_at']
     search_fields = [
         'order_no', 'merchant_name',
         'receiver_name', 'receiver_phone',
@@ -62,11 +85,14 @@ class ProductOrderAdmin(admin.ModelAdmin):
     list_per_page = 30
     raw_id_fields = ['user', 'verified_by_staff']
     inlines = [ProductOrderItemInline]
-    readonly_fields = ['order_no', 'created_at', 'updated_at']
+    readonly_fields = ['order_no', 'created_at', 'updated_at', 'is_settled', 'settle_due_at', 'settled_at']
 
     fieldsets = (
         ('基本信息', {
             'fields': ('order_no', 'user', 'merchant_id', 'merchant_name', 'status')
+        }),
+        ('结算信息', {
+            'fields': ('is_settled', 'settle_due_at', 'settled_at'),
         }),
         ('金额', {
             'fields': (
@@ -116,12 +142,12 @@ class ServiceOrderAdmin(admin.ModelAdmin):
     list_display = [
         'order_no', 'user', 'merchant_name',
         'service_type', 'service_mode',
-        'pay_amount', 'status',
+        'pay_amount', 'status', _get_settle_status,
         'receiver_name', 'receiver_community',
         'assigned_staff', 'is_urgent',
         'appointment_date', 'created_at',
     ]
-    list_filter = ['status', 'service_type', 'service_mode', 'is_urgent', 'created_at']
+    list_filter = ['status', 'service_type', 'service_mode', 'is_urgent', 'is_settled', 'created_at']
     search_fields = [
         'order_no', 'merchant_name',
         'receiver_name', 'receiver_phone',
@@ -130,7 +156,7 @@ class ServiceOrderAdmin(admin.ModelAdmin):
     list_per_page = 30
     raw_id_fields = ['user', 'assigned_staff', 'verified_by_staff']
     inlines = [ServiceOrderItemInline, OrderTransferInline]
-    readonly_fields = ['order_no', 'verify_code', 'created_at', 'updated_at']
+    readonly_fields = ['order_no', 'verify_code', 'created_at', 'updated_at', 'is_settled', 'settle_due_at', 'settled_at']
 
     fieldsets = (
         ('基本信息', {
@@ -138,6 +164,9 @@ class ServiceOrderAdmin(admin.ModelAdmin):
                 'order_no', 'user', 'merchant_id', 'merchant_name',
                 'service_type', 'service_mode', 'schedule_type', 'status',
             )
+        }),
+        ('结算信息', {
+            'fields': ('is_settled', 'settle_due_at', 'settled_at'),
         }),
         ('金额', {
             'fields': (

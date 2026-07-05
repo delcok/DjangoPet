@@ -1297,11 +1297,13 @@ class MerchantProductOrderListSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     short_address  = serializers.CharField(read_only=True)
     items_summary  = serializers.SerializerMethodField()
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
 
     class Meta:
         model = ProductOrder
         fields = [
-            'id', 'order_no', 'user_id',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone',
             'total_amount', 'freight_amount', 'pay_amount',
             'status', 'status_display',
             'receiver_name', 'receiver_phone', 'short_address',
@@ -1323,11 +1325,13 @@ class MerchantProductOrderDetailSerializer(serializers.ModelSerializer):
     items          = ProductOrderItemSerializer(many=True, read_only=True)
     full_address   = serializers.CharField(read_only=True)
     short_address  = serializers.CharField(read_only=True)
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
 
     class Meta:
         model = ProductOrder
         fields = [
-            'id', 'order_no','merchant_name', 'user_id',
+            'id', 'order_no','merchant_name', 'user_id', 'user_name', 'user_phone',
             'total_amount', 'freight_amount', 'discount_amount', 'user_coupon_id', 'coupon_deduct_amount',
         ] + _COIN_FIELDS + [
             'pay_amount',
@@ -1357,11 +1361,13 @@ class MerchantServiceOrderListSerializer(serializers.ModelSerializer):
     short_address  = serializers.CharField(read_only=True)
     staff_name     = serializers.CharField(source='assigned_staff.name', read_only=True, default='')
     items_summary  = serializers.SerializerMethodField()
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
 
     class Meta:
         model = ServiceOrder
         fields = [
-            'id', 'order_no', 'user_id',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone',
             'service_type', 'service_mode',
             'total_amount', 'pay_amount',
             'status', 'status_display',
@@ -1387,11 +1393,13 @@ class MerchantServiceOrderDetailSerializer(serializers.ModelSerializer):
     staff_name     = serializers.CharField(source='assigned_staff.name', read_only=True, default='')
     transfer_records = OrderTransferSerializer(many=True, read_only=True)
     delivery_schedules = DeliveryScheduleSerializer(many=True, read_only=True)
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
 
     class Meta:
         model = ServiceOrder
         fields = [
-            'id', 'order_no', 'user_id',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone',
             'service_type', 'service_mode', 'schedule_type',
             'total_amount', 'discount_amount', 'user_coupon_id', 'coupon_deduct_amount',
         ] + _COIN_FIELDS + [
@@ -1548,15 +1556,32 @@ class AdminProductOrderListSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     items_count    = serializers.SerializerMethodField()
     short_address  = serializers.CharField(read_only=True)
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
+    is_settled     = serializers.BooleanField(read_only=True)
+    settle_due_at  = serializers.DateTimeField(read_only=True)
+    settled_at     = serializers.DateTimeField(read_only=True)
+    settle_status_display = serializers.SerializerMethodField()
+
+    def get_settle_status_display(self, obj):
+        if obj.is_settled:
+            return f"已结算（{obj.settled_at.strftime('%Y-%m-%d') if obj.settled_at else ''}）"
+        if obj.status == 'completed' and obj.settle_due_at:
+            from django.utils import timezone
+            if obj.settle_due_at <= timezone.now():
+                return "待结算（已到期）"
+            return f"待结算（{obj.settle_due_at.strftime('%Y-%m-%d')}到期）"
+        return "未到结算期"
 
     class Meta:
         model = ProductOrder
         fields = [
-            'id', 'order_no', 'user_id', 'merchant_id', 'merchant_name',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone', 'merchant_id', 'merchant_name',
             'total_amount', 'freight_amount', 'discount_amount', 'pay_amount',
             'status', 'status_display',
             'receiver_name', 'receiver_phone', 'short_address',
             'items_count',
+            'is_settled', 'settle_due_at', 'settled_at', 'settle_status_display',
             'paid_at', 'completed_at', 'created_at',
         ]
 
@@ -1569,11 +1594,27 @@ class AdminProductOrderDetailSerializer(serializers.ModelSerializer):
     items          = ProductOrderItemSerializer(many=True, read_only=True)
     full_address   = serializers.CharField(read_only=True)
     short_address  = serializers.CharField(read_only=True)
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
+    is_settled     = serializers.BooleanField(read_only=True)
+    settle_due_at  = serializers.DateTimeField(read_only=True)
+    settled_at     = serializers.DateTimeField(read_only=True)
+    settle_status_display = serializers.SerializerMethodField()
+
+    def get_settle_status_display(self, obj):
+        if obj.is_settled:
+            return f"已结算（{obj.settled_at.strftime('%Y-%m-%d %H:%M') if obj.settled_at else ''}）"
+        if obj.status == 'completed' and obj.settle_due_at:
+            from django.utils import timezone
+            if obj.settle_due_at <= timezone.now():
+                return "待结算（已到期）"
+            return f"待结算（{obj.settle_due_at.strftime('%Y-%m-%d')}到期）"
+        return "未到结算期"
 
     class Meta:
         model = ProductOrder
         fields = [
-            'id', 'order_no', 'user_id', 'merchant_id', 'merchant_name',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone', 'merchant_id', 'merchant_name',
             'total_amount', 'freight_amount', 'discount_amount', 'user_coupon_id', 'coupon_deduct_amount',
         ] + _COIN_FIELDS + [
             'pay_amount',
@@ -1586,6 +1627,7 @@ class AdminProductOrderDetailSerializer(serializers.ModelSerializer):
             'points_earned', 'gold_earned',
             'remark', 'cancel_reason',
             'is_reviewed', 'reviewed_at',
+            'is_settled', 'settle_due_at', 'settled_at', 'settle_status_display',
             'paid_at', 'completed_at', 'created_at', 'updated_at',
             'items',
         ]
@@ -1645,11 +1687,27 @@ class AdminServiceOrderListSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     short_address  = serializers.CharField(read_only=True)
     staff_name = serializers.CharField(source='assigned_staff.name', read_only=True, default='')
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
+    is_settled     = serializers.BooleanField(read_only=True)
+    settle_due_at  = serializers.DateTimeField(read_only=True)
+    settled_at     = serializers.DateTimeField(read_only=True)
+    settle_status_display = serializers.SerializerMethodField()
+
+    def get_settle_status_display(self, obj):
+        if obj.is_settled:
+            return f"已结算（{obj.settled_at.strftime('%Y-%m-%d') if obj.settled_at else ''}）"
+        if obj.status == 'completed' and obj.settle_due_at:
+            from django.utils import timezone
+            if obj.settle_due_at <= timezone.now():
+                return "待结算（已到期）"
+            return f"待结算（{obj.settle_due_at.strftime('%Y-%m-%d')}到期）"
+        return "未到结算期"
 
     class Meta:
         model = ServiceOrder
         fields = [
-            'id', 'order_no', 'user_id', 'merchant_id', 'merchant_name',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone', 'merchant_id', 'merchant_name',
             'service_type', 'service_mode',
             'total_amount', 'discount_amount', 'pay_amount',
             'status', 'status_display',
@@ -1657,6 +1715,7 @@ class AdminServiceOrderListSerializer(serializers.ModelSerializer):
             'is_urgent', 'staff_name',
             'appointment_date',
             'planned_delivery_count', 'completed_delivery_count',
+            'is_settled', 'settle_due_at', 'settled_at', 'settle_status_display',
             'paid_at', 'completed_at', 'created_at',
         ]
 
@@ -1669,11 +1728,27 @@ class AdminServiceOrderDetailSerializer(serializers.ModelSerializer):
     staff_name     = serializers.CharField(source='assigned_staff.name', read_only=True, default='')
     transfer_records = OrderTransferSerializer(many=True, read_only=True)
     delivery_schedules = DeliveryScheduleSerializer(many=True, read_only=True)
+    user_name      = serializers.CharField(source='user.display_name', read_only=True, default='')
+    user_phone     = serializers.CharField(source='user.phone', read_only=True, default='')
+    is_settled     = serializers.BooleanField(read_only=True)
+    settle_due_at  = serializers.DateTimeField(read_only=True)
+    settled_at     = serializers.DateTimeField(read_only=True)
+    settle_status_display = serializers.SerializerMethodField()
+
+    def get_settle_status_display(self, obj):
+        if obj.is_settled:
+            return f"已结算（{obj.settled_at.strftime('%Y-%m-%d %H:%M') if obj.settled_at else ''}）"
+        if obj.status == 'completed' and obj.settle_due_at:
+            from django.utils import timezone
+            if obj.settle_due_at <= timezone.now():
+                return "待结算（已到期）"
+            return f"待结算（{obj.settle_due_at.strftime('%Y-%m-%d')}到期）"
+        return "未到结算期"
 
     class Meta:
         model = ServiceOrder
         fields = [
-            'id', 'order_no', 'user_id', 'merchant_id', 'merchant_name',
+            'id', 'order_no', 'user_id', 'user_name', 'user_phone', 'merchant_id', 'merchant_name',
             'service_type', 'service_mode', 'schedule_type',
             'total_amount', 'discount_amount', 'user_coupon_id', 'coupon_deduct_amount',
         ] + _COIN_FIELDS + [
@@ -1693,6 +1768,7 @@ class AdminServiceOrderDetailSerializer(serializers.ModelSerializer):
             'extra_info', 'points_earned', 'gold_earned',
             'remark', 'cancel_reason',
             'is_reviewed', 'reviewed_at',
+            'is_settled', 'settle_due_at', 'settled_at', 'settle_status_display',
             'paid_at', 'service_start_at', 'service_end_at',
             'completed_at', 'created_at', 'updated_at',
             'items', 'transfer_records',

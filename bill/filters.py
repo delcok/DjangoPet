@@ -64,7 +64,7 @@ class UserServiceOrderFilter(django_filters.FilterSet):
 # ══════ 商家端 ══════
 
 class MerchantProductOrderFilter(django_filters.FilterSet):
-    status = django_filters.CharFilter(field_name='status')
+    status = django_filters.CharFilter(method='filter_status')
     keyword = django_filters.CharFilter(method='filter_keyword')
     created_after = django_filters.DateTimeFilter(field_name='created_at', lookup_expr='gte')
     created_before = django_filters.DateTimeFilter(field_name='created_at', lookup_expr='lte')
@@ -72,6 +72,14 @@ class MerchantProductOrderFilter(django_filters.FilterSet):
     class Meta:
         model = ProductOrder
         fields = ['status']
+
+    def filter_status(self, qs, name, value):
+        if not value:
+            return qs
+        statuses = [s.strip() for s in value.split(',') if s.strip()]
+        if not statuses:
+            return qs
+        return qs.filter(status__in=statuses)
 
     def filter_keyword(self, qs, name, value):
         if not value:
@@ -85,7 +93,7 @@ class MerchantProductOrderFilter(django_filters.FilterSet):
 
 
 class MerchantServiceOrderFilter(django_filters.FilterSet):
-    status = django_filters.CharFilter(field_name='status')
+    status = django_filters.CharFilter(method='filter_status')
     service_type = django_filters.CharFilter(field_name='service_type')
     service_mode = django_filters.CharFilter(field_name='service_mode')
     is_urgent = django_filters.BooleanFilter(field_name='is_urgent')
@@ -98,6 +106,14 @@ class MerchantServiceOrderFilter(django_filters.FilterSet):
     class Meta:
         model = ServiceOrder
         fields = ['status', 'service_type', 'service_mode', 'is_urgent']
+
+    def filter_status(self, qs, name, value):
+        if not value:
+            return qs
+        statuses = [s.strip() for s in value.split(',') if s.strip()]
+        if not statuses:
+            return qs
+        return qs.filter(status__in=statuses)
 
     def filter_keyword(self, qs, name, value):
         if not value:
