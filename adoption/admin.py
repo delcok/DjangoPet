@@ -2,23 +2,9 @@
 """
 adoption/admin.py — 领养模块 Django Admin(适配 Django 5.1.2)
 
-═══════════════ 定位说明(重要)═══════════════
-你们的业务后台是 Manager + JWT 的 API 后台(AdminXxxViewSet),状态机联动
-(择优批量拒绝、名额计数、打卡任务生成、资格处罚联动)全部在那一层。
-
-Django Admin 在这里定位为【内部审计 + 兜底运维】工具:
-1. 登录 Django Admin 的是 django.contrib.auth 的超管(createsuperuser),
-   不是 managers.Manager —— 所以凡是 FK 指向 Manager 的操作人字段
-   (created_by/reviewer/operator/reviewed_by)在这里一律只读,不能自动写入。
-2. 申请单状态、违规创建等有联动逻辑的写操作在此【禁用或只读】,
-   防止绕过 API 层把计数和状态机改脏;纯字段型的修改(宠物资料、
-   资格档案手动调整、动态结论)开放。
-
-Django 5.1 适配点:
-- list_display 直接写 '__' 跨表字段(5.1 新特性)
-- format_html 全部带参数占位(5.0 起不带参数的调用已废弃)
-- show_facets 使用 admin.ShowFacets(5.0+)
-═══════════════════════════════════════════════
+⚠️ 测试环境版本:已放开删除权限,用于清空测试数据。
+   上线前请务必还原 has_delete_permission / has_add_permission,
+   否则超管可在 Admin 里绕过 API 层直接物理删除业务数据。
 """
 import json
 
@@ -36,7 +22,6 @@ from .models import (AdopterProfile, AdoptionApplication, AdoptionUpdate,
 # 公共小工具
 # ============================================================
 def _badge(label, color):
-    """彩色状态徽章(format_html 带占位参数,Django 5 安全写法)"""
     return format_html(
         '<span style="display:inline-block;padding:2px 10px;border-radius:10px;'
         'font-size:12px;color:#fff;background:{};white-space:nowrap;">{}</span>',
@@ -44,7 +29,6 @@ def _badge(label, color):
 
 
 def _img_gallery(urls, height=56):
-    """JSONField 图片列表缩略预览"""
     if not urls:
         return '—'
     return format_html_join(
@@ -103,7 +87,8 @@ class StrayPetAdmin(admin.ModelAdmin):
     list_per_page = 30
     empty_value_display = '—'
     inlines = [PetMediaInline]
-    actions = ['make_available', 'make_paused']
+    # 测试环境:新增物理删除动作
+    actions = ['make_available', 'make_paused', 'hard_delete_pets']
 
     readonly_fields = ('applying_count', 'view_count', 'favorite_count',
                        'adopted_at', 'created_by', 'created_at', 'updated_at',
@@ -161,36 +146,49 @@ class StrayPetAdmin(admin.ModelAdmin):
 
     # ---------- 写保护 ----------
     def save_model(self, request, obj, form, change):
-        # 兜底: 流程自动状态禁止在 django admin 手填(API 层 serializer 同样拦截)
         if 'status' in form.changed_data and obj.status in ('full', 'handover', 'adopted'):
             obj.status = (type(obj).objects.get(pk=obj.pk).status
                           if change else 'draft')
             self.message_user(
                 request, '⚠️ full/handover/adopted 由申请流程自动流转,本次状态修改已忽略',
                 messages.WARNING)
-        # 登录主体是 auth 超管而非 Manager,created_by 不自动写入,保持为空/原值
         super().save_model(request, obj, form, change)
 
-    # ---------- 软删除 ----------
+    # ---------- 删除权限(测试环境放开)----------
+    def has_delete_permission(self, request, obj=None):
+        return True
+
+    # 单条删除:测试环境直接物理删除(连带申请等由级联/手动清理)
     def delete_model(self, request, obj):
-        if obj.applications.filter(
-                status__in=AdoptionApplication.ACTIVE_STATUSES).exists():
-            self.message_user(request, f'「{obj.name}」存在进行中申请,未删除',
-                              messages.ERROR)
-            return
-        obj.is_deleted = True
-        obj.save(update_fields=['is_deleted', 'updated_at'])
+        self._hard_delete(request, StrayPet.objects.filter(pk=obj.pk))
 
     def delete_queryset(self, request, queryset):
-        blocked_ids = set(queryset.filter(
-            applications__status__in=AdoptionApplication.ACTIVE_STATUSES
-        ).values_list('id', flat=True))
-        if blocked_ids:
-            self.message_user(
-                request, f'{len(blocked_ids)} 只宠物存在进行中申请,已跳过',
-                messages.WARNING)
-        queryset.exclude(id__in=blocked_ids).update(
-            is_deleted=True, updated_at=timezone.now())
+        self._hard_delete(request, queryset)
+
+    def _hard_delete(self, request, queryset):
+        """
+        物理删除宠物。pet 被 AdoptionApplication 以 PROTECT 引用,
+        必须先删申请及其下游数据,否则 ProtectedError。
+        顺序:动态 → 打卡任务 → 日志 → 违规 → 申请 → 宠物。
+        """
+        pet_ids = list(queryset.values_list('id', flat=True))
+        if not pet_ids:
+            return
+        apps = AdoptionApplication.objects.filter(pet_id__in=pet_ids)
+        app_ids = list(apps.values_list('id', flat=True))
+
+        AdoptionUpdate.objects.filter(application_id__in=app_ids).delete()
+        AdoptionUpdateTask.objects.filter(application_id__in=app_ids).delete()
+        ApplicationStatusLog.objects.filter(application_id__in=app_ids).delete()
+        # 违规单 application 是 SET_NULL,这里连测试违规一起清掉
+        AdoptionViolation.objects.filter(application_id__in=app_ids).delete()
+        apps.delete()
+
+        deleted, _ = queryset.delete()
+        self.message_user(
+            request,
+            f'已物理删除 {len(pet_ids)} 只宠物及其 {len(app_ids)} 张申请和关联数据',
+            messages.SUCCESS)
 
     # ---------- 批量动作 ----------
     @admin.action(description='批量上架(待上架/暂停 → 可领养)')
@@ -204,17 +202,21 @@ class StrayPetAdmin(admin.ModelAdmin):
         updated = queryset.filter(status='available').update(status='paused')
         self.message_user(request, f'{updated} 只宠物已暂停领养', messages.SUCCESS)
 
+    @admin.action(description='⚠️ 物理删除选中宠物及全部关联数据(仅测试用)')
+    def hard_delete_pets(self, request, queryset):
+        self._hard_delete(request, queryset)
+
 
 # ============================================================
-# 2. 领养申请(只读为主: 状态流转必须走 API 后台的择优联动)
+# 2. 领养申请
 # ============================================================
 class ApplicationStatusLogInline(admin.TabularInline):
     model = ApplicationStatusLog
     extra = 0
-    can_delete = False
+    can_delete = True  # 测试环境允许删除内联日志
     fields = ('created_at', 'from_status', 'to_status', 'operator', 'remark')
     readonly_fields = fields
-    verbose_name_plural = '状态流转日志(只读)'
+    verbose_name_plural = '状态流转日志'
 
     def has_add_permission(self, request, obj=None):
         return False
@@ -223,11 +225,11 @@ class ApplicationStatusLogInline(admin.TabularInline):
 class AdoptionUpdateTaskInline(admin.TabularInline):
     model = AdoptionUpdateTask
     extra = 0
-    can_delete = False
+    can_delete = True
     fields = ('period_no', 'due_start', 'due_end', 'status',
               'remind_count', 'reminded_at')
     readonly_fields = fields
-    verbose_name_plural = '打卡任务(只读,豁免请到打卡任务列表操作)'
+    verbose_name_plural = '打卡任务'
 
     def has_add_permission(self, request, obj=None):
         return False
@@ -247,7 +249,6 @@ class AdoptionApplicationAdmin(admin.ModelAdmin):
     inlines = [ApplicationStatusLogInline, AdoptionUpdateTaskInline]
     empty_value_display = '—'
 
-    # 仅允许补充审核备注/评分,其余全部只读
     readonly_fields = (
         'application_no', 'pet', 'applicant', 'status',
         'real_name', 'phone', 'wechat_id', 'age', 'occupation', 'address',
@@ -282,10 +283,11 @@ class AdoptionApplicationAdmin(admin.ModelAdmin):
     )
 
     def has_add_permission(self, request):
-        return False  # 申请只能由 C 端用户提交
+        return False
 
+    # 测试环境放开删除
     def has_delete_permission(self, request, obj=None):
-        return False  # 留痕,不可删
+        return True
 
     @admin.display(description='宠物', ordering='pet__name')
     def pet_link(self, obj):
@@ -312,11 +314,10 @@ class AdoptionApplicationAdmin(admin.ModelAdmin):
 
 
 # ============================================================
-# 3. 状态日志(纯审计,完全只读)
+# 3. 状态日志
 # ============================================================
 @admin.register(ApplicationStatusLog)
 class ApplicationStatusLogAdmin(admin.ModelAdmin):
-    # 'application__application_no': Django 5.1 起 list_display 支持 __ 跨表字段
     list_display = ('id', 'application__application_no', 'flow',
                     'operator', 'remark', 'created_at')
     list_filter = ('to_status', ('created_at', admin.DateFieldListFilter))
@@ -335,12 +336,13 @@ class ApplicationStatusLogAdmin(admin.ModelAdmin):
     def has_change_permission(self, request, obj=None):
         return False
 
+    # 测试环境放开删除
     def has_delete_permission(self, request, obj=None):
-        return False
+        return True
 
 
 # ============================================================
-# 4. 领养资格档案(允许人工风控调整)
+# 4. 领养资格档案
 # ============================================================
 @admin.register(AdopterProfile)
 class AdopterProfileAdmin(admin.ModelAdmin):
@@ -351,7 +353,7 @@ class AdopterProfileAdmin(admin.ModelAdmin):
     list_filter = ('status',)
     search_fields = ('user__phone', 'user__username')
     list_select_related = ('user',)
-    show_facets = admin.ShowFacets.ALWAYS  # Django 5.0+: 列表过滤器直接显示计数
+    show_facets = admin.ShowFacets.ALWAYS
     actions = ['lift_restriction', 'ban_users']
     raw_id_fields = ('user',)
 
@@ -364,7 +366,11 @@ class AdopterProfileAdmin(admin.ModelAdmin):
               'remark', ('created_at', 'updated_at'))
 
     def has_add_permission(self, request):
-        return False  # 档案由首次申请时自动建档
+        return False
+
+    # 测试环境放开删除
+    def has_delete_permission(self, request, obj=None):
+        return True
 
     @admin.display(description='资格状态', ordering='status')
     def status_badge(self, obj):
@@ -384,7 +390,7 @@ class AdopterProfileAdmin(admin.ModelAdmin):
 
 
 # ============================================================
-# 5. 违规记录(只读审计: 创建需联动资格处罚,必须走 API 后台)
+# 5. 违规记录
 # ============================================================
 @admin.register(AdoptionViolation)
 class AdoptionViolationAdmin(admin.ModelAdmin):
@@ -403,14 +409,14 @@ class AdoptionViolationAdmin(admin.ModelAdmin):
     fields = readonly_fields
 
     def has_add_permission(self, request):
-        # 违规创建会联动扣分/限制/封禁,必须走 API 后台接口,此处只读防联动遗漏
         return False
 
     def has_change_permission(self, request, obj=None):
         return False
 
+    # 测试环境放开删除
     def has_delete_permission(self, request, obj=None):
-        return False
+        return True
 
     @admin.display(description='处罚', ordering='penalty')
     def penalty_badge(self, obj):
@@ -423,7 +429,7 @@ class AdoptionViolationAdmin(admin.ModelAdmin):
 
 
 # ============================================================
-# 6. 打卡任务(逾期看板 + 豁免动作)
+# 6. 打卡任务
 # ============================================================
 @admin.register(AdoptionUpdateTask)
 class AdoptionUpdateTaskAdmin(admin.ModelAdmin):
@@ -443,10 +449,11 @@ class AdoptionUpdateTaskAdmin(admin.ModelAdmin):
                        'created_at', 'updated_at')
 
     def has_add_permission(self, request):
-        return False  # 任务由交接完成时按计划自动生成
-
-    def has_delete_permission(self, request, obj=None):
         return False
+
+    # 测试环境放开删除
+    def has_delete_permission(self, request, obj=None):
+        return True
 
     @admin.display(description='宠物', ordering='application__pet__name')
     def pet_name(self, obj):
@@ -465,7 +472,7 @@ class AdoptionUpdateTaskAdmin(admin.ModelAdmin):
 
 
 # ============================================================
-# 7. 领养动态(查看 + 给结论;代录走 API 后台)
+# 7. 领养动态
 # ============================================================
 @admin.register(AdoptionUpdate)
 class AdoptionUpdateAdmin(admin.ModelAdmin):
@@ -480,7 +487,6 @@ class AdoptionUpdateAdmin(admin.ModelAdmin):
     list_select_related = ('application', 'application__pet', 'task')
     actions = ['mark_normal', 'mark_abnormal']
 
-    # 可改: 结论 + 是否公开;内容本体与归属只读
     readonly_fields = ('application', 'task', 'source', 'content',
                        'images_preview', 'video_url', 'related_post_id',
                        'reviewed_by', 'reviewed_at', 'created_at')
@@ -490,10 +496,11 @@ class AdoptionUpdateAdmin(admin.ModelAdmin):
               ('reviewed_by', 'reviewed_at'), 'created_at')
 
     def has_add_permission(self, request):
-        return False  # 用户打卡走 C 端,回访代录走 API 后台(会联动豁免任务)
-
-    def has_delete_permission(self, request, obj=None):
         return False
+
+    # 测试环境放开删除
+    def has_delete_permission(self, request, obj=None):
+        return True
 
     @admin.display(description='宠物', ordering='application__pet__name')
     def pet_name(self, obj):
@@ -532,7 +539,7 @@ class AdoptionUpdateAdmin(admin.ModelAdmin):
 
 
 # ============================================================
-# 8. 收藏(只读统计)
+# 8. 收藏
 # ============================================================
 @admin.register(PetFavorite)
 class PetFavoriteAdmin(admin.ModelAdmin):
@@ -551,5 +558,6 @@ class PetFavoriteAdmin(admin.ModelAdmin):
     def has_change_permission(self, request, obj=None):
         return False
 
+    # 测试环境放开删除
     def has_delete_permission(self, request, obj=None):
-        return False
+        return True

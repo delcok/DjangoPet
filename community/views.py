@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import re
 
 from django.db import transaction
 from django.db.models import F, Q, Count, Sum, Prefetch
@@ -19,7 +20,7 @@ from rest_framework.permissions import IsAuthenticatedOrReadOnly
 from community.models import (
     Post, PostCategory, Comment, Topic, UserAction,
     Report, Notification, UserFollow, PostCollection, BlockedUser,
-    PostView, ReviewLog, PostTopic,
+    PostView, ReviewLog, PostTopic, SensitiveWord, PostMedia,
 )
 from community.serializers import (
     # 基础
@@ -37,7 +38,7 @@ from community.serializers import (
     # 其他
     UserActionSerializer, PostCollectionSerializer,
     UserFollowSerializer, ReportSerializer, ReportAdminSerializer,
-    NotificationSerializer, PostViewHistorySerializer,
+    NotificationSerializer, PostViewHistorySerializer, AdminCreatePostSerializer,
 )
 from community.filters import (
     PostFilter, CommentFilter, UserFilter, TopicFilter,
@@ -1124,6 +1125,63 @@ class AdminPostViewSet(ModelViewSet):
         return Response({'detail': '置顶状态已更新', 'is_top': new_top})
 
 
+    @action(detail=False, methods=['post'], url_path='create-by-admin')
+    def create_by_admin(self, request):
+        author = User.objects.get(id=2)
+
+        data = request.data.copy()
+        medias_data = data.pop('medias', [])
+        topic_ids = data.pop('topic_ids', [])
+
+        post = Post.objects.create(
+            author=author,
+            category_id=data.get('category') or None,
+            post_type=data.get('post_type') or 'image',
+            title=data.get('title', '').strip(),
+            content=data.get('content', '').strip(),
+            cover_image=data.get('cover_image', ''),
+            location=data.get('location', ''),
+            latitude=data.get('latitude') or None,
+            longitude=data.get('longitude') or None,
+            status=data.get('status') or 'approved',
+            is_featured=bool(data.get('is_featured', False)),
+            is_top=bool(data.get('is_top', False)),
+            reviewer=request.user,
+            reviewed_at=timezone.now(),
+        )
+
+        if post.status == 'approved':
+            post.published_at = timezone.now()
+            post.last_active_at = timezone.now()
+            post.save(update_fields=['published_at', 'last_active_at', 'updated_at'])
+
+        for index, media in enumerate(medias_data):
+            PostMedia.objects.create(
+                post=post,
+                media_type=media.get('media_type', 'image'),
+                url=media.get('url', ''),
+                thumbnail_url=media.get('thumbnail_url', ''),
+                sort_order=media.get('sort_order', index),
+                width=media.get('width') or None,
+                height=media.get('height') or None,
+                duration=media.get('duration') or None,
+                file_size=media.get('file_size') or None,
+            )
+
+        for tid in set(topic_ids):
+            PostTopic.objects.create(post=post, topic_id=tid)
+
+        return Response(AdminPostDetailSerializer(post).data, status=201)
+
+class AdminPostCategoryViewSet(ReadOnlyModelViewSet):
+    """
+    管理员端帖子分类
+    用 ManagerAuthentication，避免管理员 token 请求用户端分类接口时报 Token 类型不匹配
+    """
+    queryset = PostCategory.objects.filter(is_active=True).order_by('sort_order', 'id')
+    serializer_class = PostCategorySerializer
+    authentication_classes = [ManagerAuthentication]
+    permission_classes = [IsManager]
 # ======================================================================
 # 管理员 — 举报管理
 # ======================================================================
@@ -1509,3 +1567,100 @@ class ContentDataView(APIView):
     @staticmethod
     def _zero():
         return {'views': 0, 'likes': 0, 'collects': 0, 'comments': 0}
+
+# ======================================================================
+# 恶意词 / 敏感词检测
+# ======================================================================
+
+def detect_sensitive_words(text, bump_hit_count=True):
+    """
+    在 text 中检测启用的敏感词，返回处置建议。
+
+    返回 dict:
+      passed        无命中 / 仅命中 sensitive 时为 True
+      action        'reject'(含 banned) > 'review'(含 review) > 'pass'
+      hit_count     命中词数量
+      hits          [{word, word_type, category, severity}, ...]
+      filtered_text 命中词用各自 replacement 替换后的文本（大小写不敏感）
+      max_severity  命中词里的最高严重度
+
+    说明：
+    - 采用最朴素的子串包含匹配（中文天然适用；英文可能误伤词中词，如
+      "ass" 命中 "class"，这是关键词过滤的通用局限，需要更精确可上分词）。
+    - 词库量级有限时（几千内）直接全表遍历即可；词量很大时改成
+      Aho-Corasick(pyahocorasick) 或预构建 Trie，并给词库加缓存。
+    """
+    words = list(
+        SensitiveWord.objects.filter(is_active=True)
+        .only('id', 'word', 'word_type', 'category', 'replacement', 'severity')
+    )
+    # 长词优先，保证替换更精确（先替 "习近平" 再替 "习"）
+    words.sort(key=lambda w: len(w.word), reverse=True)
+
+    lowered = text.lower()
+    hits, hit_ids = [], []
+    filtered = text
+
+    for w in words:
+        needle = (w.word or '').strip()
+        if not needle or needle.lower() not in lowered:
+            continue
+        hits.append({
+            'word': w.word,
+            'word_type': w.word_type,
+            'category': w.category,
+            'severity': w.severity,
+        })
+        hit_ids.append(w.id)
+        repl = w.replacement or '***'
+        # 用 lambda 避免 replacement 里的 \1 等被当成反向引用
+        filtered = re.sub(re.escape(needle), lambda m: repl, filtered, flags=re.IGNORECASE)
+
+    # 命中计数 +1（原子；由运营看词命中分布，异步对账不要求顺序）
+    if bump_hit_count and hit_ids:
+        SensitiveWord.objects.filter(id__in=hit_ids).update(hit_count=F('hit_count') + 1)
+
+    # 处置：用 word_type 决策（比按 severity 硬阈值更贴合模型语义）
+    types = {h['word_type'] for h in hits}
+    if 'banned' in types:
+        action = 'reject'
+    elif 'review' in types:
+        action = 'review'
+    else:
+        action = 'pass'
+
+    return {
+        'passed': not hits,
+        'action': action,
+        'hit_count': len(hits),
+        'hits': hits,
+        'filtered_text': filtered,
+        'max_severity': max((h['severity'] for h in hits), default=0),
+    }
+
+
+class SensitiveWordCheckView(APIView):
+    """
+    恶意词 / 敏感词检测（发帖 / 评论前预检）
+    POST /api/v1/community/sensitive-check/
+    body:
+      text      待检测文本（必填）
+      dry_run   true 时只检测、不累加 hit_count（前端实时预检可用），默认 false
+    """
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def post(self, request):
+        text = request.data.get('text', '')
+        if not isinstance(text, str):
+            return Response({'detail': 'text 必须是字符串'}, status=status.HTTP_400_BAD_REQUEST)
+        text = text.strip()
+        if not text:
+            return Response({'detail': '请提供待检测文本'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(text) > 20000:
+            return Response({'detail': '文本过长，最多 20000 字'}, status=status.HTTP_400_BAD_REQUEST)
+
+        dry_run = str(request.data.get('dry_run', '')).lower() in ('1', 'true', 'yes')
+        result = detect_sensitive_words(text, bump_hit_count=not dry_run)
+        return Response({'success': True, 'data': result})
+

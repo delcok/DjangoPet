@@ -3,7 +3,9 @@
 community/serializers.py
 社区模块序列化器 — 用户端 + 管理员端
 """
+import uuid
 
+from django.utils.text import slugify
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
@@ -13,7 +15,7 @@ from managers.models import Manager
 from .models import (
     PostCategory, Post, PostMedia, Comment, Topic, UserAction,
     Report, Notification, UserFollow, PostCollection, BlockedUser,
-    PostTopic, Mention, PostView
+    PostTopic, Mention, PostView, SensitiveWord,
 )
 
 
@@ -805,3 +807,92 @@ class BlockedUserSerializer(serializers.ModelSerializer):
         model = BlockedUser
         fields = ['id', 'blocked_user', 'reason', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+
+class AdminCreatePostSerializer(serializers.ModelSerializer):
+    """管理员后台创建帖子：作者固定为 User(id=2)，也允许显式传 author_id 覆盖。"""
+    author_id = serializers.IntegerField(required=False, write_only=True, default=2)
+    medias = PostMediaSerializer(many=True, required=False)
+    topic_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, write_only=True
+    )
+    topic_names = serializers.ListField(
+        child=serializers.CharField(max_length=50), required=False, write_only=True
+    )
+
+    class Meta:
+        model = Post
+        fields = [
+            'author_id', 'category', 'post_type', 'status',
+            'title', 'content', 'cover_image', 'location', 'latitude', 'longitude',
+            'is_featured', 'is_top', 'quality_score', 'review_priority', 'review_note',
+            'medias', 'topic_ids', 'topic_names',
+        ]
+
+    def validate_title(self, value):
+        value = (value or '').strip()
+        if len(value) < 2:
+            raise serializers.ValidationError('标题至少需要2个字符')
+        if len(value) > 100:
+            raise serializers.ValidationError('标题不能超过100个字符')
+        return value
+
+    def validate_content(self, value):
+        value = (value or '').strip()
+        if len(value) < 5:
+            raise serializers.ValidationError('内容至少需要5个字符')
+        return value
+
+    def validate_author_id(self, value):
+        value = value or 2
+        if not User.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError(f'作者用户不存在或不可用: {value}')
+        return value
+
+    def validate_topic_ids(self, value):
+        if not value:
+            return []
+        valid_ids = set(
+            Topic.objects.filter(id__in=value)
+            .exclude(status__in=['banned', 'rejected', 'suspended'])
+            .values_list('id', flat=True)
+        )
+        invalid = [tid for tid in value if tid not in valid_ids]
+        if invalid:
+            raise serializers.ValidationError(f'话题不存在或不可用: {invalid}')
+        return value
+
+    @transaction.atomic
+    def create(self, validated_data):
+        author_id = validated_data.pop('author_id', 2) or 2
+        medias_data = validated_data.pop('medias', [])
+        topic_ids = validated_data.pop('topic_ids', [])
+        topic_names = validated_data.pop('topic_names', [])
+
+        author = User.objects.get(id=author_id, is_active=True)
+        post = Post.objects.create(author=author, **validated_data)
+
+        for index, media_data in enumerate(medias_data):
+            media_data.setdefault('media_type', 'image')
+            media_data.setdefault('sort_order', index)
+            PostMedia.objects.create(post=post, **media_data)
+
+        for tid in set(topic_ids):
+            PostTopic.objects.get_or_create(post=post, topic_id=tid)
+
+        for raw_name in topic_names:
+            name = (raw_name or '').strip().lstrip('#').strip()
+            if not name:
+                continue
+            topic = Topic.objects.filter(name=name).exclude(status__in=['banned', 'rejected', 'suspended']).first()
+            if not topic:
+                base = slugify(name, allow_unicode=True)[:40] or f'topic-{uuid.uuid4().hex[:8]}'
+                slug = base
+                i = 1
+                while Topic.all_objects.filter(slug=slug).exists():
+                    i += 1
+                    slug = f'{base}-{i}'[:50]
+                topic = Topic.objects.create(name=name, slug=slug, status='approved', is_official=True)
+            PostTopic.objects.get_or_create(post=post, topic=topic)
+
+        return post

@@ -22,6 +22,8 @@ admin_router = DefaultRouter()
 admin_router.register(r'posts', views.AdminPostViewSet, basename='admin-post')
 admin_router.register(r'reports', views.AdminReportViewSet, basename='admin-report')
 
+admin_router.register(r'categories', views.AdminPostCategoryViewSet, basename='admin-category')
+
 # ==================== URL 配置 ====================
 # 整体挂载在 community/ 下
 # 主 urls.py: path('api/v1/', include('community.urls'))
@@ -54,6 +56,9 @@ urlpatterns = [
         path('search/',
              views.SearchView.as_view(),
              name='search'),
+        path('sensitive-check/',
+             views.SensitiveWordCheckView.as_view(),
+             name='sensitive-check'),
         path('statistics/',
              views.StatisticsView.as_view(),
              name='statistics'),
