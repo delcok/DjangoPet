@@ -216,6 +216,16 @@ ALIPAY_CONFIG = {
     'SIGN_TYPE': 'RSA2',  # 签名类型，固定RSA2
 }
 
+# 配置微信小程序虚拟支付（米大师）
+WECHAT_VIRTUAL_PAY_CONFIG = {
+    'APP_ID': env('WECHAT_APP_ID', default=''),  # 小程序APPID
+    'OFFER_ID': env('VIRTUAL_PAY_OFFER_ID', default=''),  # 虚拟支付offerId（MP后台获取）
+    'PROD_APP_KEY': env('VIRTUAL_PAY_PROD_APP_KEY', default=''),  # 正式环境AppKey
+    'SANDBOX_APP_KEY': env('VIRTUAL_PAY_SANDBOX_APP_KEY', default=''),  # 沙箱环境AppKey
+    'NOTIFY_URL': env('VIRTUAL_PAY_NOTIFY_URL', default=''),  # 虚拟支付回调地址
+    'MESSAGE_TOKEN': 'PetVpayNotify2026',
+}
+
 # 配置缓存为Redis
 CACHES = {
     "default": {

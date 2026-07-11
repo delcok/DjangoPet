@@ -2,8 +2,13 @@
 # pay/views.py
 
 import logging
+import json
+import hashlib
+
+from datetime import timedelta
 from decimal import Decimal, ROUND_DOWN
 
+from django.conf import settings
 from django.db import transaction, IntegrityError
 from django.db.models import Sum, F
 from django.http import HttpResponse
@@ -16,7 +21,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.decorators import action
 
-from .models import PaymentOrder, PaymentRefund, generate_refund_no
+from .models import PaymentOrder, PaymentRefund, generate_refund_no, generate_payment_no
 from .serializers import (
     PaymentOrderListSerializer, PaymentOrderDetailSerializer,
     CreatePaymentSerializer, QueryPaymentSerializer,
@@ -27,6 +32,8 @@ from .serializers import (
 # 支付渠道封装
 from utils.wechat_pay import WeChatPayHelper
 from utils.alipay_pay import AlipayPayHelper
+from utils.wechat_virtual_pay import WeChatVirtualPayHelper
+from utils.wechat_client import get_user_mini_client
 
 # 认证 / 权限
 from utils.authentication import (
@@ -1880,3 +1887,486 @@ def _revoke_activity_grants_on_refund(refund, order):
             ActivityMerchantEarn.objects.filter(pk=e.id).update(
                 frozen_status=ActivityMerchantEarn.FrozenStatus.REVOKE_PENDING,
             )
+# ══════════════════════════════════════════════════════════════
+# 微信小程序虚拟支付（金币充值）
+# —— 完全复用普通充值逻辑：金额制 + promotions 充值活动加送
+# —— 与普通充值唯一区别是支付渠道走 wechat_virtual
+# ══════════════════════════════════════════════════════════════
+
+
+class CreateVirtualPaymentView(APIView):
+    """
+    创建微信虚拟支付订单（金币充值）。
+
+    下单逻辑和 promotions.CreateRechargeView 完全一致：
+      1. 按金额挑最优充值活动，锁定 bonus_coins / activity_id 到 WalletRecharge
+      2. 创建 order_type='recharge'、channel='wechat_virtual' 的 PaymentOrder
+      3. 调米大师生成前端调起参数
+    回调 / 补单成功后由 _run_payment_success_hooks -> _grant_recharge_coins
+    统一发放「面额金币 + 活动加送金币」，这里不碰钱包。
+    """
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def post(self, request):
+        # ── 1. 参数校验 ──
+        try:
+            amount = Decimal(str(request.data.get('amount', '0')))
+        except Exception:
+            return Response({'error': 'amount 无效'}, status=status.HTTP_400_BAD_REQUEST)
+        if amount <= 0:
+            return Response({'error': '充值金额必须大于 0'}, status=status.HTTP_400_BAD_REQUEST)
+        # 虚拟支付价格由 buyQuantity 决定（1 元 = 1 金币），只接受整数元
+        if amount != amount.to_integral_value():
+            return Response({'error': '虚拟支付充值金额必须为整数元'}, status=status.HTTP_400_BAD_REQUEST)
+
+        platform = request.data.get('platform', 'android')
+        code = request.data.get('code', '')
+        env = int(request.data.get('env', 0))  # 0 正式 / 1 沙箱
+        if not code:
+            return Response({'error': '缺少微信登录 code'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── 2. code 换 openid + session_key（虚拟支付用户态签名必须 session_key）──
+        try:
+            mini_client = get_user_mini_client()
+            login_res = mini_client.wxa.code_to_session(code)
+            openid = login_res.get('openid', '')
+            session_key = login_res.get('session_key', '')
+            if not openid or not session_key:
+                logger.error('虚拟支付 code_to_session 缺少字段 res=%s', login_res)
+                return Response({'error': '获取微信用户信息失败'}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception('微信 code_to_session 失败')
+            return Response({'error': f'微信登录失败: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── 3. 锁定最优充值活动 + 加送金币（与普通充值一致）──
+        best_act, bonus = pick_best_recharge_activity(request.user.id, amount)
+        face_coins = int(amount)  # 1 元 = 1 金币
+
+        from wallet.models import WalletRecharge
+
+        with transaction.atomic():
+            recharge = WalletRecharge.objects.create(
+                user=request.user,
+                amount=amount,
+                face_coins=face_coins,
+                bonus_coins=bonus,                              # ★ 下单锁定
+                activity_id=best_act.id if best_act else None,  # ★ 下单锁定
+            )
+            payment_no = generate_payment_no()
+            payment = PaymentOrder.objects.create(
+                payment_no=payment_no,
+                out_trade_no=payment_no,
+                order_no=recharge.recharge_no,
+                order_type='recharge',
+                user_id=request.user.id,
+                channel='wechat_virtual',
+                amount=amount,
+                status='pending',
+                pay_platform=platform,
+                expire_at=timezone.now() + timedelta(minutes=15),
+            )
+
+        # ── 4. 调米大师生成前端调起参数 ──
+        helper = WeChatVirtualPayHelper(env=env)
+        try:
+            pay_params = helper.generate_client_pay_params(
+                openid=openid,
+                session_key=session_key,
+                buy_quantity=face_coins,   # ★ 假设 MP 后台代币兑换比例 1 元 = 1 代币(=1 金币)
+                out_trade_no=payment.out_trade_no,
+                attach=recharge.recharge_no,
+                platform=platform,
+            )
+        except Exception as e:
+            logger.exception('生成虚拟支付参数失败 payment_no=%s', payment.payment_no)
+            payment.status = 'failed'
+            payment.callback_raw = f'create error: {e}'
+            payment.save(update_fields=['status', 'callback_raw', 'updated_at'])
+            return Response({'error': f'调起虚拟支付失败: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        payment.pay_params = {**pay_params, '_openid': openid}  # ★ 顺带存 openid，补单查询要用
+        payment.save(update_fields=['pay_params', 'updated_at'])
+
+        return Response({
+            'recharge_no': recharge.recharge_no,
+            'payment_no': payment.payment_no,
+            'out_trade_no': payment.out_trade_no,
+            'pay_params': pay_params,
+            'bonus_preview': {
+                'activity_name': best_act.name if best_act else '',
+                'face_coins': face_coins,
+                'bonus_coins': bonus,
+                'total_coins': face_coins + bonus,
+            },
+        })
+
+
+class VirtualPaymentOrderListView(APIView):
+    """我的虚拟充值记录"""
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def get(self, request):
+        payments = PaymentOrder.objects.filter(
+            user_id=request.user.id,
+            order_type='recharge',
+            channel='wechat_virtual',
+        ).order_by('-created_at')
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_data = payments[start:end]
+
+        from wallet.models import WalletRecharge
+        result = []
+        for p in page_data:
+            gold_amount = int(p.amount)
+            bonus_gold = 0
+            try:
+                recharge = WalletRecharge.objects.get(recharge_no=p.order_no)
+                gold_amount = recharge.face_coins
+                bonus_gold = recharge.bonus_coins
+            except WalletRecharge.DoesNotExist:
+                pass
+
+            result.append({
+                'payment_no': p.payment_no,
+                'out_trade_no': p.out_trade_no,
+                'amount': p.amount,
+                'gold_amount': gold_amount,
+                'bonus_gold': bonus_gold,
+                'total_gold': gold_amount + bonus_gold,
+                'status': p.status,
+                'status_display': p.get_status_display(),
+                'paid_at': p.paid_at,
+                'created_at': p.created_at,
+            })
+
+        return Response({
+            'results': result,
+            'count': payments.count(),
+            'page': page,
+            'page_size': page_size,
+        })
+
+
+class QueryVirtualPaymentView(APIView):
+    """查询虚拟支付订单状态，主动轮询补单（金币充值）"""
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def get(self, request):
+        out_trade_no = request.query_params.get('out_trade_no')
+        env = int(request.query_params.get('env', 0))
+        if not out_trade_no:
+            return Response({'error': '缺少 out_trade_no'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            payment = PaymentOrder.objects.get(
+                out_trade_no=out_trade_no,
+                user_id=request.user.id,
+                order_type='recharge',
+                channel='wechat_virtual',
+            )
+        except PaymentOrder.DoesNotExist:
+            return Response({'error': '订单不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if payment.status == 'paid':
+            return Response({
+                'status': 'paid',
+                'payment_no': payment.payment_no,
+                'paid_at': payment.paid_at,
+            })
+
+        openid = ''
+        if isinstance(payment.pay_params, dict):
+            openid = payment.pay_params.get('_openid', '')
+
+        # 主动查询微信订单，若已支付则本地补单
+        helper = WeChatVirtualPayHelper(env=env)
+        order = None
+        try:
+            wx_order = helper.query_order(openid=openid, out_trade_no=out_trade_no)  # ★ 传 openid
+            if wx_order.get('order_state') == 2:  # 2=支付成功（以米大师实际返回为准）
+                with transaction.atomic():
+                    payment = PaymentOrder.objects.select_for_update().get(pk=payment.pk)
+                    if payment.status != 'paid':
+                        payment.mark_paid(
+                            channel_trade_no=wx_order.get('transaction_id', ''),
+                            callback_raw=str(wx_order),
+                        )
+                        order = _advance_business_order_to_paid(payment)
+                # 事务提交后发金币（面额 + 活动加送）
+                if order:
+                    _run_payment_success_hooks(payment, order)
+                # 通知微信发货
+                try:
+                    helper.notify_provide_goods(out_trade_no)
+                except Exception:
+                    logger.exception('通知微信发货失败 out_trade_no=%s', out_trade_no)
+                return Response({
+                    'status': 'paid',
+                    'payment_no': payment.payment_no,
+                    'paid_at': payment.paid_at,
+                })
+        except Exception:
+            logger.exception('查询虚拟支付订单失败 out_trade_no=%s', out_trade_no)
+
+        return Response({
+            'status': payment.status,
+            'payment_no': payment.payment_no,
+        })
+
+
+@csrf_exempt
+@require_POST
+def virtual_pay_callback(request):
+    """
+    微信虚拟支付回调 —— 完全复用普通充值成功逻辑：
+    mark_paid -> _advance_business_order_to_paid(标记 WalletRecharge=paid)
+    -> _run_payment_success_hooks -> _grant_recharge_coins(面额 + 活动加送)
+    """
+    try:
+        helper = WeChatVirtualPayHelper()
+        callback_data = helper.parse_xml_callback(request.body)
+
+        out_trade_no = callback_data.get('out_trade_no')
+        return_code = callback_data.get('return_code')
+        result_code = callback_data.get('result_code')
+        transaction_id = callback_data.get('transaction_id', '')
+
+        if not out_trade_no:
+            return HttpResponse(
+                json.dumps({'ErrCode': 1, 'ErrMsg': 'missing out_trade_no'}),
+                content_type='application/json'
+            )
+
+        order_to_run_hooks = None
+        payment_for_hooks = None
+
+        if return_code == 'SUCCESS' and result_code == 'SUCCESS':
+            try:
+                with transaction.atomic():
+                    payment = PaymentOrder.objects.select_for_update().get(
+                        out_trade_no=out_trade_no,
+                        channel='wechat_virtual',
+                    )
+
+                    # 幂等：已支付直接返回成功
+                    if payment.status == 'paid':
+                        try:
+                            helper.notify_provide_goods(out_trade_no)
+                        except Exception:
+                            pass
+                        return HttpResponse(
+                            json.dumps({'ErrCode': 0, 'ErrMsg': 'success'}),
+                            content_type='application/json'
+                        )
+
+                    payment.mark_paid(
+                        channel_trade_no=transaction_id,
+                        callback_raw=str(callback_data),
+                    )
+                    order = _advance_business_order_to_paid(payment)
+                    if order:
+                        order_to_run_hooks = order
+                        payment_for_hooks = payment
+
+            except PaymentOrder.DoesNotExist:
+                logger.error('虚拟支付回调订单不存在 out_trade_no=%s', out_trade_no)
+                return HttpResponse(
+                    json.dumps({'ErrCode': 1, 'ErrMsg': 'order not found'}),
+                    content_type='application/json'
+                )
+            except Exception as e:
+                logger.exception('处理虚拟支付回调异常 out_trade_no=%s', out_trade_no)
+                return HttpResponse(
+                    json.dumps({'ErrCode': 1, 'ErrMsg': str(e)}),
+                    content_type='application/json'
+                )
+
+            # 主事务提交后发金币（和普通充值完全一致：面额 + 活动加送）
+            if order_to_run_hooks:
+                _run_payment_success_hooks(payment_for_hooks, order_to_run_hooks)
+
+            # 通知微信已发货
+            try:
+                helper.notify_provide_goods(out_trade_no)
+            except Exception:
+                logger.exception('通知微信发货失败 out_trade_no=%s', out_trade_no)
+
+        return HttpResponse(
+            json.dumps({'ErrCode': 0, 'ErrMsg': 'success'}),
+            content_type='application/json'
+        )
+
+    except Exception as e:
+        logger.exception('虚拟支付回调处理异常: %s', e)
+        return HttpResponse(
+            json.dumps({'ErrCode': 1, 'ErrMsg': str(e)}),
+            content_type='application/json'
+        )
+
+class ConfirmVirtualPaymentView(APIView):
+    """
+    代币充值：前端 wx.requestVirtualPayment success 后主动确认到账。
+    文档明确「支付成功由 success 回调触发」，代币单无法用 query_order 轮询，
+    故以前端 success 为主、xpay_coin_pay_notify 消息推送为兜底。
+    幂等：select_for_update + status 判断，重复调不会重复发币。
+    """
+    authentication_classes = [UserAuthentication]
+    permission_classes = [IsUser]
+
+    def post(self, request):
+        out_trade_no = request.data.get('out_trade_no')
+        if not out_trade_no:
+            return Response({'error': '缺少 out_trade_no'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            payment = PaymentOrder.objects.get(
+                out_trade_no=out_trade_no,
+                user_id=request.user.id,
+                order_type='recharge',
+                channel='wechat_virtual',
+            )
+        except PaymentOrder.DoesNotExist:
+            return Response({'error': '订单不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if payment.status == 'paid':
+            return Response({'status': 'paid', 'payment_no': payment.payment_no,
+                             'paid_at': payment.paid_at})
+
+        order_to_run_hooks = None
+        payment_for_hooks = None
+        try:
+            with transaction.atomic():
+                payment = PaymentOrder.objects.select_for_update().get(pk=payment.pk)
+                if payment.status == 'paid':
+                    return Response({'status': 'paid', 'payment_no': payment.payment_no,
+                                     'paid_at': payment.paid_at})
+                if payment.status != 'pending':
+                    return Response({'error': f'订单状态 {payment.status} 不可确认'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+
+                payment.mark_paid(
+                    channel_trade_no=f'VCOIN_{payment.payment_no}',  # 代币单暂无微信订单号，占位
+                    callback_raw='client confirmed coin pay success',
+                )
+                order = _advance_business_order_to_paid(payment)
+                if order:
+                    order_to_run_hooks = order
+                    payment_for_hooks = payment
+        except Exception as e:
+            logger.exception('确认虚拟支付失败 out_trade_no=%s', out_trade_no)
+            return Response({'error': f'确认失败: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 事务提交后发金币（面额 + 活动加送）
+        if order_to_run_hooks:
+            _run_payment_success_hooks(payment_for_hooks, order_to_run_hooks)
+
+        # ★ 注意：代币充值不调 notify_provide_goods（那只能通知现金单）
+
+        return Response({'status': 'paid', 'payment_no': payment.payment_no,
+                         'paid_at': payment.paid_at})
+
+
+
+# 小程序消息推送 Token —— 和你在「消息推送配置」页面填的 Token 必须一模一样
+# 建议放 settings，这里演示直接常量
+WX_MESSAGE_TOKEN = settings.WECHAT_VIRTUAL_PAY_CONFIG.get('MESSAGE_TOKEN', 'your_custom_token_here')
+
+
+def _handle_coin_pay_notify(msg):
+    """处理代币支付推送 xpay_coin_pay_notify（虚拟支付到账兜底）。返回 True=成功。"""
+    out_trade_no = msg.get('OutTradeNo')
+    if not out_trade_no:
+        logger.error('coin_pay_notify 缺少 OutTradeNo msg=%s', msg)
+        return False
+
+    wx_pay_info = msg.get('WeChatPayInfo') or {}
+    transaction_id = wx_pay_info.get('TransactionId', '') if isinstance(wx_pay_info, dict) else ''
+
+    order_to_run_hooks = None
+    payment_for_hooks = None
+    try:
+        with transaction.atomic():
+            payment = (PaymentOrder.objects
+                       .select_for_update()
+                       .get(out_trade_no=out_trade_no, channel='wechat_virtual'))
+            if payment.status == 'paid':      # 前端 confirm 可能已发币，幂等
+                return True
+            payment.mark_paid(
+                channel_trade_no=transaction_id or f'VCOIN_{payment.payment_no}',
+                callback_raw=str(msg),
+            )
+            order = _advance_business_order_to_paid(payment)
+            if order:
+                order_to_run_hooks = order
+                payment_for_hooks = payment
+    except PaymentOrder.DoesNotExist:
+        logger.error('coin_pay_notify 命中不存在的支付单 out_trade_no=%s', out_trade_no)
+        return True   # 不是我们的单，返回成功避免重推
+    except Exception:
+        logger.exception('处理 coin_pay_notify 异常 out_trade_no=%s', out_trade_no)
+        return False  # 让微信重推
+
+    if order_to_run_hooks:
+        _run_payment_success_hooks(payment_for_hooks, order_to_run_hooks)
+    logger.info('coin_pay_notify 到账处理完成 out_trade_no=%s', out_trade_no)
+    return True
+
+@csrf_exempt
+def wx_message_push(request):
+    """
+    小程序统一消息推送入口（配到 mp 后台「消息推送」的 URL）。
+    - GET：响应微信服务器 URL 验证（返回 echostr）
+    - POST：接收所有事件消息，按 Event 分发；当前只处理 xpay_coin_pay_notify（代币支付到账兜底）
+    其它消息一律返回 success 忽略，避免微信重推。
+    """
+    # ── GET：URL 有效性验证 ──
+    if request.method == 'GET':
+        signature = request.GET.get('signature', '')
+        timestamp = request.GET.get('timestamp', '')
+        nonce = request.GET.get('nonce', '')
+        echostr = request.GET.get('echostr', '')
+
+        # 按微信规则：token/timestamp/nonce 字典序排序拼接后 sha1
+        tmp_list = sorted([WX_MESSAGE_TOKEN, timestamp, nonce])
+        tmp_str = ''.join(tmp_list)
+        hashcode = hashlib.sha1(tmp_str.encode('utf-8')).hexdigest()
+
+        if hashcode == signature:
+            return HttpResponse(echostr)  # 验证通过，原样返回 echostr
+        logger.error('小程序消息推送 URL 验证失败 sig=%s calc=%s', signature, hashcode)
+        return HttpResponse('verify failed', status=403)
+
+    # ── POST：接收事件消息 ──
+    if request.method == 'POST':
+        try:
+            body = request.body.decode('utf-8') if isinstance(request.body, bytes) else request.body
+        except Exception:
+            logger.exception('消息推送 body 解码失败')
+            return HttpResponse('success')  # 别让微信重推
+
+        try:
+            msg = WeChatVirtualPayHelper.parse_xml_callback(body)
+        except Exception:
+            logger.exception('消息推送 XML 解析失败 body=%s', body[:500])
+            return HttpResponse('success')
+
+        event = (msg.get('Event') or '').strip()
+        logger.info('收到小程序消息推送 Event=%s', event)
+
+        # 只处理代币支付到账；其它消息忽略
+        if event == 'xpay_coin_pay_notify':
+            ok = _handle_coin_pay_notify(msg)
+            # 明文 XML 场景，返回 success 即代表 ErrCode=0
+            return HttpResponse('success' if ok else 'fail')
+
+        # 其它所有事件（客服消息、订阅回执等）都返回 success 忽略
+        return HttpResponse('success')
+
+    return HttpResponse('success')

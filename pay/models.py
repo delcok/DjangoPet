@@ -43,6 +43,7 @@ class PaymentOrder(models.Model):
         ('wechat_mini', '微信小程序支付'),
         ('wechat_app',  '微信App支付'),
         ('wechat_h5',   '微信H5支付'),
+        ('wechat_virtual', '微信小程序虚拟支付'),
         ('alipay',      '支付宝'),
         ('balance',     '余额支付'),
     ]
